@@ -205,7 +205,7 @@ def cmd_chat(a):
         mload=re.search(r"caricato in ([0-9.]+)s \| densa residente: ([0-9.]+) MB", elog)
         if mload: print(f"  {C.grn}✓{C.r} pronto in {mload.group(1)}s {C.dim}· residente {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
-            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]")):
+            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
                 l=re.sub(r" da$| in$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:

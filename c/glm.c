@@ -44,6 +44,8 @@ typedef struct {
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
     int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
+    int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
+    int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
 } Cfg;
 
@@ -95,6 +97,12 @@ typedef struct {
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori uso expert per layer (per STATS/PIN) */
+    /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
+    int has_dsa;
+    QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
+    float **ix_knw, **ix_knb;                    /* k_norm (LayerNorm, eps 1e-6) */
+    float **Ic;                                  /* cache k dell'indexer per layer full [max_t*hd] */
+    int *dsa_sel, *dsa_nsel; int dsa_scap;       /* selezione per posizione del batch corrente */
     /* testa MTP (layer n_layers, stile DeepSeek-V3): draft nativi ad alta acceptance */
     int has_mtp; Layer mtpL; QT eh_proj;
     float *enorm, *hnorm, *mtp_norm;
@@ -424,6 +432,13 @@ static void rmsnorm(float *out, const float *x, const float *w, int D, float eps
     double ms=0; for(int i=0;i<D;i++) ms+=(double)x[i]*x[i];
     float r=1.f/sqrtf((float)(ms/D)+eps); for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
+/* LayerNorm classica (media+varianza, weight+bias) — usata dal k_norm dell'indexer DSA */
+static void layernorm(float *v, const float *w, const float *b, int n, float eps){
+    double mu=0; for(int i=0;i<n;i++) mu+=v[i]; mu/=n;
+    double var=0; for(int i=0;i<n;i++){ double d=v[i]-mu; var+=d*d; } var/=n;
+    float r=1.f/sqrtf((float)var+eps);
+    for(int i=0;i<n;i++) v[i]=((float)(v[i]-mu))*r*w[i]+b[i];
+}
 static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i]>m)m=x[i];
     float s=0; for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++) x[i]/=s; }
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
@@ -472,6 +487,16 @@ static void load_cfg(Cfg *c, const char *snap){
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
             else if(eo->t==J_ARR) for(int i=0;i<eo->len && c->n_stop<8;i++)
                 c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
+    /* DSA lightning indexer: parametri + tipo per-layer (lista esplicita o formula freq/offset) */
+    c->index_topk=gi(r,"index_topk"); c->index_nh=gi(r,"index_n_heads"); c->index_hd=gi(r,"index_head_dim");
+    { jval *it=json_get(r,"indexer_types");
+      int freq=gi(r,"index_topk_freq"); if(freq<1) freq=1;
+      jval *of=json_get(r,"index_skip_topk_offset"); int off=of?(int)of->num:2;
+      for(int i=0;i<c->n_layers && i<128;i++){
+          if(it && it->t==J_ARR && i<it->len && it->kids[i]->str)
+              c->idx_type[i] = !strcmp(it->kids[i]->str,"full");
+          else { int v=i-off+1; if(v<0) v=0; c->idx_type[i] = (v%freq)==0; }
+      } }
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
     if(c->n_group!=1){ fprintf(stderr,"questo motore assume n_group=1 (GLM-5.2)\n"); exit(1); }
@@ -596,6 +621,34 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             #undef PM
         }
     }
+    /* DSA lightning indexer: attivo SOLO se i pesi (conversione --indexer) ci sono per
+     * TUTTI i layer full. Auto-rilevamento come per MTP: niente flag, niente passi extra. */
+    {
+        m->has_dsa = (c->index_topk>0 && c->index_nh>0 && c->index_hd>0 && c->index_hd<=256);
+        char inm[300];
+        for(int i=0;i<c->n_layers && m->has_dsa;i++){
+            if(!c->idx_type[i]) continue;
+            snprintf(inm,sizeof(inm),"model.layers.%d.self_attn.indexer.wq_b.weight",i);
+            if(!st_has(&m->S,inm)) m->has_dsa=0;
+        }
+        if(getenv("DSA") && atoi(getenv("DSA"))==0) m->has_dsa=0;
+        if(m->has_dsa){
+            m->ix_wq=calloc(c->n_layers,sizeof(QT)); m->ix_wk=calloc(c->n_layers,sizeof(QT));
+            m->ix_wp=calloc(c->n_layers,sizeof(QT));
+            m->ix_knw=calloc(c->n_layers,sizeof(float*)); m->ix_knb=calloc(c->n_layers,sizeof(float*));
+            for(int i=0;i<c->n_layers;i++){
+                if(!c->idx_type[i]) continue;
+                #define PI(s) (snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.indexer." s,i),nm)
+                m->ix_wq[i]=qt_load(m,PI("wq_b.weight"), c->index_nh*c->index_hd, c->q_lora, dbits);
+                m->ix_wk[i]=qt_load(m,PI("wk.weight"), c->index_hd, D, dbits);
+                m->ix_wp[i]=qt_load(m,PI("weights_proj.weight"), c->index_nh, D, dbits);
+                m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
+                #undef PI
+            }
+            fprintf(stderr,"[DSA] indexer attivo: attenzione sparsa top-%d oltre %d token di contesto\n",
+                c->index_topk, c->index_topk);
+        }
+    }
     m->hlast=falloc(D); m->h_all=falloc((int64_t)64*D);
 
     /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+shared+norme) */
@@ -609,6 +662,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         rb+=qt_bytes(&l->q_a)+qt_bytes(&l->q_b)+qt_bytes(&l->kv_a)+qt_bytes(&l->kv_b)+qt_bytes(&l->o);
         rb+=qt_bytes(&l->sh_gate)+qt_bytes(&l->sh_up)+qt_bytes(&l->sh_down)+qt_bytes(&m->eh_proj);
     }
+    if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(c->idx_type[i])
+        rb+=qt_bytes(&m->ix_wq[i])+qt_bytes(&m->ix_wk[i])+qt_bytes(&m->ix_wp[i]);
     m->resident_bytes=rb;
 }
 
@@ -745,6 +800,9 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     }
 }
 static int g_absorb=-1;   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
+static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
+static int cmp_fdesc(const void *a,const void *b){
+    float x=*(const float*)a, y=*(const float*)b; return x<y?1:x>y?-1:0; }
 
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
@@ -753,10 +811,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     double ta0=now_s();
     float *ctx=falloc((int64_t)S*H*vh);
     float *Q=falloc((int64_t)S*H*qh);                  /* query (roped) dei token nuovi */
-    float *qresid=falloc(c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
-    /* 1) per ogni token nuovo: query roped + latente normato e k_rot roped -> in cache */
+    float *QR=falloc((int64_t)S*c->q_lora), *comp=falloc(c->kv_lora+c->qk_rope);
+    /* 1) per ogni token nuovo: query roped + latente normato e k_rot roped -> in cache.
+     * QR tiene il residuo q_a per TUTTE le posizioni: serve anche all'indexer DSA. */
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*D; int pos=pos_base+s;
+        float *qresid=QR+(int64_t)s*c->q_lora;
         matmul_qt(qresid, xs, &l->q_a, 1);
         rmsnorm(qresid, qresid, l->q_a_ln, c->q_lora, c->eps);
         float *qfull=Q+(int64_t)s*H*qh; matmul_qt(qfull, qresid, &l->q_b, 1);
@@ -767,6 +827,61 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
         memcpy(Rdst, comp+c->kv_lora, c->qk_rope*sizeof(float));
         rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
+    }
+    /* ---- DSA lightning indexer ----
+     * Layer FULL: k_idx dei token nuovi in cache + selezione top-k per query (riusata
+     * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
+     * (o DSA_FORCE=1 per il test: selezionare TUTTO deve dare l'output denso esatto). */
+    const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
+    if(m->has_dsa && layer<c->n_layers && m->kv_start[layer]==0){
+        int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
+        if(c->idx_type[layer]){
+            for(int s=0;s<S;s++){
+                const float *xs=x+(int64_t)s*D; int pos=pos_base+s;
+                float *kd=m->Ic[layer]+(int64_t)pos*hd;
+                matmul_qt(kd, xs, &m->ix_wk[layer], 1);
+                layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, 1e-6f);
+                rope_interleave(kd, pos, c);                 /* primi qk_rope dim, interleaved */
+            }
+            if((int64_t)S*dtopk > m->dsa_scap){
+                free(m->dsa_sel); free(m->dsa_nsel);
+                m->dsa_scap=(int64_t)S*dtopk;
+                m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+                m->dsa_nsel=malloc((size_t)S*sizeof(int));
+            }
+            #pragma omp parallel for schedule(dynamic,1)
+            for(int s=0;s<S;s++){
+                int pos=pos_base+s, nk=pos+1;
+                if(nk<=dtopk && !g_dsa_force){ m->dsa_nsel[s]=0; continue; }
+                int keep = nk<dtopk ? nk : dtopk;
+                float *qi=falloc((int64_t)nh*hd);
+                matmul_qt(qi, QR+(int64_t)s*c->q_lora, &m->ix_wq[layer], 1);
+                for(int h=0;h<nh;h++) rope_interleave(qi+(int64_t)h*hd, pos, c);
+                float w32[64];
+                matmul_qt(w32, x+(int64_t)s*D, &m->ix_wp[layer], 1);
+                float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
+                float *isc=falloc(nk);
+                for(int t=0;t<nk;t++){
+                    const float *kt=m->Ic[layer]+(int64_t)t*hd;
+                    float a=0;
+                    for(int h=0;h<nh;h++){ const float *qhp=qi+(int64_t)h*hd;
+                        float d0=0; for(int i=0;i<hd;i++) d0+=qhp[i]*kt[i];
+                        d0*=rs; if(d0>0) a+=w32[h]*d0;       /* ReLU sullo score, poi peso */
+                    }
+                    isc[t]=a*wsc;
+                }
+                /* top-keep: soglia via qsort desc, poi scan in ordine di posizione */
+                float *tmp=falloc(nk); memcpy(tmp,isc,nk*sizeof(float));
+                qsort(tmp,nk,sizeof(float),cmp_fdesc);
+                float thr=tmp[keep-1];
+                int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
+                for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
+                for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
+                m->dsa_nsel[s]=nd;
+                free(qi); free(isc); free(tmp);
+            }
+        }
+        if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
     }
     /* WEIGHT ABSORPTION (DeepSeek): per S piccoli (decode/verifica MTP) NON si ricostruisce
      * k/v per ogni token del contesto. Per linearita':
@@ -785,21 +900,25 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
             float sc[8192];
             int st0=m->kv_start[layer];
-            for(int t=st0;t<=pos;t++){
+            int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
+            const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
+            int nt = ns ? ns : pos+1-st0;
+            for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
                 const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
                 const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
                 float a=0; for(int i=0;i<kvl;i++) a+=qabs[i]*Lt[i];
                 for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
-                sc[t-st0]=a*c->attn_scale;
+                sc[jj]=a*c->attn_scale;
             }
-            softmax(sc,pos+1-st0);
+            softmax(sc,nt);
             float clat[512]; memset(clat,0,kvl*sizeof(float));
-            for(int t=st0;t<=pos;t++){ const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
-                float a=sc[t-st0]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
+            for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
+                const float *Lt=m->Lc[layer]+(int64_t)t*kvl;
+                float a=sc[jj]; for(int i=0;i<kvl;i++) clat[i]+=a*Lt[i]; }
             qt_matvec_rows(&l->kv_b, rbase+r0v, vh, clat, ctx+((int64_t)s*H+h)*vh);
         }
         matmul_qt(out, ctx, &l->o, S);
-        free(ctx); free(Q); free(qresid); free(comp);
+        free(ctx); free(Q); free(QR); free(comp);
         m->t_attn += now_s()-ta0;
         return;
     }
@@ -817,20 +936,24 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         const float *qr=qp+c->qk_nope;
         float sc[8192];
         int st0=m->kv_start[layer];
-        for(int t=st0;t<=pos;t++){
+        int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;        /* DSA: lista top-k o range pieno */
+        const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
+        int nt = ns ? ns : pos+1-st0;
+        for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
             const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
             float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
             for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
-            sc[t-st0]=a*c->attn_scale;
+            sc[jj]=a*c->attn_scale;
         }
-        softmax(sc,pos+1-st0);
+        softmax(sc,nt);
         float *cx=ctx+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++) cx[d]=0;
-        for(int t=st0;t<=pos;t++){ const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
-            float a=sc[t-st0]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
+        for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
+            const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
+            float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     matmul_qt(out, ctx, &l->o, S);
-    free(ctx); free(Q); free(qresid); free(comp); free(kvb_all);
+    free(ctx); free(Q); free(QR); free(comp); free(kvb_all);
     m->t_attn += now_s()-ta0;
 }
 
@@ -977,6 +1100,11 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     if(m->Lc){ for(int i=0;i<c->n_layers+1;i++){ free(m->Lc[i]); free(m->Rc[i]); } free(m->Lc); free(m->Rc); }
+    if(m->Ic){ for(int i=0;i<c->n_layers;i++) free(m->Ic[i]); free(m->Ic); m->Ic=NULL; }
+    if(m->has_dsa){
+        m->Ic=calloc(c->n_layers,sizeof(float*));
+        for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) m->Ic[i]=falloc((int64_t)max_t*c->index_hd);
+    }
     m->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
     m->Lc=calloc(NR,sizeof(float*)); m->Rc=calloc(NR,sizeof(float*));
@@ -1581,6 +1709,7 @@ int main(int argc, char **argv){
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
+    g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
@@ -1593,6 +1722,7 @@ int main(int argc, char **argv){
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     if(g_draft<0) g_draft = m.has_mtp ? 3 : 0;
+    if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
     printf("caricato in %.2fs | densa residente: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
            m.has_mtp?"ATTIVA":"assente", g_draft);
