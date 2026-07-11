@@ -4088,10 +4088,13 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
         if(i==g_tap_l && g_tap_f){
             for(int s=0;s<S;s++){
                 float p=(float)(pos_base+s);
-                fwrite(&p,sizeof(float),1,g_tap_f);
-                fwrite(x+(int64_t)s*D,sizeof(float),D,g_tap_f);
+                if(fwrite(&p,sizeof(float),1,g_tap_f)!=1 ||
+                   fwrite(x+(int64_t)s*D,sizeof(float),D,g_tap_f)!=(size_t)D){
+                    perror("[TAP] fwrite"); exit(1);   /* record troncato = dati di
+                                                        * esperimento corrotti in silenzio */
+                }
             }
-            fflush(g_tap_f);
+            if(fflush(g_tap_f)!=0){ perror("[TAP] fflush"); exit(1); }
         }
         if(i==g_inj_l && g_inj_v)
             for(int s=0;s<S;s++) for(int j=0;j<D;j++)
@@ -5529,6 +5532,15 @@ static void run_serve(Model *m, const char *snap){
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
     g_kvsave = getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
+    /* INJECT + KV persistito non convivono: un KV ripreso da disco mescolerebbe
+     * token vecchi NON-steered (o steered diversamente) con token nuovi steered
+     * — e un KV steered avvelenerebbe le sessioni future. Spegnamo RUMOROSAMENTE.
+     * EN: steered runs must not resume or persist KV — silent semantic mixing. */
+    if(g_inj_v && g_kvsave){
+        g_kvsave=0;
+        fprintf(stderr,"[INJECT] KVSAVE forzato a 0: il KV persistito non porta il vettore "
+                "di steering (mix silenzioso steered/unsteered). Riparti a freddo.\n");
+    }
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>16){ fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); exit(2); }
     KVState *initial=m->kv; free(initial->kv_start); free(initial);

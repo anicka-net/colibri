@@ -35,6 +35,8 @@ SNAP = "./glm_tiny_i8"
 def run_engine(env_extra):
     env = dict(os.environ, SNAP=SNAP, **env_extra)
     out = subprocess.run(["./glm"], env=env, capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"engine exited {out.returncode}:\n{out.stdout}\n{out.stderr}")
     for line in out.stdout.splitlines():
         if line.startswith("Motore C GLM"):
             return line
@@ -81,6 +83,28 @@ def main():
                        "INJECT_SCALE": "3.0"}) != base, \
         "INJECT scale 3.0 did not change generation"
     print("INJECT unit*3.0: changes generation OK")
+
+    # --- hook-order oracle: at the SAME layer TAP runs before INJECT
+    # (sensor reads the un-steered state), one layer up it must see it ---
+    def prefill_rows(tapf):
+        recs = np.fromfile(tapf, dtype=np.float32).reshape(-1, 1 + D)
+        return recs[recs[:, 0].astype(int) < len(prompt)][:, 1:]
+
+    run_engine({"TAP": "3:/tmp/coli_tap_same.bin",
+                "INJECT": "3:/tmp/coli_inj_rand.bin", "INJECT_SCALE": "3.0"})
+    clean = prefill_rows("/tmp/coli_tap_l3.bin")       # from the TAP-only pass
+    same = prefill_rows("/tmp/coli_tap_same.bin")
+    assert np.array_equal(clean, same), \
+        "TAP at the inject layer must record the PRE-inject residual"
+    print("TAP@L3 + INJECT@L3: tap reads pre-inject state OK")
+
+    run_engine({"TAP": "4:/tmp/coli_tap_down.bin",
+                "INJECT": "3:/tmp/coli_inj_rand.bin", "INJECT_SCALE": "3.0"})
+    down = prefill_rows("/tmp/coli_tap_down.bin")
+    clean4 = prefill_rows("/tmp/coli_tap_l4.bin")
+    assert not np.array_equal(clean4, down), \
+        "TAP one layer above the inject must see the steering"
+    print("TAP@L4 + INJECT@L3: steering visible downstream OK")
     print("ALL TAP/INJECT CHECKS PASSED")
 
 
