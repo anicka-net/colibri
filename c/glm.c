@@ -1279,6 +1279,21 @@ static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' 
 static int g_pilot_inflight[256];        /* protected by g_pilot_mx; URING can load a layer concurrently */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
+static int g_tap_l=-1;   /* TAP=layer:file -> dopo il layer L appende al file un record f32
+                          * [pos, x[0..D-1]] per OGNI posizione del forward: il residuo
+                          * POST-layer (== hidden_states[L+1] di transformers). Analisi:
+                          * np.fromfile(f,dtype=np.float32).reshape(-1,1+D).
+                          * EN: activation tap on the residual stream, one f32 record
+                          * (position + row) per forward position. */
+static FILE *g_tap_f=NULL;
+static int g_inj_l=-1;   /* INJECT=layer:file -> STEERING additivo: al residuo dopo il layer L
+                          * somma INJECT_SCALE * v (v = D float32 raw dal file) su ogni
+                          * posizione. Il file DEVE essere esattamente 4*D byte: mismatch =
+                          * exit(1), niente fallback silenziosi.
+                          * EN: additive residual steering after layer L; file must hold
+                          * exactly D raw f32 values. */
+static float *g_inj_v=NULL;
+static float g_inj_s=1.0f;
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -4022,6 +4037,12 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                                                      : (g_cuda_ndev<=1 ? 1 : 8);
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 !(m->has_dsa && pos_base+S>c->index_topk);
+    /* TAP/INJECT leggono/scrivono il residuo HOST dopo ogni layer; sotto PIPE2 x resta
+     * sul device (stale sul host) -> i hook vedrebbero dati morti. Niente fallback muti. */
+    if(pipe2 && (g_tap_l>=0 || g_inj_l>=0)){
+        fprintf(stderr,"[TAP/INJECT] CUDA resident pipeline (PIPE2) disabled: hooks read/steer the host residual\n");
+        pipe2=0;
+    }
 #endif
     for(int i=0;i<c->n_layers;i++){
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
@@ -4062,6 +4083,19 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
         }
 #endif
         layer_forward_rows(m,&m->L[i],i,x,S,pos_base,kvs,positions,nrm,tmp);
+        /* TAP/INJECT: residuo post-layer i (== hidden_states[i+1]).
+         * Solo lo stack principale: i forward del layer MTP non passano di qui. */
+        if(i==g_tap_l && g_tap_f){
+            for(int s=0;s<S;s++){
+                float p=(float)(pos_base+s);
+                fwrite(&p,sizeof(float),1,g_tap_f);
+                fwrite(x+(int64_t)s*D,sizeof(float),D,g_tap_f);
+            }
+            fflush(g_tap_f);
+        }
+        if(i==g_inj_l && g_inj_v)
+            for(int s=0;s<S;s++) for(int j=0;j<D;j++)
+                x[(int64_t)s*D+j]+=g_inj_s*g_inj_v[j];
     }
 #ifdef COLI_CUDA
     if(x_dev_on>=0) coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
@@ -4070,6 +4104,46 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     layers_forward_rows(m,x,S,pos_base,NULL,NULL);
+}
+
+/* TAP/INJECT init: parse "layer:path", validazione RUMOROSA (exit su input rotto).
+ * Chiamata dopo model_init: serve n_layers per il range e D per la taglia del vettore. */
+static void tapinj_init(Model *m){
+    const char *e; Cfg *c=&m->c; int D=c->hidden;
+    if((e=getenv("TAP"))){
+        const char *colon=strchr(e,':');
+        if(!colon||colon==e||!colon[1]){ fprintf(stderr,"[TAP] formato: TAP=layer:file\n"); exit(1); }
+        g_tap_l=atoi(e);
+        if(g_tap_l<0||g_tap_l>=c->n_layers){
+            fprintf(stderr,"[TAP] layer %d fuori range (0..%d)\n",g_tap_l,c->n_layers-1); exit(1); }
+        g_tap_f=fopen(colon+1,"wb");
+        if(!g_tap_f){ perror("[TAP] fopen"); exit(1); }
+        fprintf(stderr,"[TAP] residuo post-layer %d -> %s (record f32: pos + %d dim)\n",
+                g_tap_l,colon+1,D);
+        if(g_draft>0) fprintf(stderr,"[TAP] ATTENZIONE: DRAFT=%d attivo — le posizioni dei draft "
+                "rifiutati vengono ri-forwardate (record duplicati; tieni l'ULTIMO per pos). "
+                "Per tap puliti: DRAFT=0.\n",g_draft);
+    }
+    if((e=getenv("INJECT"))){
+        const char *colon=strchr(e,':');
+        if(!colon||colon==e||!colon[1]){ fprintf(stderr,"[INJECT] formato: INJECT=layer:file\n"); exit(1); }
+        g_inj_l=atoi(e);
+        if(g_inj_l<0||g_inj_l>=c->n_layers){
+            fprintf(stderr,"[INJECT] layer %d fuori range (0..%d)\n",g_inj_l,c->n_layers-1); exit(1); }
+        FILE *f=fopen(colon+1,"rb");
+        if(!f){ perror("[INJECT] fopen"); exit(1); }
+        fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+        if(sz!=(long)D*4){
+            fprintf(stderr,"[INJECT] %s: %ld byte, attesi esattamente %d (D=%d float32)\n",
+                    colon+1,sz,D*4,D); exit(1); }
+        g_inj_v=falloc(D);
+        if(fread(g_inj_v,sizeof(float),D,f)!=(size_t)D){ fprintf(stderr,"[INJECT] short read\n"); exit(1); }
+        fclose(f);
+        if(getenv("INJECT_SCALE")) g_inj_s=atof(getenv("INJECT_SCALE"));
+        double n=0; for(int j=0;j<D;j++) n+=(double)g_inj_v[j]*g_inj_v[j];
+        fprintf(stderr,"[INJECT] steering post-layer %d: ||v||=%.3f scale=%.3f -> ||delta||=%.3f\n",
+                g_inj_l,sqrt(n),g_inj_s,sqrt(n)*fabs(g_inj_s));
+    }
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -6482,6 +6556,7 @@ int main(int argc, char **argv){
         g_draft = m.has_mtp ? 3 : 0;
 #endif
     }
+    if(getenv("TAP")||getenv("INJECT")) tapinj_init(&m);   /* dopo model_init: serve D e n_layers */
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
     /* Il path MUX (SERVE_BATCH=1, cioe' `coli serve`) forza g_draft=0 sotto —
      * la speculazione non e' ragged-safe nel batch multi-slot. Segnalarlo QUI,
