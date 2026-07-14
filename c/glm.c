@@ -896,6 +896,11 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+static int g_expert_budget=0; /* EXPERT_BUDGET=N -> cap distinct experts loaded per layer across the
+                               * batch-union. Reduces disk I/O on cold/low-RAM hosts by dropping the
+                               * lowest-gate-weight experts from the cross-position union. MoE-Spec
+                               * (arXiv 2602.16052): top-32 of 64 capture 93% routing weight. */
+static int64_t g_budget_dropped=0; /* total experts dropped by EXPERT_BUDGET across all layers */
 /* CACHE_ROUTE (paper 2412.00099 max-rank): opt-in only. Keep true top-J always;
  * fill remaining slots preferring pin∪LRU experts ranked within top-M (or mass ROUTE_P). */
 static int g_cache_route=0;
@@ -2413,6 +2418,53 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         int e=idxs[(int64_t)s*K+kk];
         if(!seen[e]){ seen[e]=1; uniq[nu++]=e; }
     }
+    /* EXPERT_BUDGET: cap distinct experts per layer to reduce disk I/O on cold/low-RAM
+     * hosts. Keep the highest-aggregate-gate-weight experts; drop the rest from idxs[]
+     * so they're never loaded. (MoE-Spec arXiv 2602.16052: top-32 of 64 capture 93%
+     * routing weight.) Complementary to TOPP (per-position) — this trims cross-position. */
+    if(g_expert_budget>0 && nu>g_expert_budget){
+        /* compute aggregate gate weight per unique expert */
+        float *wsum=falloc(nu); for(int j=0;j<nu;j++) wsum[j]=0;
+        for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
+            int e=idxs[(int64_t)s*K+kk];
+            for(int j=0;j<nu;j++) if(uniq[j]==e){ wsum[j]+=ws[(int64_t)s*K+kk]; break; }
+        }
+        /* mark which unique experts to keep (1) or drop (0) */
+        unsigned char *keep=calloc(nu,1); int nkeep=0;
+        {   /* simple selection: find top-budget by weight */
+            for(int rank=0;rank<g_expert_budget && rank<nu;rank++){
+                int best=-1; float bv=-1e30f;
+                for(int j=0;j<nu;j++) if(!keep[j] && wsum[j]>bv){ bv=wsum[j]; best=j; }
+                if(best<0) break; keep[best]=1; nkeep++;
+            }
+        }
+        /* build a lookup: for each expert id, is it kept? (reuse seen[]) */
+        memset(seen,0,(size_t)E);
+        for(int j=0;j<nu;j++) if(keep[j]) seen[uniq[j]]=1;
+        int dropped=nu-nkeep; g_budget_dropped+=dropped;
+        /* remove dropped experts from each position's routing list */
+        for(int s=0;s<S;s++){
+            int w=0;
+            for(int kk=0;kk<keff[s];kk++){
+                int e=idxs[(int64_t)s*K+kk];
+                if(seen[e]){ idxs[(int64_t)s*K+w]=e; ws[(int64_t)s*K+w]=ws[(int64_t)s*K+kk]; w++; }
+            }
+            if(w<keff[s]){
+                keff[s]=w;
+                /* renormalize remaining weights per position */
+                if(c->norm_topk && w>0){
+                    float sm=0; for(int kk=0;kk<w;kk++) sm+=ws[(int64_t)s*K+kk]; sm+=1e-20f;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]/=sm;
+                    for(int kk=0;kk<w;kk++) ws[(int64_t)s*K+kk]*=c->routed_scale;
+                }
+            }
+        }
+        /* compact uniq[] to kept experts only */
+        int nu2=0;
+        for(int j=0;j<nu;j++) if(keep[j]) uniq[nu2++]=uniq[j];
+        nu=nu2;
+        free(wsum); free(keep);
+    }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
@@ -3790,6 +3842,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("experts loaded/token: %.1f (per-layer %.2f across %d; baseline topk=%d) | TOPK=%d TOPP=%.2f",
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
     if(g_cache_route) printf(" | CACHE_ROUTE J=%d M=%d P=%.2f alpha=%.2f", g_route_j, g_route_m, g_route_p, g_route_alpha);
+    if(g_expert_budget) printf(" | EXPERT_BUDGET=%d (dropped %lld experts, ~%.1f GB I/O saved)", g_expert_budget, (long long)g_budget_dropped, g_budget_dropped*18.9e6/1e9);
     printf("\n");
     printf("speculation: %.2f tokens/forward (%llu forwards per %llu tokens) | MTP acceptance %.0f%% (%llu/%llu)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit,
@@ -4925,6 +4978,7 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_expert_budget = getenv("EXPERT_BUDGET")?atoi(getenv("EXPERT_BUDGET")):0;
     g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
     g_route_j = getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m = getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;
