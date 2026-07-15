@@ -271,20 +271,29 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->dense_load_s = now_s() - t0;
 }
 
-/* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O].
- * Container pre-quantizzato (convert_olmoe.py: int8 + scale f32 in "name.qs"):
- * lettura raw diretta — meta' I/O e zero quantize_rows a runtime. Prima di
- * questa patch il container int8 causava SIGBUS (st_read_f32 su tensori I8). */
-static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp) {
-    st_tensor *t = st_find(&m->S, name);
-    if (t && t->dtype == 3) {                    /* I8/U8: container colibri */
-        char qs[300]; snprintf(qs, sizeof(qs), "%s.qs", name);
-        st_read_raw(&m->S, name, q, 1);
-        st_read_f32(&m->S, qs, scale, 1);
-        return;
-    }
-    st_read_f32(&m->S, name, tmp, 1);            /* pread + fadvise DONTNEED */
-    quantize_rows(tmp, q, scale, O, I, m->quant_bits);
+
+static void slot_ensure_allocated(Model *m, Slot *s) {
+    if (s->g) return;
+    Cfg *c = &m->c;
+    int64_t ng = (int64_t)c->inter * c->hidden;
+    int64_t nd = (int64_t)c->hidden * c->inter;
+    int8_t *w_block = malloc(ng + ng + nd);
+    s->g = w_block;
+    s->u = w_block + ng;
+    s->d = w_block + ng + ng;
+    float *s_block = falloc(c->inter + c->inter + c->hidden);
+    s->gs = s_block;
+    s->us = s_block + c->inter;
+    s->ds = s_block + c->inter + c->inter;
+    s->pinned = 0;
+}
+
+static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+    char nm[256], qsnm[256];
+    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
+    snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
+    st_read_raw(&m->S, nm, s->g, 1);
+    st_read_raw(&m->S, qsnm, s->gs, 1);
 }
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
@@ -298,13 +307,10 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     }
     m->miss++; lc->layer_miss++;
     Cfg *c = &m->c;
-    int64_t ng = (int64_t)c->inter * c->hidden, nd = (int64_t)c->hidden * c->inter;
     Slot *s;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        s->g = malloc(ng); s->u = malloc(ng); s->d = malloc(nd);
-        s->gs = falloc(c->inter); s->us = falloc(c->inter); s->ds = falloc(c->hidden);
-        s->pinned = 0;
+        slot_ensure_allocated(m, s);
     } else {
         /* IMPROVEMENT 2: LRU eviction — never evict pinned experts */
         int lru = -1;
@@ -320,12 +326,7 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    float *tmp = falloc(ng > nd ? ng : nd);
-    char nm[256];
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid); load_expert_w(m,nm,s->g,s->gs,c->inter,c->hidden,tmp);
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.up_proj.weight",  layer,eid); load_expert_w(m,nm,s->u,s->us,c->inter,c->hidden,tmp);
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.down_proj.weight",layer,eid); load_expert_w(m,nm,s->d,s->ds,c->hidden,c->inter,tmp);
-    free(tmp);
+    load_expert_merged(m, layer, eid, s);
 
     pthread_mutex_lock(&g_pilot_mx);
     s->eid = eid;
@@ -551,7 +552,6 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 static void pilot_realload(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
     Cfg *c = &m->c;
-    int64_t ng = (int64_t)c->inter * c->hidden, nd = (int64_t)c->hidden * c->inter;
 
     pthread_mutex_lock(&g_pilot_mx);
     for (int i = 0; i < lc->n; i++) {
@@ -560,9 +560,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     Slot *s;
     if (lc->n < lc->cap) {
         s = &lc->slots[lc->n++];
-        s->g = malloc(ng); s->u = malloc(ng); s->d = malloc(nd);
-        s->gs = falloc(c->inter); s->us = falloc(c->inter); s->ds = falloc(c->hidden);
-        s->pinned = 0;
+        slot_ensure_allocated(m, s);
     } else {
         /* IMPROVEMENT 2: never evict pinned experts */
         int lru = -1;
@@ -576,15 +574,7 @@ static void pilot_realload(Model *m, int layer, int eid) {
     s->eid = -1; s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
 
-    float *tmp = falloc(ng > nd ? ng : nd);
-    char nm[256];
-    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.gate_proj.weight", layer, eid);
-    load_expert_w(m, nm, s->g, s->gs, c->inter, c->hidden, tmp);
-    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.up_proj.weight",   layer, eid);
-    load_expert_w(m, nm, s->u, s->us, c->inter, c->hidden, tmp);
-    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.down_proj.weight", layer, eid);
-    load_expert_w(m, nm, s->d, s->ds, c->hidden, c->inter, tmp);
-    free(tmp);
+    load_expert_merged(m, layer, eid, s);
 
     pthread_mutex_lock(&g_pilot_mx);
     s->eid = eid;

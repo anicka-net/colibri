@@ -67,3 +67,7 @@ c/bench/
 c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
+olmoe_merged/
+olmoe_i4/
+c/olmoe_merged/
+c/olmoe_i4/
