@@ -483,8 +483,24 @@ static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kern
  * that changes OMP scheduling vs separate matmul_qt calls — this
  * shifts floating-point accumulation order and can collapse MTP
  * draft acceptance by flipping near-ties (#163). */
+/* #163: l'acceptance MTP crolla quando il forward di draft (S=1) e quello di verifica
+ * (S>=2) non calcolano la STESSA funzione. Tre interruttori dipendono da S: il gate
+ * int4-IDOT (S>=g_i4s — asimmetrico proprio dove g_i4s>1), la fusione gate+up solo-S==1,
+ * e la soglia righe del GEMM Metal. Con SPEC_PIN=1 (default) ogni forward emesso mentre
+ * i draft del modello sono attivi resta sulla famiglia di kernel di S=1: draft e verifica
+ * coincidono per costruzione. Prefill e decode non speculativo sono intoccati.
+ * EN: MTP acceptance collapses when the draft (S=1) and verify (S>=2) forwards do not
+ * compute the SAME function. Three switches are S-dependent: the int4 IDOT gate
+ * (S>=g_i4s — asymmetric exactly on ISAs where g_i4s>1), the S==1-only gate+up fusion,
+ * and the Metal GEMM row threshold. SPEC_PIN=1 (default) pins every forward issued
+ * while model drafts are live to the platform's S=1 kernel family, so draft and verify
+ * agree by construction; prefill and non-speculative decode are untouched.
+ * SPEC_PIN=0 restores the S-dependent gates (A/B). */
+static int g_spec_pin=1;
+static int g_spec_live=0;                    /* set by spec_decode while drafts are live */
+static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
-    if(!g_no_fused_pair&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
+    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
@@ -961,7 +977,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     /* Large row-batches (prefill: kv_b reconstruction, o_proj, dense MLP, step_all logits)
      * amortize Metal's ~5ms submit latency; small-S decode matmuls stay on CPU (NEON wins).
      * Weights must be registered (all dense QT allocs are, via qalloc). */
-    if(g_metal_enabled && S>=g_metal_gemm_min && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
+    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O)) return;
     }
@@ -990,7 +1006,13 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
      * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
      * twin). Threshold configurable via I4S. */
-    if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
+    /* #163: sotto SPEC_PIN il gate int4-IDOT usa la decisione di S=1 per OGNI S, cosi'
+     * draft e verifica restano sulla stessa famiglia. (CUDA non e' toccato: la sua
+     * condizione non dipende da S, quindi e' gia' coerente tra draft e verifica.)
+     * EN: under SPEC_PIN the int4 IDOT gate uses the S=1 decision for EVERY S, so draft
+     * and verify stay in one family. (CUDA untouched: its condition is S-independent,
+     * hence already draft/verify-consistent.) */
+    if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
         quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
@@ -4077,6 +4099,18 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
+    /* #163: draft del modello attivi -> pin della famiglia di kernel per draft+verifica.
+     * EN: model drafts live -> pin the kernel family for draft+verify forwards. */
+    g_spec_live = (g_draft>0);
+    if(spec_pinned() && m->has_mtp){ static int once=0; if(!once){ once=1;
+        fprintf(stderr,"[SPEC_PIN] draft+verify pinned to the S=1 kernel family: int4=%s int8=%s (#163; SPEC_PIN=0 for A/B)\n",
+            (g_idot&&g_i4s<=1)?"idot":"exact", g_idot?"idot":"exact"); } }
+    /* guardia MTP morbida (#163): finestra di 24 proposte, pausa e ri-arma invece del
+     * latch permanente — una regressione transitoria non spegne MTP per tutta la sessione.
+     * EN: soft MTP guard (#163): 24-proposal window, pause and re-arm instead of the
+     * permanent latch — a transient collapse no longer kills MTP for the whole session. */
+    enum { GUARD_PAUSE_TOKENS = 256 };
+    uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
@@ -4089,15 +4123,19 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             g=grammar_draft(draft,g_gr_max);
             if(g>0) gsrc=1;
         }
-        if(!g && g_draft>0){
-            /* auto-off adattivo: draft che non vengono mai accettati = solo tassa disco */
-            if(m->has_mtp && m->mtp_prop>=24 && m->mtp_acc*10 < m->mtp_prop){
-                g_draft=0;
-                fprintf(stderr,"[MTP] %.0f%% acceptance after %llu proposals: drafts disabled\n",
-                    100.0*m->mtp_acc/m->mtp_prop, (unsigned long long)m->mtp_prop);
+        if(!g && g_draft>0 && m->has_mtp){
+            /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
+             * ma il vecchio g_draft=0 era permanente. EN: adaptive pause; the old
+             * g_draft=0 latch was permanent. */
+            if(gd_pause>0){ gd_pause--; if(!gd_pause){ gd_prop0=m->mtp_prop; gd_acc0=m->mtp_acc; } }
+            else if(m->mtp_prop-gd_prop0>=24 && (m->mtp_acc-gd_acc0)*10 < m->mtp_prop-gd_prop0){
+                fprintf(stderr,"[MTP] %.0f%% acceptance over the last %llu proposals: drafts paused for %d tokens\n",
+                    100.0*(m->mtp_acc-gd_acc0)/(m->mtp_prop-gd_prop0),
+                    (unsigned long long)(m->mtp_prop-gd_prop0), (int)GUARD_PAUSE_TOKENS);
+                gd_pause=GUARD_PAUSE_TOKENS;
             }
         }
-        if(!g && g_draft>0){
+        if(!g && g_draft>0 && !(m->has_mtp && gd_pause>0)){
             if(m->has_mtp){ g=mtp_draft(m,next,kv,g_draft,draft); m->mtp_prop+=g; if(g)gsrc=2; }
             else { g=ngram_draft(all,kv+1,g_draft,draft); if(g)gsrc=2; }
         }
@@ -4129,6 +4167,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         logit=falloc(V); memcpy(logit, lo+(int64_t)k*V, V*sizeof(float)); free(lo);
         repin_pass(m);                                  /* safe point: all device work is synchronized */
     }
+    g_spec_live = 0;                     /* prefill/decode successivi: gate normali / next prefill: normal gates */
     if(logit) free(logit);
     if(kv_out) *kv_out=kv;
     return emitted;
@@ -5630,6 +5669,7 @@ int main(int argc, char **argv){
 #endif
     }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    g_spec_pin = getenv("SPEC_PIN")?atoi(getenv("SPEC_PIN")):1; /* #163: 0 = gate S-dipendenti storici / legacy S-dependent gates */
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
