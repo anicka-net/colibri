@@ -1178,7 +1178,7 @@ static void numa_slab_bind(void *p, size_t n){
     if(g_numa_nodes<2 || !p || !n) return;
     unsigned long mask=(1UL<<g_numa_nodes)-1;
     uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
-    size_t len=((uintptr_t)p+n+4095 & ~(uintptr_t)4095) - a;
+    size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
     syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
             (unsigned long)(g_numa_nodes+1),(unsigned)2/*MPOL_MF_MOVE*/);
 #else
