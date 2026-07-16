@@ -448,6 +448,713 @@ static float *falloc(int64_t n){
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
 
+/* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
+static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O;o++){ const float *w=W+(int64_t)o*I;
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; for(int i=0;i<I;i++) a+=xs[i]*w[i]; y[(int64_t)s*O+o]=a; } }
+}
+/* y[S,O] = x[S,I] @ W^T con W quantizzato int8 per-riga + scala[O] (dequant-on-use) */
+static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+#ifdef __AVX2__
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+8<=I;i+=8){ __m256i wi=_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*)(w+i)));
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i), _mm256_cvtepi32_ps(wi), acc); }
+            a=hsum256(acc);
+#elif defined(__ARM_NEON)
+            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+            for(;i+8<=I;i+=8){ int16x8_t w16=vmovl_s8(vld1_s8(w+i));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),   vcvtq_f32_s32(vmovl_s16(vget_low_s16(w16))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w16)))); }
+            a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+            for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
+}
+/* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
+static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            if(g_i4_acc512){ a=dot_i4f_avx512(w,xs,I); i=I&~31; }
+            else {
+#endif
+#ifdef __AVX2__
+            const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));   /* 8 byte=16 nibble */
+                __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                __m128i nib=_mm_unpacklo_epi8(lo,hi);                                       /* nibble in ordine */
+                __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+            a=hsum256(acc);
+#elif defined(__ARM_NEON)
+            const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
+            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+            for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));               /* 8 byte=16 nibble */
+                uint8x8x2_t z=vzip_u8(vand_u8(by,m4), vshr_n_u8(by,4));        /* nibble in ordine */
+                int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[0]),b8));
+                int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(z.val[1]),b8));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
+            a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            }
+#endif
+            for(;i+1<I;i+=2){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8, hi=(int)(byte>>4)-8;
+                a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
+            if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
+            y[(int64_t)s*O+o]=a*sc; } }
+}
+/* y[S,O] = x[S,I] @ W^T with W int4 packed (2/byte) + per-GROUP scales (fmt=4).
+ * Same nibble math as matmul_i4, but the scale changes every `gs` elements along I.
+ * The accumulator resets at each group boundary: dot(x[grp], w[grp]) * scale[grp].
+ * gs MUST be a multiple of 16 (the AVX2 vector width). */
+static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const float *scale,
+                              int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float a=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float sc=scl[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 acc=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                    __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                    __m128i nib=_mm_unpacklo_epi8(lo,hi);
+                    __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+                    __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                    acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+                a+=hsum256(acc)*sc;
+#endif
+                /* scalar tail for the group remainder */
+                for(; i<base+glen; i+=2){
+                    if(i+1<base+glen){ uint8_t byte=w[i>>1];
+                        a+=(xs[i]*(float)((int)(byte&0xF)-8)+xs[i+1]*(float)((int)(byte>>4)-8))*sc; }
+                    else { uint8_t byte=w[i>>1]; a+=xs[i]*(float)((int)(byte&0xF)-8)*sc; }
+                }
+            }
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+/* Fused gate+up for grouped int4 (fmt=4): computes both yg[S,O] and yu[S,O] from
+ * the same x[S,I], with per-group scales. One OpenMP dispatch covers both matrices,
+ * reading x once instead of twice — saves ~33% of expert-matmul time at decode.
+ * The per-group scale logic matches matmul_i4_grouped exactly. */
+static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
+                                    const uint8_t *qg, const float *sg,
+                                    const uint8_t *qu, const float *su,
+                                    int S, int I, int O, int gs){
+    int rb=(I+1)/2; int ng=(I+gs-1)/gs;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *wg=qg+(int64_t)o*rb; const uint8_t *wu2=qu+(int64_t)o*rb;
+        const float *sgl=sg+(int64_t)o*ng;   const float *sul=su+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;
+            float ag=0, au=0;
+            for(int g=0; g*gs<I; g++){
+                int base=g*gs; int glen=gs; if(base+glen>I) glen=I-base;
+                float scg=sgl[g], scu=sul[g];
+                int i=base;
+#ifdef __AVX2__
+                const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+                __m256 accg=_mm256_setzero_ps(), accu=_mm256_setzero_ps();
+                for(; i+16<=base+glen; i+=16){
+                    __m128i byg=_mm_loadl_epi64((const __m128i*)(wg+(i>>1)));
+                    __m128i log=_mm_and_si128(byg,m4),hig=_mm_and_si128(_mm_srli_epi16(byg,4),m4);
+                    __m128i nibg=_mm_unpacklo_epi8(log,hig);
+                    __m256 w0g=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nibg),b8));
+                    __m256 w1g=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nibg,8)),b8));
+                    accg=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0g, accg);
+                    accg=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1g, accg);
+                    __m128i byu=_mm_loadl_epi64((const __m128i*)(wu2+(i>>1)));
+                    __m128i lou=_mm_and_si128(byu,m4),hiu=_mm_and_si128(_mm_srli_epi16(byu,4),m4);
+                    __m128i nibu=_mm_unpacklo_epi8(lou,hiu);
+                    __m256 w0u=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nibu),b8));
+                    __m256 w1u=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nibu,8)),b8));
+                    accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0u, accu);
+                    accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1u, accu);
+                }
+                ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
+#endif
+                for(; i+1<base+glen; i+=2){
+                    uint8_t bg=wg[i>>1], bu=wu2[i>>1];
+                    ag+=(xs[i]*(float)((int)(bg&0xF)-8)+xs[i+1]*(float)((int)(bg>>4)-8))*scg;
+                    au+=(xs[i]*(float)((int)(bu&0xF)-8)+xs[i+1]*(float)((int)(bu>>4)-8))*scu;
+                }
+                if(i<base+glen){
+                    uint8_t bg=wg[i>>1], bu=wu2[i>>1];
+                    ag+=xs[i]*(float)((int)(bg&0xF)-8)*scg;
+                    au+=xs[i]*(float)((int)(bu&0xF)-8)*scu;
+                }
+            }
+            yg[(int64_t)s*O+o]=ag; yu[(int64_t)s*O+o]=au;
+        }
+    }
+}
+/* Decode hot path for gate+up: same exact q4 dot products as matmul_i4, but one
+ * OpenMP dispatch covers both matrices. KTransformers uses persistent pools;
+ * this keeps colibri dependency-free while removing one team launch/expert. */
+static void matmul_i4_pair(float *yg, float *yu, const float *x,
+                           const uint8_t *qg, const float *sg,
+                           const uint8_t *qu, const float *su, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int z=0;z<2*O;z++){
+        int o=z<O?z:z-O; const uint8_t *w=(z<O?qg:qu)+(int64_t)o*rb;
+        float a=0; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        if(g_i4_acc512){ a=dot_i4f_avx512(w,x,I); i=I&~31; }
+        else {
+#endif
+#ifdef __AVX2__
+        const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
+        __m256 acc=_mm256_setzero_ps();
+        for(;i+16<=I;i+=16){ __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+            __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+            __m128i nib=_mm_unpacklo_epi8(lo,hi);
+            __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b8));
+            __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i),w0,acc);
+            acc=_mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),w1,acc); }
+        a=hsum256(acc);
+#elif defined(__ARM_NEON)
+        const uint8x8_t m4=vdup_n_u8(0x0F); const int8x8_t b8=vdup_n_s8(8);
+        float32x4_t ac0=vdupq_n_f32(0),ac1=vdupq_n_f32(0);
+        for(;i+16<=I;i+=16){ uint8x8_t by=vld1_u8(w+(i>>1));
+            uint8x8x2_t n=vzip_u8(vand_u8(by,m4),vshr_n_u8(by,4));
+            int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u8(n.val[0]),b8));
+            int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u8(n.val[1]),b8));
+            ac0=vfmaq_f32(ac0,vld1q_f32(x+i),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+            ac1=vfmaq_f32(ac1,vld1q_f32(x+i+4),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+            ac0=vfmaq_f32(ac0,vld1q_f32(x+i+8),vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+            ac1=vfmaq_f32(ac1,vld1q_f32(x+i+12),vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
+        a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        }
+#endif
+        for(;i+1<I;i+=2){ uint8_t b=w[i>>1]; a+=x[i]*(float)((b&15)-8)+x[i+1]*(float)((b>>4)-8); }
+        if(i<I) a+=x[i]*(float)((w[i>>1]&15)-8);
+        (z<O?yg:yu)[o]=a*(z<O?sg:su)[o];
+    }
+}
+
+static void matmul_qt(float *y,const float *x,QT *w,int S);
+static int g_no_fused_pair=0;  /* COLI_NO_FUSED_PAIR=1: disable the gate+up kernel fusion
+ * that changes OMP scheduling vs separate matmul_qt calls — this
+ * shifts floating-point accumulation order and can collapse MTP
+ * draft acceptance by flipping near-ties (#163). */
+/* #163: l'acceptance MTP crolla quando il forward di draft (S=1) e quello di verifica
+ * (S>=2) non calcolano la STESSA funzione. Tre interruttori dipendono da S: il gate
+ * int4-IDOT (S>=g_i4s — asimmetrico proprio dove g_i4s>1), la fusione gate+up solo-S==1,
+ * e la soglia righe del GEMM Metal. Con SPEC_PIN=1 (default) ogni forward emesso mentre
+ * i draft del modello sono attivi resta sulla famiglia di kernel di S=1: draft e verifica
+ * coincidono per costruzione. Prefill e decode non speculativo sono intoccati.
+ * EN: MTP acceptance collapses when the draft (S=1) and verify (S>=2) forwards do not
+ * compute the SAME function. Three switches are S-dependent: the int4 IDOT gate
+ * (S>=g_i4s — asymmetric exactly on ISAs where g_i4s>1), the S==1-only gate+up fusion,
+ * and the Metal GEMM row threshold. SPEC_PIN=1 (default) pins every forward issued
+ * while model drafts are live to the platform's S=1 kernel family, so draft and verify
+ * agree by construction; prefill and non-speculative decode are untouched.
+ * SPEC_PIN=0 restores the S-dependent gates (A/B). */
+static int g_spec_pin=1;
+static int g_spec_live=0;                    /* set by spec_decode while drafts are live */
+static inline int spec_pinned(void){ return g_spec_pin && g_spec_live; }
+static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
+    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
+        matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
+    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
+        matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
+    else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
+}
+/* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
+static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
+    int rb=(I+3)/4;
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o];
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+#ifdef __AVX2__
+            const __m128i m2=_mm_set1_epi8(0x03); const __m256i b2=_mm256_set1_epi32(2);
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+16<=I;i+=16){ __m128i by=_mm_cvtsi32_si128(*(const int*)(w+(i>>2)));    /* 4 byte=16 valori */
+                __m128i p0=_mm_and_si128(by,m2), p1=_mm_and_si128(_mm_srli_epi16(by,2),m2);
+                __m128i p2=_mm_and_si128(_mm_srli_epi16(by,4),m2), p3=_mm_and_si128(_mm_srli_epi16(by,6),m2);
+                __m128i lo=_mm_unpacklo_epi8(p0,p1), hi=_mm_unpacklo_epi8(p2,p3);
+                __m128i nib=_mm_unpacklo_epi16(lo,hi);                                      /* 16 valori in ordine */
+                __m256 w0=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(nib),b2));
+                __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b2));
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
+            a=hsum256(acc);
+#elif defined(__ARM_NEON)
+            const uint8x8_t m2v=vdup_n_u8(3); const int8x8_t b2v=vdup_n_s8(2);
+            float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+            for(;i+16<=I;i+=16){ uint32_t wd; memcpy(&wd, w+(i>>2), 4);        /* 4 byte=16 valori */
+                uint8x8_t by=vreinterpret_u8_u32(vdup_n_u32(wd));
+                uint8x8x2_t z01=vzip_u8(vand_u8(by,m2v),              vand_u8(vshr_n_u8(by,2),m2v));
+                uint8x8x2_t z23=vzip_u8(vand_u8(vshr_n_u8(by,4),m2v), vshr_n_u8(by,6));
+                uint16x4x2_t zz=vzip_u16(vreinterpret_u16_u8(z01.val[0]), vreinterpret_u16_u8(z23.val[0]));
+                int16x8_t w0=vmovl_s8(vsub_s8(vreinterpret_s8_u16(zz.val[0]),b2v));  /* 16 valori in ordine */
+                int16x8_t w1=vmovl_s8(vsub_s8(vreinterpret_s8_u16(zz.val[1]),b2v));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i),    vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0))));
+                ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
+                ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
+            a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+            for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
+            y[(int64_t)s*O+o]=a*sc; } }
+}
+/* ---- KERNEL INTERI (IDOT): attivazioni quantizzate a int8 per riga (absmax/127,
+ * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
+ * f32 dei pesi nel ciclo caldo. ~2-3x sui matmul quantizzati; errore aggiunto ~0.3%
+ * RMS per matmul (attivazione int8), IDOT=0 torna al percorso f32 esatto. */
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#define IDOT_KERNEL "avx512-vnni"
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+#define IDOT_KERNEL "avx-vnni"
+#elif defined(__AVX2__)
+#define IDOT_KERNEL "avx2"
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+#define IDOT_KERNEL "neon-i8mm"
+#elif defined(__ARM_NEON)
+#define IDOT_KERNEL "neon"
+#elif defined(__VSX__)
+#define IDOT_KERNEL "vsx"
+#else
+#define IDOT_KERNEL "scalar"
+#endif
+static int g_idot=1;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
+                       * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
+                       * IDOT pays even at S=1 (decode); measured on Apple M-series. */
+#elif defined(__VSX__)
+static int g_i4s=1;   /* POWER8 vec_msum: qui il fallback f32 e' SCALARE, quindi l'IDOT
+                       * int4 conviene anche a S=1. Misurato su POWER8 S824 (vedi PR).
+                       * EN: on VSX the f32 fallback is plain scalar C, so int4 IDOT
+                       * pays even at S=1. Measured on a POWER8 S824 (see PR). */
+#else
+static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
+                       * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
+#endif
+static inline float qrow_i8(const float *x, int8_t *q, int I){
+    float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
+    float s=amax/127.f; if(s<1e-12f) s=1e-12f; float inv=1.f/s;
+    for(int i=0;i<I;i++) q[i]=(int8_t)lrintf(x[i]*inv);
+    return s;
+}
+#ifdef __AVX2__
+static inline int hsum256_i32(__m256i v){
+    __m128i lo=_mm256_castsi256_si128(v), hi=_mm256_extracti128_si256(v,1);
+    lo=_mm_add_epi32(lo,hi); lo=_mm_hadd_epi32(lo,lo); lo=_mm_hadd_epi32(lo,lo);
+    return _mm_cvtsi128_si32(lo);
+}
+#endif
+#if defined(__AVXVNNI__) && defined(__AVX2__)
+/* hsum di un __m128i a 4 lane s32 (l'AVX-VNNI 128-bit accumula su 4 lane). */
+static inline int hsum128_i32(__m128i v){
+    v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
+}
+#endif
+/* dot int8·int8: trucco del segno (|w| unsigned × x·sign(w) signed). Sicuro:
+ * coppie <= 128*127*2 = 32512 < 32767, accumulo s32 fino a I=16384. */
+static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* VNNI: vpdpbusd u8*s8 -> s32 directly, 64 bytes/iter, no 16-bit intermediate.
+     * AVX-512 has no vpsignb: |w| via abs, sign folded into x with a mask-negate
+     * (w==0 -> product 0 either way). |x|<=127 (qrow_i8), |w|<=128 as u8: each
+     * s32 lane adds <= 4*128*127, safe up to I=16384 like the AVX2 bound. */
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m512i wv=_mm512_loadu_si512((const void*)(w+i));
+        __m512i xv=_mm512_loadu_si512((const void*)(x+i));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit: vpdpbusd u8*s8 -> s32, 16 byte/iter. Stesso trucco del
+     * segno della variante 512-bit: |w| via abs, segno piegato in x con maschera
+     * (w==0 -> product 0). __AVX2__ serve per _mm_sign_epi8 / abs. */
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i xs=_mm_sign_epi8(xv,wv);              /* x * sign(w); _mm_sign zona __AVX2__ */
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(wv),xs);
+    }
+    sum=hsum128_i32(acc);
+#elif defined(__AVX2__)
+    __m256i acc=_mm256_setzero_si256(); const __m256i ones=_mm256_set1_epi16(1);
+    for(;i+32<=I;i+=32){
+        __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i));
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+#elif defined(__ARM_NEON)
+    /* ARM: SDOT nativo se disponibile (Apple Silicon: sempre); altrimenti vmull/vpadal.
+     * Stesso bound anti-overflow del trucco AVX2: coppie <= 128*127*2 = 32512 < 32767. */
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* 4 accumulatori indipendenti: SDOT ha latenza ~3-4 cicli, con un solo acc la
+     * catena seriale strozza il core a ~26 GB/s di pesi; con 4 lane indipendenti il
+     * dot diventa memory-bound (misurato su M4: 26 -> 63 GB/s per core, 2.4x). */
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        a0=vdotq_s32(a0,vld1q_s8(w+i),   vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vld1q_s8(w+i+16),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vld1q_s8(w+i+32),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vld1q_s8(w+i+48),vld1q_s8(x+i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+16<=I;i+=16) acc=vdotq_s32(acc,vld1q_s8(w+i),vld1q_s8(x+i));
+    sum=vaddvq_s32(acc);
+#else
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+16<=I;i+=16){
+        int8x16_t wv=vld1q_s8(w+i), xv=vld1q_s8(x+i);
+        int16x8_t p=vmull_s8(vget_low_s8(wv),vget_low_s8(xv));
+        p=vmlal_s8(p,vget_high_s8(wv),vget_high_s8(xv));
+        acc=vpadalq_s16(acc,p);
+    }
+    sum=vaddvq_s32(acc);
+#endif
+#elif defined(__VSX__)
+    /* POWER8: vec_msum (s8 x u8 -> s32) somma i prodotti byte DIRETTAMENTE in lane
+     * s32, 16 byte/iter: il bound anti-saturazione a 16 bit di maddubs qui non serve.
+     * Stesso trucco del segno (|w| u8 per x*sign(w) s8), ma |w| via select+sub MODULO
+     * e non vec_abs: -128 deve diventare 128 u8, non saturare a 127.
+     * EN: vec_msum accumulates byte products straight into s32 lanes; |w| is built
+     * with a modulo subtract select instead of vec_abs so w=-128 wraps to 128 (u8)
+     * rather than saturating to 127. |x|<=127 from qrow_i8, so x negation is safe. */
+    __vector signed int acc=vec_splats(0);
+    const __vector signed char vz=vec_splats((signed char)0);
+    for(;i+16<=I;i+=16){
+        __vector signed char wv=vec_xl(0,(const signed char*)(w+i));
+        __vector signed char xv=vec_xl(0,(const signed char*)(x+i));
+        __vector __bool char neg=vec_cmplt(wv,vz);
+        __vector signed char xs=vec_sel(xv,vec_sub(vz,xv),neg);
+        __vector unsigned char wa=(__vector unsigned char)vec_sel(wv,vec_sub(vz,wv),neg);
+        acc=vec_msum(xs,wa,acc);
+    }
+    sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
+#endif
+    for(;i<I;i++) sum+=(int32_t)w[i]*x[i];
+    return sum;
+}
+/* dot int4(packed)·int8: nibble -> int8 [-8,7] al volo, poi stesso trucco */
+static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
+    int32_t sum=0; int i=0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
+     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
+     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
+     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
+    const __m256i m4v=_mm256_set1_epi8(0x0F);
+    const __m512i b8v=_mm512_set1_epi8(8);
+    const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
+    __m512i acc=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m256i by=_mm256_loadu_si256((const __m256i*)(w4+(i>>1)));
+        __m256i lo=_mm256_and_si256(by,m4v), hi=_mm256_and_si256(_mm256_srli_epi16(by,4),m4v);
+        __m256i z0=_mm256_unpacklo_epi8(lo,hi), z1=_mm256_unpackhi_epi8(lo,hi);
+        __m512i wv=_mm512_sub_epi8(_mm512_inserti64x4(_mm512_castsi256_si512(z0),z1,1),b8v);
+        __m512i xv=_mm512_permutexvar_epi64(xidx,_mm512_loadu_si512((const void*)(x+i)));
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        __m512i xs=_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv);
+        acc=_mm512_dpbusd_epi32(acc,_mm512_abs_epi8(wv),xs);
+    }
+    sum=_mm512_reduce_add_epi32(acc);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    /* AVX-VNNI 128-bit, int4: 16 byte = 32 nibble -> int8 [-8,7] in due half
+     * (n0/n1), ciascuno alimentato a un vpdpbusd da 16 byte. Stesso unpack
+     * 128-bit del ramo AVX2 sotto; 32 elementi/iter come li. */
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);  /* nibble in ordine */
+        __m128i w0=_mm_sub_epi8(n0,b8), w1=_mm_sub_epi8(n1,b8);
+        __m128i x0=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i x1=_mm_loadu_si128((const __m128i*)(x+i+16));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w0),_mm_sign_epi8(x0,w0));
+        acc=_mm_dpbusd_epi32(acc,_mm_abs_epi8(w1),_mm_sign_epi8(x1,w1));
+    }
+    sum=hsum128_i32(acc);
+#elif defined(__AVX2__)
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi8(8);
+    const __m256i ones=_mm256_set1_epi16(1);
+    __m256i acc=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in ordine */
+        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
+        __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
+        __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
+        acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
+    }
+    sum=hsum256_i32(acc);
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* 4 accumulatori indipendenti (vedi dot_i8i8): spezza la catena seriale su acc.
+     * Misurato su M4: 12.4 -> 29.9 GB/s di pesi per core (2.4x). */
+    int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
+    for(;i+64<=I;i+=64){
+        uint8x16_t byA=vld1q_u8(w4+(i>>1)), byB=vld1q_u8(w4+(i>>1)+16);
+        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q), vshrq_n_u8(byA,4)); /* nibble in ordine */
+        uint8x16x2_t zB=vzipq_u8(vandq_u8(byB,m4q), vshrq_n_u8(byB,4));
+        a0=vdotq_s32(a0,vsubq_s8(vreinterpretq_s8_u8(zA.val[0]),b8q),vld1q_s8(x+i));
+        a1=vdotq_s32(a1,vsubq_s8(vreinterpretq_s8_u8(zA.val[1]),b8q),vld1q_s8(x+i+16));
+        a2=vdotq_s32(a2,vsubq_s8(vreinterpretq_s8_u8(zB.val[0]),b8q),vld1q_s8(x+i+32));
+        a3=vdotq_s32(a3,vsubq_s8(vreinterpretq_s8_u8(zB.val[1]),b8q),vld1q_s8(x+i+48));
+    }
+    int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q),vld1q_s8(x+i));
+        acc=vdotq_s32(acc,vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q),vld1q_s8(x+i+16));
+    }
+    sum=vaddvq_s32(acc);
+#else
+    int32x4_t acc=vdupq_n_s32(0);
+    for(;i+32<=I;i+=32){
+        uint8x16_t by=vld1q_u8(w4+(i>>1));                          /* 16 byte = 32 nibble */
+        uint8x16x2_t z=vzipq_u8(vandq_u8(by,m4q), vshrq_n_u8(by,4)); /* nibble in ordine */
+        int8x16_t w0=vsubq_s8(vreinterpretq_s8_u8(z.val[0]),b8q);
+        int8x16_t w1=vsubq_s8(vreinterpretq_s8_u8(z.val[1]),b8q);
+        int8x16_t x0=vld1q_s8(x+i), x1=vld1q_s8(x+i+16);
+        int16x8_t p=vmull_s8(vget_low_s8(w0),vget_low_s8(x0));      /* |w|<=8: nessun overflow */
+        p=vmlal_s8(p,vget_high_s8(w0),vget_high_s8(x0));
+        acc=vpadalq_s16(acc,p);
+        p=vmull_s8(vget_low_s8(w1),vget_low_s8(x1));
+        p=vmlal_s8(p,vget_high_s8(w1),vget_high_s8(x1));
+        acc=vpadalq_s16(acc,p);
+    }
+    sum=vaddvq_s32(acc);
+#endif
+#elif defined(__VSX__)
+    /* 16 byte = 32 nibble. vec_mergeh/vec_mergel su ppc64le (GCC) interallacciano come
+     * unpacklo/unpackhi x86 (verificato empiricamente su POWER8): i nibble escono in
+     * ordine di memoria. |w|<=8 dopo il -8, quindi stesso trucco del segno di dot_i8i8.
+     * EN: vec_mergeh/l on ppc64le interleave like x86 unpacklo/hi (verified on POWER8),
+     * so nibbles come out in memory order; then the same sign trick as dot_i8i8. */
+    const __vector unsigned char m4v=vec_splats((unsigned char)0x0F);
+    const __vector unsigned char sh4=vec_splats((unsigned char)4);
+    const __vector signed char b8v=vec_splats((signed char)8);
+    const __vector signed char vz=vec_splats((signed char)0);
+    __vector signed int acc=vec_splats(0);
+    for(;i+32<=I;i+=32){
+        __vector unsigned char by=vec_xl(0,w4+(i>>1));               /* 16 byte = 32 nibble */
+        __vector unsigned char lo=vec_and(by,m4v), hi=vec_sr(by,sh4);
+        __vector signed char w0=vec_sub((__vector signed char)vec_mergeh(lo,hi),b8v);
+        __vector signed char w1=vec_sub((__vector signed char)vec_mergel(lo,hi),b8v);
+        __vector signed char x0=vec_xl(0,(const signed char*)(x+i));
+        __vector signed char x1=vec_xl(0,(const signed char*)(x+i+16));
+        __vector __bool char n0=vec_cmplt(w0,vz), n1=vec_cmplt(w1,vz);
+        acc=vec_msum(vec_sel(x0,vec_sub(vz,x0),n0),
+                     (__vector unsigned char)vec_sel(w0,vec_sub(vz,w0),n0),acc);
+        acc=vec_msum(vec_sel(x1,vec_sub(vz,x1),n1),
+                     (__vector unsigned char)vec_sel(w1,vec_sub(vz,w1),n1),acc);
+    }
+    sum=vec_extract(acc,0)+vec_extract(acc,1)+vec_extract(acc,2)+vec_extract(acc,3);
+#endif
+    for(;i+1<I;i+=2){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+    if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
+    return sum;
+}
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+/* SMMLA (i8mm): vmmlaq_s32 vede ogni int8x16_t come matrice 2x8 row-major (byte 0-7 =
+ * riga 0, byte 8-15 = riga 1) e accumula C += A*B^T nel 2x2 int32: lane0=a0.b0,
+ * lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine di due mezze-righe costruisce la
+ * matrice: A = due righe di peso (o,o+1), B = due righe di attivazione (s,s+1), quindi
+ * meta' traffico pesi e doppio lavoro per istruzione a S>=2. EN: vmmlaq_s32 treats each
+ * int8x16_t as a 2x8 row-major matrix and does C += A*B^T on a 2x2 int32 tile; vcombine
+ * of vget_low/high halves builds the 2-row register from two weight/activation rows. */
+static inline int32x4_t mm_tile16(int32x4_t acc, int8x16_t wo, int8x16_t wo1,
+                                  int8x16_t xs, int8x16_t xs1){
+    acc=vmmlaq_s32(acc, vcombine_s8(vget_low_s8(wo), vget_low_s8(wo1)),
+                        vcombine_s8(vget_low_s8(xs), vget_low_s8(xs1)));
+    return vmmlaq_s32(acc, vcombine_s8(vget_high_s8(wo), vget_high_s8(wo1)),
+                           vcombine_s8(vget_high_s8(xs), vget_high_s8(xs1)));
+}
+static void matmul_q_idot_mm(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                             const float *scale, int S, int I, int O){
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<(O&~1);o+=2){
+        const int8_t *wo=q+(int64_t)o*I, *wo1=q+(int64_t)(o+1)*I;
+        float sc0=scale[o], sc1=scale[o+1];
+        for(int s=0;s<(S&~1);s+=2){
+            const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
+            /* 4 accumulatori indipendenti: una sola catena vmmla e' latency-bound.
+             * EN: 4 independent accumulators; a single vmmla chain is latency-bound. */
+            int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
+            for(;i+64<=I;i+=64){
+                a0=mm_tile16(a0,vld1q_s8(wo+i),   vld1q_s8(wo1+i),   vld1q_s8(xs+i),   vld1q_s8(xs1+i));
+                a1=mm_tile16(a1,vld1q_s8(wo+i+16),vld1q_s8(wo1+i+16),vld1q_s8(xs+i+16),vld1q_s8(xs1+i+16));
+                a2=mm_tile16(a2,vld1q_s8(wo+i+32),vld1q_s8(wo1+i+32),vld1q_s8(xs+i+32),vld1q_s8(xs1+i+32));
+                a3=mm_tile16(a3,vld1q_s8(wo+i+48),vld1q_s8(wo1+i+48),vld1q_s8(xs+i+48),vld1q_s8(xs1+i+48));
+            }
+            for(;i+16<=I;i+=16)
+                a0=mm_tile16(a0,vld1q_s8(wo+i),vld1q_s8(wo1+i),vld1q_s8(xs+i),vld1q_s8(xs1+i));
+            int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+            int32_t d00=vgetq_lane_s32(acc,0), d01=vgetq_lane_s32(acc,1);
+            int32_t d10=vgetq_lane_s32(acc,2), d11=vgetq_lane_s32(acc,3);
+            for(;i<I;i++){ int a=wo[i],b=wo1[i],u=xs[i],v=xs1[i];
+                d00+=a*u; d01+=a*v; d10+=b*u; d11+=b*v; }
+            y[(int64_t)s*O+o]        =(float)d00*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]    =(float)d10*sc1*sx[s];
+            y[(int64_t)(s+1)*O+o]    =(float)d01*sc0*sx[s+1];
+            y[(int64_t)(s+1)*O+(o+1)]=(float)d11*sc1*sx[s+1];
+        }
+        if(S&1){ int s=S-1; const int8_t *xs=xq+(int64_t)s*I;
+            y[(int64_t)s*O+o]    =(float)dot_i8i8(wo, xs,I)*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]=(float)dot_i8i8(wo1,xs,I)*sc1*sx[s]; }
+    }
+    if(O&1){ int o=O-1; const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+        #pragma omp parallel for schedule(static)
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+static void matmul_i4_idot_mm(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
+                              const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<(O&~1);o+=2){
+        const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+        const uint8_t *wo=q4+(int64_t)o*rb, *wo1=q4+(int64_t)(o+1)*rb;
+        float sc0=scale[o], sc1=scale[o+1];
+        for(int s=0;s<(S&~1);s+=2){
+            const int8_t *xs=xq+(int64_t)s*I, *xs1=xq+(int64_t)(s+1)*I;
+            /* 4 accumulatori indipendenti (vedi matmul_q_idot_mm).
+             * EN: 4 independent accumulators, see matmul_q_idot_mm. */
+            int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0); int i=0;
+            for(;i+64<=I;i+=64){
+                uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
+                uint8x16_t cyo=vld1q_u8(wo+(i>>1)+16), cyo1=vld1q_u8(wo1+(i>>1)+16);
+                uint8x16x2_t zo =vzipq_u8(vandq_u8(byo, m4q), vshrq_n_u8(byo, 4));
+                uint8x16x2_t zo1=vzipq_u8(vandq_u8(byo1,m4q), vshrq_n_u8(byo1,4));
+                uint8x16x2_t ko =vzipq_u8(vandq_u8(cyo, m4q), vshrq_n_u8(cyo, 4));
+                uint8x16x2_t ko1=vzipq_u8(vandq_u8(cyo1,m4q), vshrq_n_u8(cyo1,4));
+                a0=mm_tile16(a0, vsubq_s8(vreinterpretq_s8_u8(zo.val[0]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[0]),b8q),
+                                 vld1q_s8(xs+i), vld1q_s8(xs1+i));
+                a1=mm_tile16(a1, vsubq_s8(vreinterpretq_s8_u8(zo.val[1]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[1]),b8q),
+                                 vld1q_s8(xs+i+16), vld1q_s8(xs1+i+16));
+                a2=mm_tile16(a2, vsubq_s8(vreinterpretq_s8_u8(ko.val[0]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(ko1.val[0]),b8q),
+                                 vld1q_s8(xs+i+32), vld1q_s8(xs1+i+32));
+                a3=mm_tile16(a3, vsubq_s8(vreinterpretq_s8_u8(ko.val[1]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(ko1.val[1]),b8q),
+                                 vld1q_s8(xs+i+48), vld1q_s8(xs1+i+48));
+            }
+            for(;i+32<=I;i+=32){
+                uint8x16_t byo=vld1q_u8(wo+(i>>1)), byo1=vld1q_u8(wo1+(i>>1));
+                uint8x16x2_t zo =vzipq_u8(vandq_u8(byo, m4q), vshrq_n_u8(byo, 4));
+                uint8x16x2_t zo1=vzipq_u8(vandq_u8(byo1,m4q), vshrq_n_u8(byo1,4));
+                a0=mm_tile16(a0, vsubq_s8(vreinterpretq_s8_u8(zo.val[0]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[0]),b8q),
+                                 vld1q_s8(xs+i), vld1q_s8(xs1+i));
+                a1=mm_tile16(a1, vsubq_s8(vreinterpretq_s8_u8(zo.val[1]),b8q),
+                                 vsubq_s8(vreinterpretq_s8_u8(zo1.val[1]),b8q),
+                                 vld1q_s8(xs+i+16), vld1q_s8(xs1+i+16));
+            }
+            int32x4_t acc=vaddq_s32(vaddq_s32(a0,a1),vaddq_s32(a2,a3));
+            int32_t d00=vgetq_lane_s32(acc,0), d01=vgetq_lane_s32(acc,1);
+            int32_t d10=vgetq_lane_s32(acc,2), d11=vgetq_lane_s32(acc,3);
+            for(;i+1<I;i+=2){ uint8_t bo=wo[i>>1], bo1=wo1[i>>1];
+                int a0=(int)(bo&0xF)-8, a1=(int)(bo>>4)-8, b0=(int)(bo1&0xF)-8, b1=(int)(bo1>>4)-8;
+                int u0=xs[i],u1=xs[i+1],v0=xs1[i],v1=xs1[i+1];
+                d00+=a0*u0+a1*u1; d01+=a0*v0+a1*v1; d10+=b0*u0+b1*u1; d11+=b0*v0+b1*v1; }
+            if(i<I){ uint8_t bo=wo[i>>1], bo1=wo1[i>>1];
+                int a0=(int)(bo&0xF)-8, b0=(int)(bo1&0xF)-8;
+                d00+=a0*xs[i]; d01+=a0*xs1[i]; d10+=b0*xs[i]; d11+=b0*xs1[i]; }
+            y[(int64_t)s*O+o]        =(float)d00*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]    =(float)d10*sc1*sx[s];
+            y[(int64_t)(s+1)*O+o]    =(float)d01*sc0*sx[s+1];
+            y[(int64_t)(s+1)*O+(o+1)]=(float)d11*sc1*sx[s+1];
+        }
+        if(S&1){ int s=S-1; const int8_t *xs=xq+(int64_t)s*I;
+            y[(int64_t)s*O+o]    =(float)dot_i4i8(wo, xs,I)*sc0*sx[s];
+            y[(int64_t)s*O+(o+1)]=(float)dot_i4i8(wo1,xs,I)*sc1*sx[s]; }
+    }
+    if(O&1){ int o=O-1; const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        #pragma omp parallel for schedule(static)
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+#endif
+static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
+                          const float *scale, int S, int I, int O){
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if(S>=2){ matmul_q_idot_mm(y,xq,sx,q,scale,S,I,O); return; }
+#endif
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
+                           const float *scale, int S, int I, int O){
+    int rb=(I+1)/2;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if(S>=2){ matmul_i4_idot_mm(y,xq,sx,q4,scale,S,I,O); return; }
+#endif
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+}
+
+typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
+static _Thread_local QScratch g_qscratch;
+static void quant_scratch(size_t xn, size_t sn, int8_t **xq, float **sx){
+    if(xn>g_qscratch.xq_cap){
+        int8_t *p=realloc(g_qscratch.xq,xn);
+        if(!p){ fprintf(stderr,"OOM quant scratch\n"); exit(1); }
+        g_qscratch.xq=p; g_qscratch.xq_cap=xn;
+    }
+    if(sn>g_qscratch.sx_cap){
+        float *p=realloc(g_qscratch.sx,sn*sizeof(float));
+        if(!p){ fprintf(stderr,"OOM quant scales\n"); exit(1); }
+        g_qscratch.sx=p; g_qscratch.sx_cap=sn;
+    }
+    *xq=g_qscratch.xq; *sx=g_qscratch.sx;
+}
+
+/* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
+ * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
+ * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
+ * ~+12% perplexity. Gli altri matmul del prefill (o_proj, kv_b, expert) tengono l'IDOT.
+ * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
+ * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
+ * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
+static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot);
+static void matmul_qt(float *y, const float *x, QT *w, int S){ matmul_qt_ex(y,x,w,S,1); }
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
 #ifdef COLI_METAL
     if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2) && !omp_in_parallel()){
@@ -459,7 +1166,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
         w->cuda_failed=1;
         fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
@@ -934,13 +1641,14 @@ static void qt_cuda_colocate(QT *dst,const QT *src){
 }
 static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
     if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0)return;
-    int rb=l->kv_b.fmt==1?l->kv_b.I:(l->kv_b.fmt==2?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4);
+    int rb=l->kv_b.fmt==1?l->kv_b.I:
+           (l->kv_b.fmt==2||l->kv_b.fmt==4)?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4;
     const uint8_t *weights=l->kv_b.fmt==1?(const uint8_t*)l->kv_b.q8:l->kv_b.q4;
     for(int d=0,h0=0;d<g_cuda_ndev;d++){
         int hn=H/g_cuda_ndev+(d<H%g_cuda_ndev),rows=hn*(Q+V);
         const void *part=weights+(int64_t)h0*(Q+V)*rb;
         const float *scale=l->kv_b.s+(int64_t)h0*(Q+V);
-        if(!coli_cuda_tensor_upload(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d]))return;
+        if(!coli_cuda_tensor_upload(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d],l->kv_b.gs))return;
         l->shard_h0[d]=h0;l->shard_hn[d]=hn;l->n_kv_b_shard++;h0+=hn;
     }
     int old=-1;for(int i=0;i<g_cuda_ndev;i++)if(g_cuda_devices[i]==l->kv_b.cuda_device)old=i;
@@ -1122,6 +1830,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(e->fmt==4){ /* grouped int4: per-group scale (embed/lm_head at io_bits, usually fmt 0/1) */
+        const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); int gs=e->gs,ng=(D+gs-1)/gs;
+        const float *scl=e->s+(int64_t)tok*ng;
+        for(int g=0;g*gs<D;g++){ int base=g*gs,glen=gs; if(base+glen>D)glen=D-base; float s=scl[g];
+            for(int i=base;i+1<base+glen;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
+                x[i+1]=(float)((int)(byte>>4)-8)*s; }
+            if(glen&1){ uint8_t byte=q[(base+glen-1)>>1]; x[base+glen-1]=(float)((int)(byte&0xF)-8)*s; } }
+        return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
@@ -1885,6 +2601,13 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     int I=t->I;
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
+        else if(t->fmt==4){ /* grouped int4: per-group scale */
+            const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); int gs=t->gs,ng=(I+gs-1)/gs;
+            const float *scl=t->s+(int64_t)row*ng;
+            for(int g=0;g*gs<I;g++){ int base=g*gs,glen=gs; if(base+glen>I)glen=I-base; float sc=scl[g]; float acc=0;
+                for(int i=base;i+1<base+glen;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
+                if(glen&1){ uint8_t b=w[(base+glen-1)>>1]; acc+=((int)(b&0xF)-8)*x[base+glen-1]; }
+                a+=acc*sc; } }
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
             float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
@@ -4479,9 +5202,21 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     grammar_setup(&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
-    int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
+    int cap=(int)strlen(prompt)+16; int *pids=malloc((cap+2)*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt is empty after tokenization\n"); return; }
+    /* GLM prefix (#108): every GLM training sequence starts [gMASK]<sop>; without it the
+     * model is out-of-distribution and generates garbage. Serve/SCORE modes prepend it;
+     * run_text must too. CHAT_TEMPLATE=0 disables (raw prompt, for debugging/non-GLM).
+     * A prompt that already starts with the prefix passes through intact. */
+    int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
+    if(templ){
+        int gmask=tok_id_of(&T,"[gMASK]"), sop=tok_id_of(&T,"<sop>");
+        if(gmask>=0 && sop>=0 && (np<2 || pids[0]!=gmask || pids[1]!=sop)){
+            memmove(pids+2,pids,np*sizeof(int));
+            pids[0]=gmask; pids[1]=sop; np+=2;
+        }
+    }
     printf("prompt: %d tokens | generating up to %d (EOS stop=%d) | n-gram draft=%d\n", np, ngen, eos, g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
