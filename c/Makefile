@@ -143,16 +143,32 @@ else
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 endif
+# CUDA target selection. Default `native` builds SASS for the build machine's GPU
+# only (fast local dev). A headless CI/Docker build has no GPU, so `-arch=native`
+# there detects nothing and the shipped coli_cuda.dll fails at first kernel dispatch.
+# For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
+# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
+# plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
 CUDA_ARCH ?= native
+ifeq ($(CUDA_ARCH),portable)
+CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
+               -gencode arch=compute_86,code=sm_86 \
+               -gencode arch=compute_89,code=sm_89 \
+               -gencode arch=compute_90,code=sm_90 \
+               -gencode arch=compute_120,code=sm_120 \
+               -gencode arch=compute_120,code=compute_120
+else
+CUDA_GENCODE = -arch=$(CUDA_ARCH)
+endif
 ifneq ($(IS_WIN),)
 # nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
 # -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
 else
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
 endif
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*

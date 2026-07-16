@@ -646,7 +646,8 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(!cuda_ok(copy_desc,"expert group descriptors"))return 0;
     int profile=getenv("COLI_CUDA_PROFILE")&&atoi(getenv("COLI_CUDA_PROFILE"));
     cudaEvent_t ev[4]={};
-    if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")) profile=0;
+    if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")){
+        for(int j=0;j<i;j++) cudaEventDestroy(ev[j]); profile=0; break; }   /* (#B8) don't leak the events already created */
     if(profile) cudaEventRecord(ev[0],ctx->stream);
     if(async)std::memcpy(ctx->host_x,x,xb);
     cudaError_t copy_x=async?cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream)

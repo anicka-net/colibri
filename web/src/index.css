@@ -69,7 +69,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .chat-panel { min-width: 0; height: 100vh; display: grid; grid-template-rows: 72px minmax(0, 1fr) auto; }
 .topbar { display: flex; align-items: center; justify-content: space-between; padding: 0 32px; border-bottom: 1px solid var(--border); }
 .topbar > div:first-child { min-width: 0; display: grid; gap: 3px; }.topbar strong { overflow: hidden; font: 500 14px ui-monospace, SFMono-Regular, monospace; text-overflow: ellipsis; white-space: nowrap; }.eyebrow { color: #718086; font-size: 9px; font-weight: 800; letter-spacing: .16em; }
-.top-actions { display: flex; align-items: center; gap: 8px; }.top-actions [data-slot=badge] { gap: 5px; }
+.top-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }.top-actions [data-slot=badge] { gap: 5px; }
 .conversation { overflow-y: auto; }
 .empty-state { width: min(680px, calc(100% - 40px)); min-height: 100%; margin: 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 56px 0; text-align: center; }
 .orb { position: relative; display: grid; place-items: center; width: 66px; height: 66px; margin-bottom: 24px; border: 1px solid rgba(78,214,165,.25); border-radius: 50%; color: var(--primary); background: radial-gradient(circle, rgba(78,214,165,.17), rgba(78,214,165,.02) 68%); box-shadow: 0 0 55px rgba(78,214,165,.1); }.orb svg { width: 25px; }.orb::after { content: ""; position: absolute; inset: -7px; border: 1px dashed rgba(78,214,165,.14); border-radius: inherit; }

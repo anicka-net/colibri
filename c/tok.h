@@ -88,8 +88,14 @@ static void tk_build_bytemap(Tok *T){
 /* ---------- caricamento tokenizer.json ---------- */
 static char *tk_read_file(const char *path, long *out_n){
     FILE *f=fopen(path,"rb"); if(!f){ perror(path); exit(1); }
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
+    if(fseek(f,0,SEEK_END)!=0){ perror(path); exit(1); }
+    long n=ftell(f);
+    if(n<0){ perror(path); exit(1); }
+    if(n>(1L<<30)){ fprintf(stderr,"%s: file too large (%ld bytes)\n",path,n); exit(1); }   /* sanity cap vs a hostile size */
+    if(fseek(f,0,SEEK_SET)!=0){ perror(path); exit(1); }
+    char *b=malloc((size_t)n+1); if(!b){ fprintf(stderr,"OOM reading %s (%ld bytes)\n",path,n); exit(1); }
+    if(fread(b,1,(size_t)n,f)!=(size_t)n){ fprintf(stderr,"%s: short read\n",path); exit(1); }
+    b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
 }
 static int cmp_sp_len(const void *a, const void *b){ return ((const Special*)b)->len - ((const Special*)a)->len; }
 
@@ -104,10 +110,19 @@ static void tok_load(Tok *T, const char *path){
     jval *added=json_get(root,"added_tokens");
     if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
-    /* id massimo per dimensionare id2str */
+    /* id massimo per dimensionare id2str. Gli id vengono da un tokenizer.json di
+     * mirror non fidato: un id NEGATIVO indicizzerebbe id2str[id] SOTTO l'allocazione
+     * (OOB write) e un added_token privo di "id"/"content" darebbe NULL-deref. */
     int maxid=0;
-    for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>maxid)maxid=id; }
-    if(added) for(int i=0;i<added->len;i++){ int id=(int)json_get(added->kids[i],"id")->num; if(id>maxid)maxid=id; }
+    for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num;
+        if(id<0){ fprintf(stderr,"tokenizer.json: negative vocab id %d\n",id); exit(1); }
+        if(id>maxid)maxid=id; }
+    if(added) for(int i=0;i<added->len;i++){
+        jval *ji=json_get(added->kids[i],"id");
+        if(!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: added_token missing numeric id\n"); exit(1); }
+        int id=(int)ji->num;
+        if(id<0){ fprintf(stderr,"tokenizer.json: negative added id %d\n",id); exit(1); }
+        if(id>maxid)maxid=id; }
     T->n_ids=maxid+1;
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
@@ -136,7 +151,10 @@ static void tok_load(Tok *T, const char *path){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
             jval *a=added->kids[i];
-            char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            jval *jc=json_get(a,"content"), *ji=json_get(a,"id");
+            if(!jc||jc->t!=J_STR||!jc->str||!ji||ji->t!=J_NUM){ fprintf(stderr,"tokenizer.json: malformed added_token\n"); exit(1); }
+            char *content=jc->str; int id=(int)ji->num;
+            if(id<0||id>maxid){ fprintf(stderr,"tokenizer.json: added id %d out of range\n",id); exit(1); }
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
             T->id2str[id]=content; T->id_added[id]=1;
             jval *sf=json_get(a,"special");                 /* "special": true/false */

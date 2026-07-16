@@ -161,7 +161,8 @@ export default function App() {
     } catch (cause) {
       if (controller.signal.aborted) return
       setConnected(false)
-      setError(cause instanceof Error ? cause.message : "Could not reach the server.")
+      const msg = cause instanceof Error ? cause.message : "Could not reach the server."
+      setError(/401|unauthor/i.test(msg) ? "Authentication failed — check the API key." : msg)
     } finally {
       if (probeRef.current === controller) { probeRef.current = null; setConnecting(false) }
     }
@@ -247,12 +248,12 @@ export default function App() {
         <section className="side-section">
           <div className="section-title"><Link2 className="size-3.5" /> Connection</div>
           <label>API endpoint<Input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
-          <label>API key<div className="relative"><KeyRound className="field-icon" /><Input className="pl-9" type="password" value={apiKey} placeholder="optional" onChange={(event) => setApiKey(event.target.value)} /></div><span className="field-help">Kept in memory only · sent to this endpoint</span></label>
+          <label>API key<div className="relative"><KeyRound className="field-icon" /><Input className="pl-9" type="password" autoComplete="new-password" value={apiKey} placeholder="optional" onChange={(event) => setApiKey(event.target.value)} /></div><span className="field-help">Kept in memory only · sent to this endpoint</span></label>
           <Button type="button" variant="secondary" onClick={connect} disabled={connecting}>
             {connecting ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
             Probe server
           </Button>
-          <div className={cn("connection-state", connected && "connected")} aria-live="polite"><span />{connected ? "Engine reachable" : "Not connected"}</div>
+          <div className={cn("connection-state", connected && "connected")} aria-live="polite"><span />{connected ? "Engine reachable" : connecting ? "Probing…" : "Not connected"}</div>
         </section>
 
         <section className="side-section runtime-section" aria-live="polite">
@@ -339,7 +340,7 @@ export default function App() {
               <h2>Ask the giant.<br /><em>Keep the machine yours.</em></h2>
               <p>Connect to a local colibrì server and stream responses directly from your hardware. Nothing leaves the endpoint you choose.</p>
               <div className="suggestions">
-                {["Explain how expert routing works", "Write a small C benchmark", "Compare RAM and VRAM caching"].map((item) => <button key={item} onClick={() => setDraft(item)}>{item}<ArrowUp className="size-3.5 rotate-45" /></button>)}
+                {["Explain how expert routing works", "Write a small C benchmark", "Compare RAM and VRAM caching"].map((item) => <button type="button" key={item} onClick={() => setDraft(item)}>{item}<ArrowUp className="size-3.5 rotate-45" /></button>)}
               </div>
             </div>
           ) : (

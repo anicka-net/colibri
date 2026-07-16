@@ -27,6 +27,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
   const wrapRef = useRef<HTMLDivElement>(null)
   const [wrapSize, setWrapSize] = useState({ w: 1200, h: 700 })
   const [data, setData] = useState<ExpertMap | null>(null)
+  const [probeErr, setProbeErr] = useState(false)   // (#U3) surface /experts failures instead of an endless spinner
   const [atlas, setAtlas] = useState<Record<string, AtlasEntry> | null>(null)
   const [tip, setTip] = useState<{ x: number; y: number; row: number; col: number; tier: number; heat: number } | null>(null)
   const pulseRef = useRef<Float32Array | null>(null)   // per-expert pulse intensity 0..1
@@ -59,9 +60,11 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
     const poll = async () => {
       try {
         const res = await fetch(endpoint(base, "/experts"), { headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {} })
+        if (!res.ok) throw new Error(`/experts ${res.status}`)
         const next = (await res.json()) as ExpertMap
         if (disposed || !next.rows) return
         setData(next)
+        setProbeErr(false)
         if (next.seq !== lastSeq.current && next.hits) {
           lastSeq.current = next.seq
           const n = next.rows * next.cols
@@ -72,7 +75,7 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
             if (byte & (1 << (i & 7))) p[i] = 1
           }
         }
-      } catch { /* engine busy or restarting — keep the last frame */ }
+      } catch { if (!disposed) setProbeErr(true) /* surface repeated failures; keep the last frame */ }
     }
     void poll()
     const t = window.setInterval(() => void poll(), 1500)
@@ -154,13 +157,14 @@ export function Brain({ baseUrl, apiKey, connected }: { baseUrl: string; apiKey:
       <div className="brain-canvas-wrap" ref={wrapRef}>
         <canvas ref={canvasRef} onMouseMove={onMove} onMouseLeave={() => setTip(null)} />
         {!connected && <p className="runtime-unavailable">Connect to the engine to see the cortex.</p>}
+        {connected && probeErr && !data && <p className="runtime-unavailable">Expert map unavailable — this engine build may not expose /experts.</p>}
       </div>
       {tip && data && (() => {
         const isMtp = tip.row === data.rows - 1
         const realLayer = isMtp ? 78 : tip.row + 3
         const entry = atlas?.[`${realLayer}:${tip.col}`]
         return (
-        <div className="brain-tip" style={{ left: tip.x + 14, top: tip.y + 14 }}>
+        <div className="brain-tip" style={{ left: Math.min(tip.x + 14, window.innerWidth - 260), top: Math.min(tip.y + 14, window.innerHeight - 170) }}>
           <div className="brain-tip-title"><Layers className="size-3" /> Layer {realLayer}{isMtp ? " (MTP)" : ""} · Expert {tip.col}</div>
           <div>Tier: <strong style={{ color: ["#8b9aa3", "#5a9bd8", "#4ed6a5"][tip.tier] }}>{TIER_NAME[tip.tier]}</strong></div>
           <div>Heat: <strong>{tip.heat === 0 ? "never routed" : `~2^${tip.heat} selections`}</strong></div>

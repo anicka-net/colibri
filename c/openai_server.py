@@ -86,6 +86,7 @@ class GenerationScheduler:
     @contextlib.contextmanager
     def admit(self, cancelled=None, slot=None):
         ticket = object()
+        entry = (ticket, slot)          # (#B2) remember each waiter's target slot for fair, per-slot admission
         queued_at = time.monotonic()
         with self.condition:
             if self.closed:
@@ -95,31 +96,46 @@ class GenerationScheduler:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
-            self.queue.append(ticket)
+            self.queue.append(entry)
             deadline = queued_at + self.queue_timeout
             while True:
                 if self.closed:
-                    self.queue.remove(ticket)
+                    self.queue.remove(entry)
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
                 available = min(self.free_slots) if slot is None and self.free_slots else slot
-                if self.queue[0] is ticket and available in self.free_slots:
+                # (#B2) Admit as soon as our target slot is free AND no strictly-earlier
+                # waiter also wants it (an earlier waiter "wants" it if it is any-slot or
+                # pinned to the same slot). This replaces the old strict FIFO-head rule,
+                # which let a head pinned to a busy slot block every request behind it —
+                # even ones targeting a currently-free slot (head-of-line blocking).
+                # ponytail: O(queue) scan per wakeup — negligible at the default max_queue;
+                # switch to per-slot wait sets if max_queue is ever raised to thousands.
+                can_admit = available in self.free_slots
+                if can_admit:
+                    for t2, s2 in self.queue:
+                        if t2 is ticket:
+                            break
+                        if s2 is None or s2 == available:
+                            can_admit = False
+                            break
+                if can_admit:
                     break
                 if cancelled and cancelled():
-                    self.queue.remove(ticket)
+                    self.queue.remove(entry)
                     self.cancelled += 1
                     self.condition.notify_all()
                     raise ClientCancelled()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.queue.remove(ticket)
+                    self.queue.remove(entry)
                     self.timed_out += 1
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
                 self.condition.wait(min(remaining, 0.25))
-            self.queue.popleft()
+            self.queue.remove(entry)
             self.free_slots.remove(available)
             self.active += 1
             self.admitted += 1
@@ -715,14 +731,40 @@ class APIHandler(BaseHTTPRequestHandler):
         if "*" not in self.server.cors_origins:
             self.send_header("Vary", "Origin")
 
+    LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+
+    def _is_authed(self):
+        """True if no key is configured, or a correct Bearer key was presented."""
+        if not self.server.api_key:
+            return True
+        import hmac
+        provided = self.headers.get("Authorization", "")
+        return hmac.compare_digest(provided, f"Bearer {self.server.api_key}")
+
     def require_auth(self):
-        if self.server.api_key:
-            import hmac
-            provided = self.headers.get("Authorization", "")
-            expected = f"Bearer {self.server.api_key}"
-            if not hmac.compare_digest(provided, expected):
-                raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
-                               "authentication_error")
+        if not self._is_authed():
+            raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
+                           "authentication_error")
+
+    def _check_host(self):
+        """DNS-rebinding guard: a web page can resolve a hostname to 127.0.0.1 and
+        drive this local server unless we pin the Host header to loopback / the bind
+        address. Rejects requests whose Host is anything else. (#SEC-7)"""
+        host = self.headers.get("Host", "")
+        if host.startswith("["):
+            name = host[1:].split("]", 1)[0]                       # [ipv6]:port
+        elif host.count(":") == 1:
+            name = host.rsplit(":", 1)[0]                          # host:port / ipv4:port
+        else:
+            name = host                                            # bare host / bracketless ipv6
+        name = name.strip().lower()
+        allowed = set(self.LOOPBACK_HOSTS)
+        try:
+            allowed.add(str(self.server.server_address[0]).strip("[]").lower())
+        except Exception:
+            pass
+        if name not in allowed:
+            raise APIError(403, "Host header not allowed.", None, "forbidden")
 
     def read_json(self):
         try:
@@ -780,20 +822,26 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
+            self._check_host()
             path = urlsplit(self.path).path
             if path == "/health":
-                payload = {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
-                           "kv_slots": self.server.kv_slots}
-                tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
-                if tiers: payload["tiers"] = tiers
-                hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
-                if hwinfo: payload["hwinfo"] = hwinfo
+                # Liveness is always public; hardware/scheduler internals only when a
+                # request is authed (or no key set), so a configured key isn't leaked
+                # past a bare 200 to an unauthenticated probe. (#SEC-8)
+                payload = {"status": "ok"}
+                if self._is_authed():
+                    payload["scheduler"] = self.server.scheduler.snapshot()
+                    payload["kv_slots"] = self.server.kv_slots
+                    tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                    if tiers: payload["tiers"] = tiers
+                    hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                    if hwinfo: payload["hwinfo"] = hwinfo
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
-                eng = self.server.engine
                 payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
-                if eng and getattr(eng, "emap", None):
+                eng = self.server.engine
+                if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
@@ -819,6 +867,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json(error.status, error_object(error), request_id, error.headers)
 
     def do_OPTIONS(self):
+        try:                                   # (#SEC-7) apply the Host guard uniformly, incl. CORS preflight
+            self._check_host()
+        except APIError:
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.send_cors_headers()
@@ -827,6 +882,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
+            self._check_host()
             self.require_auth()
             body = self.read_json()
             self.check_model(body)
@@ -1027,11 +1083,12 @@ class APIHandler(BaseHTTPRequestHandler):
             if include_usage:
                 event([], self.usage(stats))
             if connected:
-                try:
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                except OSError:
-                    pass
+                with ka_lock:                          # (#B9) share the pump's lock so [DONE] can't interleave a keepalive write
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except OSError:
+                        pass
             self.close_connection = True
 
     def client_disconnected(self):
@@ -1094,7 +1151,15 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
-        print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
+        # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
+        # a compute-heavy API to the network. Refuse unless explicitly overridden.
+        if os.environ.get("COLI_ALLOW_INSECURE_BIND") == "1":
+            print("WARNING: binding %s beyond localhost with NO auth (COLI_ALLOW_INSECURE_BIND=1)" % host,
+                  file=sys.stderr)
+        else:
+            print("refusing to bind %s beyond localhost without COLI_API_KEY set "
+                  "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
+            sys.exit(1)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.

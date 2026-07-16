@@ -1445,6 +1445,25 @@ static int detect_group_size(int O, int I, int64_t ns){
     return 0;
 }
 
+/* Reject a quantized tensor whose on-disk weight/scale byte counts don't EXACTLY
+ * match the config-derived [O,I] shape for the detected fmt. The fmt is inferred
+ * from the weight byte count and falls to int2 (fmt=3) on any mismatch; without
+ * this guard a crafted `.qs` (untrusted mirror, the documented threat model) picks
+ * a wrong fmt and the SIMD kernels index the weight slab / per-row scale buffer
+ * past its real length (OOB read), and qt_from_disk's O-sized scale buffer is
+ * overrun on read (OOB write). ns is the scale-tensor byte count (F32 scales). */
+static void qt_check_fmt(const char *name, int fmt, int gs, int O, int I, int64_t nb, int64_t ns){
+    int64_t ew, es;   /* expected weight bytes, expected scale float count */
+    if(fmt==1){ ew=(int64_t)O*I;         es=(int64_t)O; }
+    else if(fmt==2){ ew=(int64_t)O*((I+1)/2); es=(int64_t)O; }
+    else if(fmt==3){ ew=(int64_t)O*((I+3)/4); es=(int64_t)O; }
+    else if(fmt==4){ int ng=(I+gs-1)/gs; ew=(int64_t)O*((I+1)/2); es=(int64_t)O*ng; }
+    else { fprintf(stderr,"%s: unknown quant fmt %d\n",name,fmt); exit(1); }
+    if(nb!=ew || ns!=es*4){
+        fprintf(stderr,"%s: quantized size mismatch fmt=%d [O=%d,I=%d,gs=%d]: weight %lld (want %lld), scale %lld (want %lld)\n",
+                name,fmt,O,I,gs,(long long)nb,(long long)ew,(long long)ns,(long long)(es*4)); exit(1); }
+}
+
 /* costruisce un QT [O,I] dal disco in `t` (buffer riusabili tra chiamate).
  *  - se esiste `name.qs`: pesi GIA' quantizzati nel container (U8 qdata + F32 scala) -> letti diretti
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
@@ -1460,16 +1479,17 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         int gs=0;
         if(fmt==2) gs=detect_group_size(O,I,ns);
         if(gs>0) fmt=4;
+        qt_check_fmt(name,fmt,gs,O,I,nb,ns);   /* reject size/format mismatch before alloc+read */
         if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->gs=0; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
         else if(fmt==4){ int ng=(I+gs-1)/gs;
             if(t->fmt!=4||!t->q4){ t->fmt=4; t->O=O; t->I=I; t->gs=gs; t->q4=qalloc(nb); t->s=falloc((int64_t)O*ng); }
             st_read_raw(&m->S,name,t->q4,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
-        st_read_f32(&m->S,sn,t->s,drop);
+        st_read_f32_cap(&m->S,sn,t->s, fmt==4?(int64_t)O*((I+gs-1)/gs):(int64_t)O, drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
-        if(t->fmt==0) st_read_f32(&m->S,name,t->qf,drop);
-        else { float *tmp=falloc((int64_t)O*I); st_read_f32(&m->S,name,tmp,drop); qt_fill(t,tmp,bits); free(tmp); }
+        if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
+        else { float *tmp=falloc((int64_t)O*I); st_read_f32_cap(&m->S,name,tmp,(int64_t)O*I,drop); qt_fill(t,tmp,bits); free(tmp); }
     }
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
@@ -1678,6 +1698,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 /* embed: dequantizza la riga del token (scala per-riga) in x[hidden] */
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
+    if(tok<0 || tok>=e->O){ memset(x,0,(size_t)D*sizeof(float)); return; }   /* #SEC-5: out-of-range token id -> zero row, never OOB */
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
@@ -1807,6 +1828,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
                 int gs=0;
                 if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
                 if(gs>0) fmt=4;
+                qt_check_fmt(nm[k],fmt,gs,OO[k],II[k],nb,tq[k]->nbytes);   /* reject crafted size/format mismatch */
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
@@ -1935,6 +1957,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         int gs=0;
         if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
         if(gs>0) fmt=4;
+        qt_check_fmt(nm[k],fmt,gs,OO[k],II[k],nb,tq[k]->nbytes);   /* reject crafted size/format mismatch */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }

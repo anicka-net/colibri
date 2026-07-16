@@ -200,11 +200,26 @@ static void st_init(shards *S, const char *snap_dir) {
             if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
-            int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
+            int64_t numel = 1;
+            for (int k = 0; k < shp->len; k++) {
+                int64_t dim = (int64_t)shp->kids[k]->num;
+                if (dim < 0 || (dim && numel > INT64_MAX / dim)) {   /* shape-product overflow from a crafted header */
+                    fprintf(stderr, "%s: tensor '%s' shape overflows int64\n", files[fi], name); exit(1); }
+                numel *= dim;
+            }
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            /* cross-check the declared element count against the byte span for FLOAT
+             * dtypes: st_read_f32 writes `numel` floats (BF16/F16 loop or F32 memcpy)
+             * into a caller-sized buffer, so a header with numel != nbytes/esz is an
+             * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
+             * their numel is unused by the read path and legitimately may differ. */
+            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
+              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+                  fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
+                          files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
@@ -264,6 +279,20 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     return t->numel;
 }
 
+/* like st_read_f32 but refuses to write more than `cap` floats into `out`.
+ * Callers that size `out` from CONFIG dims (qt_alloc's O*I, per-row scales) must
+ * use this: a crafted header whose tensor holds more elements than the config
+ * shape would otherwise overrun `out`. Callers that size `out` from st_numel are
+ * self-consistent and may keep using st_read_f32. */
+static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->numel > cap) {
+        fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
+                name, (long long)t->numel, (long long)cap); exit(1); }
+    return st_read_f32(S, name, out, drop);
+}
+
 static int64_t st_numel(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->numel : -1;
 }
@@ -287,9 +316,13 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
+    if (elem_off < 0 || n_elems < 0 || elem_off + n_elems > t->numel) {   /* keep the slice inside the tensor */
+        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
+                name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");
+    if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
