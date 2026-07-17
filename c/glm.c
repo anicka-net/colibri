@@ -1207,7 +1207,9 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
  * 10x (#82) — hence per-region mbind here and nothing else. Raw syscall, no libnuma
  * dependency; MPOL_MF_MOVE migrates pages of reused heap chunks too. Linux-only,
  * silent no-op elsewhere or on single-node hosts. */
-static int g_numa_nodes=0;
+#ifdef __linux__
+static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA is a no-op */
+#endif
 static void numa_slab_bind(void *p, size_t n){
 #ifdef __linux__
     if(g_numa_nodes<2 || !p || !n) return;

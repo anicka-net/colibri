@@ -237,7 +237,9 @@ static inline int compat_rename(const char *old, const char *new){
 /* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
  * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */
 #include <psapi.h>
-#pragma comment(lib, "psapi.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")   /* MSVC: link psapi; MinGW/GCC uses -lpsapi */
+#endif
 struct rusage { long ru_maxrss; };
 #define RUSAGE_SELF 0
 static inline int getrusage(int who, struct rusage *r){
