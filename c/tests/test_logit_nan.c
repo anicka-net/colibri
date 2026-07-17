@@ -41,6 +41,21 @@ int main(void){
       assert(approx1(g_pbuf[3]) && "mass must land on the max finite logit (idx3)");
       assert(dist_sample(8,-1)==3 && "sampler emits the finite argmax, not token 0"); }
 
+    /* --- NaN at index 0: poisons the max scan itself (the old mx=lo[0] seed),
+     *     the failure mode that starts before the sum (review note on #369) --- */
+    { float lo[8]={NAN,1.f,0.5f,6.f,0.2f,-1.f,0.f,0.3f};   /* max finite = idx3 (6.0) */
+      dist_build(lo,8);
+      double sum=0; int nan=0;
+      for(int i=0;i<8;i++){ if(!(g_pbuf[i]==g_pbuf[i])) nan=1; sum+=g_pbuf[i]; }
+      assert(!nan && "NaN at lo[0] must not poison via the mx seed");
+      assert(approx1(sum) && "still normalizes to 1");
+      assert(dist_sample(8,-1)==3 && "emits the max finite logit, not token 0"); }
+
+    /* --- all-NaN logits: worst case — must stay finite, no crash --- */
+    { float lo[8]; for(int i=0;i<8;i++) lo[i]=NAN;
+      dist_build(lo,8);
+      for(int i=0;i<8;i++) assert(g_pbuf[i]==g_pbuf[i] && "all-NaN: g_pbuf stays finite"); }
+
     /* --- regression: clean logits still produce a valid distribution --- */
     { float lo[8]={0.1f,0.2f,3.0f,0.4f,0.5f,0.6f,0.7f,0.8f};   /* peak = idx2 */
       dist_build(lo,8);

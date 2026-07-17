@@ -4259,7 +4259,13 @@ static void topp_siftdown(int *h, int n, int i){
  * la coda troncata va AZZERATA in g_pbuf (dist_sample la legge direttamente per id). */
 static void dist_build(const float *lo, int V){
     if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
-    float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
+    /* NaN-skip the max scan (x==x rules out NaN): seeding mx=lo[0] let a NaN at
+     * index 0 poison every (lo[i]-mx) before the sum — the softmax was doomed at
+     * the max-finding, not the normalize. The post-sum guard below stays as the
+     * second line of defense. */
+    float mx=-INFINITY;
+    for(int i=0;i<V;i++) if(lo[i]==lo[i] && lo[i]>mx) mx=lo[i];
+    if(!isfinite(mx)) mx=0.f;   /* all-NaN (or +Inf) logits: let the guard below decide */
     double s=0; float invt=1.f/(g_temp>1e-4f?g_temp:1e-4f);
     for(int i=0;i<V;i++){ g_pbuf[i]=expf((lo[i]-mx)*invt); s+=g_pbuf[i]; }
     /* A single NaN/+Inf logit (bad streamed expert tile, matmul overflow at an
