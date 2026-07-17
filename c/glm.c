@@ -4197,10 +4197,21 @@ static uint64_t g_rng=0x9E3779B97F4A7C15ULL;
 static inline double rndu(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17;
     return (double)(g_rng>>11)*(1.0/9007199254740992.0); }
 static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* buffer riusati (decode single-thread) */
-static int cmp_pdesc(const void *a,const void *b){
-    float pa=g_pbuf[*(const int*)a], pb=g_pbuf[*(const int*)b];
-    return pa<pb ? 1 : pa>pb ? -1 : 0; }
-/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc */
+/* sift-down su max-heap in h[0..n), chiave = g_pbuf[h[i]] (#335: partial top-p select).
+ * Versione "a buco": porta il valore di radice e lo deposita solo alla fine, cosi'
+ * heapify e' O(V) e ogni pop e' O(log n) senza qsort sull'intero vocabolario. */
+static void topp_siftdown(int *h, int n, int i){
+    int iv=h[i]; float kv=g_pbuf[iv];
+    for(;;){ int l=2*i+1;
+        if(l>=n) break;                      /* foglia */
+        int b=l; if(l+1<n && g_pbuf[h[l+1]]>g_pbuf[h[l]]) b=l+1;  /* figlio maggiore */
+        if(g_pbuf[h[b]]<=kv) break;          /* nessun figlio supera la radice -> ferma */
+        h[i]=h[b]; i=b; }
+    h[i]=iv;
+}
+/* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc.
+ * Invariante per dist_sample: g_pbuf resta INDICIZZATO per token-id (mai riordinato);
+ * la coda troncata va AZZERATA in g_pbuf (dist_sample la legge direttamente per id). */
 static void dist_build(const float *lo, int V){
     if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
     float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
@@ -4209,12 +4220,19 @@ static void dist_build(const float *lo, int V){
     for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
     if(g_nuc>0 && g_nuc<1.f){
         for(int i=0;i<V;i++) g_pidx[i]=i;
-        qsort(g_pidx,V,sizeof(int),cmp_pdesc);
-        double cum=0; int keep=V;
-        for(int i=0;i<V;i++){ cum+=g_pbuf[g_pidx[i]]; if(cum>=g_nuc){ keep=i+1; break; } }
-        double s2=0; for(int i=keep;i<V;i++) g_pbuf[g_pidx[i]]=0;
-        for(int i=0;i<keep;i++) s2+=g_pbuf[g_pidx[i]];
-        for(int i=0;i<keep;i++) g_pbuf[g_pidx[i]]/=(float)s2;
+        for(int i=V/2-1;i>=0;i--) topp_siftdown(g_pidx,V,i);   /* heapify O(V) */
+        /* pop verso la coda: i vincitori (testa top-p) cadono in g_pidx[out..V-1] in ordine
+         * DECRESCENTE, come il vecchio qsort, quindi s2 accumula nello stesso ordine ->
+         * head bit-identical sui casi senza pareggi (i pareggi erano gia' non specificati
+         * sotto il qsort instabile e restano tali). Il prefisso g_pidx[0..out-1) e' la coda. */
+        double s2=0, cum=0; int out=V;
+        do{ int root=g_pidx[0];                  /* massimo corrente */
+            g_pidx[0]=g_pidx[--out]; g_pidx[out]=root;          /* sposta il max in coda */
+            s2+=g_pbuf[root]; cum+=g_pbuf[root];
+            if(out>0) topp_siftdown(g_pidx,out,0);
+        } while(cum<g_nuc && out>0);
+        for(int i=0;i<out;i++) g_pbuf[g_pidx[i]]=0;            /* azzera la coda (invariante) */
+        float s2f=(float)s2; for(int i=out;i<V;i++) g_pbuf[g_pidx[i]]/=s2f;  /* rinormalizza */
     }
 }
 /* campiona da g_pbuf; ban>=0 -> quel token e' escluso (rinormalizzando al volo) */
