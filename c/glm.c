@@ -3848,6 +3848,26 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
       else if(!coli_cuda_pipe_upload(dev,w_in,l->in_ln,(size_t)D*4)||
               !coli_cuda_pipe_upload(dev,w_post,l->post_ln,(size_t)D*4)) return 0; }
     double ta=now_s();
+    /* Fused chain fast path: whole attention section in one backend call, KV
+     * device-resident, single sync.  DSA-indexer layers and non-int4 weights
+     * fall back to the op-by-op path below. */
+    if(S==1 && li<c->n_layers && !(m->has_dsa && c->idx_type[li]) &&
+       kv_dev_sync(m,l,m->kv,li,pos_base)){
+        int kvl=c->kv_lora, R=c->qk_rope;
+        float *cw1=pipe_ln_cache(dev,li,0,l->q_a_ln,(size_t)c->q_lora);
+        float *cw2=pipe_ln_cache(dev,li,1,l->kv_a_ln,(size_t)kvl);
+        if(cw1&&cw2&&coli_cuda_pipe_attn_chain(dev,x_dev,nrm_d,nrm_host,
+               coli_kv_row(m->Lc[li],pos_base,kvl),coli_kv_row(m->Rc[li],pos_base,R),
+               l->q_a.cuda,l->q_b.cuda,l->kv_a.cuda,l->kv_b.cuda,l->o.cuda,
+               w_in,cw1,cw2,w_post,
+               m->kv->cuda_Lc[li],m->kv->cuda_Rc[li],
+               D,c->n_heads,c->q_lora,kvl,c->qk_nope,R,c->v_head,
+               S,pos_base,m->kv_start[li],c->eps,c->theta,c->attn_scale)){
+            m->kv->cuda_valid[li]=pos_base+S;
+            m->t_attn+=now_s()-ta;
+            goto attn_done;
+        }
+    }
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_in,S,D,c->eps)) return 0;
     /* DSA: i layer con indexer FULL cachano k_idx dalla nrm pre-attention (CPU, piccolo) */
     if(m->has_dsa && li<c->n_layers && m->kv_start[li]==0 && c->idx_type[li]){
@@ -3866,6 +3886,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_post,S,D,c->eps)) return 0;
     if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
     m->t_attn+=now_s()-ta;
+attn_done:;
     /* OVERLAP: issue the shared expert on the GPU BEFORE moe() runs on the CPU.
      * The shared expert reads nrm_d (valid after the download above) and writes its
      * residual into x_dev (async). While the GPU computes this, the CPU enters moe()
