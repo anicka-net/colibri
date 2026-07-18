@@ -152,6 +152,16 @@ because miss-containing groups must complete before their host slabs can be
 reused, while CACHE_ROUTE remains 4.74 tok/s.  Host-wrapping the int8 MTP
 experts removes the CPU fallback but does not change that verdict.
 
+Coupling prefetch transfers across workloads.  A table trained on the first
+70% of a prime-number trace predicts an unrelated compiler prompt; its single
+top prediction has 83% precision.  On Spark, the existing
+`PILOT_REAL=1 COUPLE_K=8 COUPLE_D=1` default improves strict decode from 3.17
+to **3.58 tok/s**, raises hit rate 87.8% -> 92.3%, and cuts felt I/O wait
+20.9 -> 15.0 s over 128 tokens.  K=1 is slightly slower at 3.51 tok/s despite
+fetching fewer bytes (147 vs 172 GB), because it leaves less I/O overlapped.
+Depth 2 over-prefetches and thrashes: K8/D2 falls to 2.11 tok/s, 79.5% hit,
+and 458 GB fetched.  Keep `COUPLE_D=1`.
+
 ## Measured dead ends (do not revisit without new evidence)
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).
