@@ -74,6 +74,16 @@ DIRECT=1 DRAFT=0 ./glm <cache-slots> 4 4
   tight, prefer fewer slots over swapping — a wired model plus swap thrashing
   is worse than honest streaming.
 
+## Prefill (long prompts)
+
+Prefill is a separate performance regime from decode.  On GPU hosts always add
+`COLI_CUDA_TC_W4A16=1`: the tensor-core expert path (lossless weights, fp16
+activations, rows>=16) halves prefill expert time — measured 207 -> 167 s on a
+2.7k prompt, output identical.  Do NOT enable `COLI_CUDA_TC_INT4` (W4A4) — it
+is slower and lossy.  Prefill attention is currently the dominant cost at long
+prompts (see docs/PERF-QUEUE.md); expect ~16 tok/s prefill until the tiled
+kernel lands.
+
 ## Shared notes
 
 - **MTP head precision**: the speculative head must be converted at **int8**

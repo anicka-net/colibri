@@ -84,8 +84,7 @@ speed; a 10k agentic prompt would be ~15 min.  Same with DSA=0, so it is not
 the indexer.  PROFILED (2701 tok):
 attention 114 s (score-softmax-value alone 93 s — the batch absorb kernel is
 ~60x off the FLOP floor and absorbed-MLA prefill is FLOP-heavier than
-reconstructing k/v once; this is THE prefill fix, a flash-style/tiled or
-non-absorbed prefill kernel) + expert-matmul 80 s + proj/rope 21 s + other 13.
+reconstructing k/v once; this is THE prefill fix — see design below) + expert-matmul 80 s + proj/rope 21 s + other 13.
 FREE WIN: `COLI_CUDA_TC_W4A16=1` (lossless-weights tensor-core expert path,
 rows>=16) cuts expert time 80 -> 40 s, prefill 207 -> 167 s (13 -> 16 tok/s);
 greedy short-context output verified identical — recommended in the prefill
@@ -97,6 +96,23 @@ mandatory for the model's purpose, and prefill needs work before that.
 All tuning so far targets decode.  The DS4/OpenAI server workload prefills
 thousands of tokens (pipe1 `S>=8` path, never profiled here).  Time-to-first-
 token may matter more than decode tok/s for agentic use.
+
+#### Prefill attention rewrite — design (ready to implement)
+The 93 s is naive per-element contraction kernels; the same math as five
+GEMMs is ~0.5 s of tensor-core time:
+1. `qabs[S,H,kvl] = q_nope[S,H,192] @ kvb_k[h][192,kvl]` — int4-weight GEMM
+   per head (w4a16_matmul shape);
+2. `scores[h][S,T] = qabs[h] @ Lc^T + q_rope[h] @ Rc^T` — fp16 GEMM (new
+   kernel; Lc/Rc tiles from the device KV cache, staged fp16);
+3. causal online-softmax over scores (new kernel, row-tiled);
+4. `ctxL[h][S,kvl] = P[h] @ Lc` — fp16 GEMM (same kernel as 2 transposed);
+5. `out = ctxL @ kvb_v + o_proj` — int4-weight GEMM per head.
+Steps 1/5 reuse the existing w4a16 wmma machinery; 2/4 need one fp16 GEMM
+kernel; 3 is small.  Wire into attn_pipe_prefill behind an env
+(COLI_PREFILL_GEMM=0 fallback), validate exact-vs-dense on a 2.7k prompt
+(greedy continuation must match the current path), then default on.
+Expected: prefill 167 s -> ~60-80 s (attention 114 -> ~20-30 incl. proj),
+with the expert 40 s then the next target.
 
 ### 5. Expert-group remaining headroom
 Group kernel time is 761 ms/64 tok vs a ~100-150 ms bandwidth floor.  The
