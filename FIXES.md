@@ -85,7 +85,7 @@ CPU:
 ```text
 OK kv_alloc re-allocation
 ----------------------------------------------------------------------
-Ran 69 tests in 1.998s
+Ran 72 tests in 2.078s
 
 OK
 ```
