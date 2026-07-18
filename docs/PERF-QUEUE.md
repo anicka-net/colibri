@@ -17,14 +17,21 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context)
+### 1. DSA sparse attention + IndexShare (long context) — weights EXTRACTED, integration open
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
 (`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
 reuses the selection for MTP drafts.  Below ~2k context this changes nothing;
 past it, our attention grows linearly while native stays ~flat — and MTP verify
 pays attention twice.
-- Extraction: `convert_fp8_to_int4.py --indexer` re-downloads ~756 GB of shards
+- Extraction: DONE 2026-07-18 — only 20 of 141 shards carry indexer tensors
+  (~107 GB transient download, ~10 min on the fast host), output is 227 MB of
+  out-idx files.  VALIDATED end-to-end: with `DSA_TOPK=32` forcing sparse
+  selection at short context, greedy output is token-identical to full
+  attention.  Caveat until integration: with the files present the engine
+  auto-enables DSA and the current pipe/fused-chain gates cost ~3 tok/s at
+  short context — set `DSA=0` on the discrete-GPU host for now.
+  (Original plan, for reference: `--indexer` re-downloads shards
   to keep a few GB (resumable per shard).  Run it on the multi-GB/s host, not
   the 1 Gbps ones; the few-GB output then crosses the ~100 Mbps host-to-host
   link in minutes (never move the raw shards between machines).  The fast host
