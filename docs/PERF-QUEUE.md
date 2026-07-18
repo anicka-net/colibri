@@ -81,8 +81,15 @@ double-buffer staging for the uploads.
 ### 4. Prefill profiling — MEASURED, now the top priority
 2701-token prefill takes **246 s (11 tok/s)** — prefill runs at near-decode
 speed; a 10k agentic prompt would be ~15 min.  Same with DSA=0, so it is not
-the indexer.  First suspects: the prefill path's chunking and whether the
-S>=8 pipe path actually engages end-to-end.  Long-context decode at 2.8k ctx:
+the indexer.  PROFILED (2701 tok):
+attention 114 s (score-softmax-value alone 93 s — the batch absorb kernel is
+~60x off the FLOP floor and absorbed-MLA prefill is FLOP-heavier than
+reconstructing k/v once; this is THE prefill fix, a flash-style/tiled or
+non-absorbed prefill kernel) + expert-matmul 80 s + proj/rope 21 s + other 13.
+FREE WIN: `COLI_CUDA_TC_W4A16=1` (lossless-weights tensor-core expert path,
+rows>=16) cuts expert time 80 -> 40 s, prefill 207 -> 167 s (13 -> 16 tok/s);
+greedy short-context output verified identical — recommended in the prefill
+env until made default.  TC_INT4 (W4A4) is not worth it (200 s).  Long-context decode at 2.8k ctx:
 DSA=0 **5.31 tok/s** (chain on, attention 115 ms/tok, linear in T);
 DSA-on **2.45 tok/s** (selection active -> chain off -> CPU DSA path,
 attention 44 s/128 tok).  Confirms item 1 phase 2 (selection in chain) is
