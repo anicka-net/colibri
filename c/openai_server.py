@@ -390,7 +390,8 @@ def split_reasoning(reply, enabled):
     if THINK_CLOSE not in reply:
         return reply.replace(THINK_OPEN, "").strip(), ""
     reasoning, content = reply.split(THINK_CLOSE, 1)
-    return reasoning.replace(THINK_OPEN, "").strip(), content.strip()
+    return (reasoning.replace(THINK_OPEN, "").replace(THINK_CLOSE, "").strip(),
+            content.replace(THINK_OPEN, "").replace(THINK_CLOSE, "").strip())
 
 
 class ReasoningStream:
@@ -401,10 +402,24 @@ class ReasoningStream:
         self.on_reasoning = on_reasoning
         self.on_content = on_content
         self.pending = ""
+        self.content_pending = ""
+
+    def feed_content(self, text):
+        self.content_pending += text
+        cleaned = self.content_pending.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+        hold = max(len(THINK_OPEN), len(THINK_CLOSE)) - 1
+        if len(cleaned) > hold:
+            self.on_content(cleaned[:-hold])
+            self.content_pending = cleaned[-hold:]
+        else:
+            self.content_pending = cleaned
 
     def feed(self, text):
         if not self.reasoning:
-            self.on_content(text)
+            if self.content_pending or THINK_OPEN in text or THINK_CLOSE in text:
+                self.feed_content(text)
+            else:
+                self.on_content(text)
             return
         self.pending += text
         marker = self.pending.find(THINK_CLOSE)
@@ -416,7 +431,7 @@ class ReasoningStream:
             self.pending = ""
             self.reasoning = False
             if after:
-                self.on_content(after)
+                self.feed_content(after)
             return
         hold = len(THINK_CLOSE) - 1
         if len(self.pending) > hold:
@@ -430,6 +445,9 @@ class ReasoningStream:
             (self.on_reasoning if self.reasoning else self.on_content)(
                 self.pending.replace(THINK_OPEN, "").replace(THINK_CLOSE, ""))
             self.pending = ""
+        if self.content_pending:
+            self.on_content(self.content_pending.replace(THINK_OPEN, "").replace(THINK_CLOSE, ""))
+            self.content_pending = ""
 
 
 def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
@@ -439,8 +457,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
     if enable_thinking:
-        effort = {"minimal": "Low", "low": "Low", "medium": "Medium", "high": "High",
-                  "xhigh": "Max", "max": "Max"}.get(reasoning_effort, "High")
+        effort = "Max" if reasoning_effort in ("xhigh", "max") else "High"
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):

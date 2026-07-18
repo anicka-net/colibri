@@ -82,6 +82,8 @@ class TemplateTest(unittest.TestCase):
     def test_truncated_thinking_does_not_leak_into_content(self):
         self.assertEqual(split_reasoning("private reasoning", True),
                          ("private reasoning", ""))
+        self.assertEqual(split_reasoning("reason</think>answer</think>done", True),
+                         ("reason", "answerdone"))
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
