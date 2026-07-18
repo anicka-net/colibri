@@ -162,6 +162,13 @@ fetching fewer bytes (147 vs 172 GB), because it leaves less I/O overlapped.
 Depth 2 over-prefetches and thrashes: K8/D2 falls to 2.11 tok/s, 79.5% hit,
 and 458 GB fetched.  Keep `COUPLE_D=1`.
 
+This gain does not transfer to the 131k production profile with a 30 GB hot
+tier and cap 17.  There, no coupling and K1/D1 both measure 1.35 tok/s
+(18.1/18.0 s felt I/O wait), while K8/D1 regresses to 1.25 tok/s and fetches
+442 GB instead of 329 GB over 64 tokens.  Keep coupling disabled in that
+service; it currently pays only when the short-context profile can devote
+roughly 92 GB to its LRU.
+
 ## Measured dead ends (do not revisit without new evidence)
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).
