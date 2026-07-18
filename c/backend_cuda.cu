@@ -659,6 +659,10 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     return 1;
 }
 
+__global__ static void gemv_q4(float *__restrict__ y, const float *__restrict__ x,
+                               const uint8_t *__restrict__ w, const float *__restrict__ scales,
+                               int I, int O);
+
 extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *ups,
                                         ColiCudaTensor *const *downs,
@@ -747,6 +751,25 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                     host[c].d,host[c].ds,host[c].df,r,I,D,row_bytes(host[c].df,I));
             }
             off16+=r;
+        }
+    }else if(all_s4&&max_rows==1&&
+             (!getenv("COLI_CUDA_DECODE_GEMV")||atoi(getenv("COLI_CUDA_DECODE_GEMV")))){
+        /* Decode shape (one row per expert): the grouped block-per-output kernels
+         * reach ~14% of HBM peak here; the warp-per-8-rows gemv_q4 (already
+         * validated on these same uploaded tensors by the fused chain) is far
+         * denser.  A few extra launches per call, all stream-ordered. */
+        size_t smem_h=(size_t)D*sizeof(__half), smem_d=(size_t)I*sizeof(__half);
+        for(int c2=0;c2<count;c2++){
+            const GroupDesc *hc=&host[c2];
+            const float *xr=ctx->x+(size_t)hc->offset*D;
+            float *g1=ctx->gate+(size_t)hc->offset*I,*u1=ctx->up+(size_t)hc->offset*I;
+            gemv_q4<<<((unsigned)I+7)/8,256,smem_h,ctx->stream>>>(g1,xr,
+                (const uint8_t*)hc->g,hc->gs,D,I);
+            gemv_q4<<<((unsigned)I+7)/8,256,smem_h,ctx->stream>>>(u1,xr,
+                (const uint8_t*)hc->u,hc->us,D,I);
+            silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(g1,u1,(size_t)I);
+            gemv_q4<<<((unsigned)D+7)/8,256,smem_d,ctx->stream>>>(ctx->y+(size_t)hc->offset*D,g1,
+                (const uint8_t*)hc->d,hc->ds,I,D);
         }
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
