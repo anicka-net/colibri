@@ -663,6 +663,73 @@ __global__ static void gemv_q4(float *__restrict__ y, const float *__restrict__ 
                                const uint8_t *__restrict__ w, const float *__restrict__ scales,
                                int I, int O);
 
+/* Grouped decode gemv (rows==1 per expert): block = (rows8, expert).  The
+ * activation row is staged to smem ONCE per block and feeds BOTH the gate and
+ * up projections (dual), so weight bandwidth dominates.  Same signed-nibble
+ * decode as gemv_q4. */
+__global__ static void grouped_gemv_q4_dual(float *__restrict__ gate_out,
+        float *__restrict__ up_out, const float *__restrict__ x_all,
+        const GroupDesc *__restrict__ g, int I_in, int O) {
+    const GroupDesc d = g[blockIdx.y];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * 8 + warp;
+    extern __shared__ char shmem[];
+    __half *sx = reinterpret_cast<__half *>(shmem);
+    const float *x = x_all + (size_t)d.offset * I_in;
+    for (int i = threadIdx.x; i < I_in; i += 256) sx[i] = __float2half(x[i]);
+    __syncthreads();
+    if (row >= O) return;
+    const int rb = I_in >> 1;
+    const uint8_t *gp = (const uint8_t *)d.g + (size_t)row * rb;
+    const uint8_t *up = (const uint8_t *)d.u + (size_t)row * rb;
+    float sg = 0.0f, su = 0.0f;
+    for (int b = lane * 4; b < rb; b += 128) {
+        uint32_t pg = *reinterpret_cast<const uint32_t *>(gp + b);
+        uint32_t pu = *reinterpret_cast<const uint32_t *>(up + b);
+        const int e = b * 2;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            float xv = __half2float(sx[e + k]);
+            sg += xv * (float)(((int)((pg >> (4 * k)) & 0xF) ^ 8) - 8);
+            su += xv * (float)(((int)((pu >> (4 * k)) & 0xF) ^ 8) - 8);
+        }
+    }
+    for (int o = 16; o; o >>= 1) {
+        sg += __shfl_down_sync(0xFFFFFFFF, sg, o);
+        su += __shfl_down_sync(0xFFFFFFFF, su, o);
+    }
+    if (lane == 0) {
+        gate_out[(size_t)d.offset * O + row] = sg * d.gs[row];
+        up_out  [(size_t)d.offset * O + row] = su * d.us[row];
+    }
+}
+
+__global__ static void grouped_gemv_q4_down(float *__restrict__ y,
+        const float *__restrict__ in_all, const GroupDesc *__restrict__ g,
+        int I_in, int O) {
+    const GroupDesc d = g[blockIdx.y];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * 8 + warp;
+    extern __shared__ char shmem[];
+    __half *sx = reinterpret_cast<__half *>(shmem);
+    const float *x = in_all + (size_t)d.offset * I_in;
+    for (int i = threadIdx.x; i < I_in; i += 256) sx[i] = __float2half(x[i]);
+    __syncthreads();
+    if (row >= O) return;
+    const int rb = I_in >> 1;
+    const uint8_t *rp = (const uint8_t *)d.d + (size_t)row * rb;
+    float sum = 0.0f;
+    for (int b = lane * 4; b < rb; b += 128) {
+        uint32_t p = *reinterpret_cast<const uint32_t *>(rp + b);
+        const int e = b * 2;
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            sum += __half2float(sx[e + k]) * (float)(((int)((p >> (4 * k)) & 0xF) ^ 8) - 8);
+    }
+    for (int o = 16; o; o >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, o);
+    if (lane == 0) y[(size_t)d.offset * O + row] = sum * d.ds[row];
+}
+
 extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *ups,
                                         ColiCudaTensor *const *downs,
@@ -759,18 +826,11 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
          * validated on these same uploaded tensors by the fused chain) is far
          * denser.  A few extra launches per call, all stream-ordered. */
         size_t smem_h=(size_t)D*sizeof(__half), smem_d=(size_t)I*sizeof(__half);
-        for(int c2=0;c2<count;c2++){
-            const GroupDesc *hc=&host[c2];
-            const float *xr=ctx->x+(size_t)hc->offset*D;
-            float *g1=ctx->gate+(size_t)hc->offset*I,*u1=ctx->up+(size_t)hc->offset*I;
-            gemv_q4<<<((unsigned)I+7)/8,256,smem_h,ctx->stream>>>(g1,xr,
-                (const uint8_t*)hc->g,hc->gs,D,I);
-            gemv_q4<<<((unsigned)I+7)/8,256,smem_h,ctx->stream>>>(u1,xr,
-                (const uint8_t*)hc->u,hc->us,D,I);
-            silu_mul<<<(unsigned)((I+255)/256),256,0,ctx->stream>>>(g1,u1,(size_t)I);
-            gemv_q4<<<((unsigned)D+7)/8,256,smem_d,ctx->stream>>>(ctx->y+(size_t)hc->offset*D,g1,
-                (const uint8_t*)hc->d,hc->ds,I,D);
-        }
+        grouped_gemv_q4_dual<<<dim3(((unsigned)I+7)/8,(unsigned)count),256,smem_h,ctx->stream>>>(
+            ctx->gate,ctx->up,ctx->x,dev,D,I);
+        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+        grouped_gemv_q4_down<<<dim3(((unsigned)D+7)/8,(unsigned)count),256,smem_d,ctx->stream>>>(
+            ctx->y,ctx->gate,dev,I,D);
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
