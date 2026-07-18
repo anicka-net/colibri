@@ -945,14 +945,14 @@ __global__ static void gemv_q4(float *__restrict__ y,
     for (int b = lane * 4; b < rb; b += 128) {
         uint32_t p = *reinterpret_cast<const uint32_t *>(rp + b);
         const int e = b * 2;
-        sum += __half2float(sx[e  ]) * (float)((int)( p        & 0xF) - 8);
-        sum += __half2float(sx[e+1]) * (float)((int)((p >>  4) & 0xF) - 8);
-        sum += __half2float(sx[e+2]) * (float)((int)((p >>  8) & 0xF) - 8);
-        sum += __half2float(sx[e+3]) * (float)((int)((p >> 12) & 0xF) - 8);
-        sum += __half2float(sx[e+4]) * (float)((int)((p >> 16) & 0xF) - 8);
-        sum += __half2float(sx[e+5]) * (float)((int)((p >> 20) & 0xF) - 8);
-        sum += __half2float(sx[e+6]) * (float)((int)((p >> 24) & 0xF) - 8);
-        sum += __half2float(sx[e+7]) * (float)((int)((p >> 28)      ) - 8);
+        sum += __half2float(sx[e  ]) * (float)(((int)( p        & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+1]) * (float)(((int)((p >>  4) & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+2]) * (float)(((int)((p >>  8) & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+3]) * (float)(((int)((p >> 12) & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+4]) * (float)(((int)((p >> 16) & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+5]) * (float)(((int)((p >> 20) & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+6]) * (float)(((int)((p >> 24) & 0xF) ^ 8) - 8);
+        sum += __half2float(sx[e+7]) * (float)(((int)((p >> 28)      ) ^ 8) - 8);
     }
 
     sum += __shfl_down_sync(0xFFFFFFFF, sum, 16);
@@ -963,8 +963,8 @@ __global__ static void gemv_q4(float *__restrict__ y,
 
     if (lane == 0) y[row] = sum * scales[row];
 }
-__global__ static void rmsnorm_kernel(float *__restrict__ out,
-                                       const float *__restrict__ x,
+__global__ static void rmsnorm_kernel(float *out,
+                                       const float *x,
                                        const float *__restrict__ weight,
                                        int size, float eps) {
     int tid = threadIdx.x;
@@ -1025,7 +1025,8 @@ __device__ static void absorption_body(
         for (int d = 0; d < qk_nope; d++) {
             const uint8_t *rp = kv_b_w + (size_t)(rbase + d) * rb;
             uint8_t v = rp[i >> 1];
-            float w = (float)(((i & 1) ? (v >> 4) : (v & 15)) - 8);
+            int n = (i & 1) ? (v >> 4) : (v & 15);
+            float w = (float)((n ^ 8) - 8);
             sum += qp[d] * w * kv_b_s[rbase + d];
         }
         s_qabs[i] = sum;
@@ -1124,7 +1125,8 @@ __device__ static void absorption_body(
         float sum = 0.0f;
         for (int i = 0; i < kvl; i++) {
             uint8_t v = rp[i >> 1];
-            float w = (float)(((i & 1) ? (v >> 4) : (v & 15)) - 8);
+            int n = (i & 1) ? (v >> 4) : (v & 15);
+            float w = (float)((n ^ 8) - 8);
             sum += s_clat[i] * w;
         }
         ctx_out[(size_t)h * vh + row] = sum * kv_b_s[krow];
