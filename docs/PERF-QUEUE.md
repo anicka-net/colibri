@@ -17,7 +17,7 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context) — weights EXTRACTED, integration open
+### 1. DSA sparse attention + IndexShare (long context) — short-context tax REMOVED, selection-in-chain open
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
 (`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
@@ -29,8 +29,13 @@ pays attention twice.
   out-idx files.  VALIDATED end-to-end: with `DSA_TOPK=32` forcing sparse
   selection at short context, greedy output is token-identical to full
   attention.  Caveat until integration: with the files present the engine
-  auto-enables DSA and the current pipe/fused-chain gates cost ~3 tok/s at
-  short context — set `DSA=0` on the discrete-GPU host for now.
+  auto-enables DSA; since b9a1c30 the fused chain runs on indexer layers while
+  selection is inactive and caches k_idx itself (DSA-on 19.7 vs DSA=0 20.2 —
+  the residue is the CPU k_idx gemv, 19 'full' layers).  `DSA=0` no longer
+  needed for short-context benchmarks.  REMAINING (the actual long-context
+  win): selection inside the chain — device Ic cache, ix_wq/ix_wp scoring +
+  top-k, absorption over an index list, 'shared'-layer selection reuse,
+  index_topk_freq refresh — and lifting the pipe2 gate past index_topk.
   (Original plan, for reference: `--indexer` re-downloads shards
   to keep a few GB (resumable per shard).  Run it on the multi-GB/s host, not
   the 1 Gbps ones; the few-GB output then crosses the ~100 Mbps host-to-host
