@@ -3880,7 +3880,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     /* Fused chain fast path: whole attention section in one backend call, KV
      * device-resident, single sync.  DSA-indexer layers and non-int4 weights
      * fall back to the op-by-op path below. */
-    if(S==1 && li<c->n_layers && !(m->has_dsa && c->idx_type[li]) &&
+    if(S<=4 && li<c->n_layers && !(m->has_dsa && c->idx_type[li]) &&
        kv_dev_sync(m,l,m->kv,li,pos_base)){
         int kvl=c->kv_lora, R=c->qk_rope;
         float *cw1=pipe_ln_cache(dev,li,0,l->q_a_ln,(size_t)c->q_lora);
