@@ -26,7 +26,8 @@ past it, our attention grows linearly while native stays ~flat — and MTP verif
 pays attention twice.
 - Extraction: `convert_fp8_to_int4.py --indexer` re-downloads ~756 GB of shards
   to keep a few GB (resumable per shard).  Run it on the multi-GB/s host, not
-  the 1 Gbps ones.
+  the 1 Gbps ones; the few-GB output then crosses the ~100 Mbps host-to-host
+  link in minutes (never move the raw shards between machines).
 - Integration: the CPU DSA paths exist, but the fused pipe2 chain has no index
   support and the pipe gate disables itself past `index_topk` when `has_dsa`.
 - IndexShare for drafts comes nearly free once the above lands.
