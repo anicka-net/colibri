@@ -227,12 +227,14 @@ tap_bytes=147480
 
 ### 12. Windows CUDA DLL fused symbol
 
-**CHANGED-UNVERIFIED** - The fused entry point is exported, resolved, and
-forwarded by `backend_loader.c`. No MinGW/MSVC CUDA toolchain is installed on
-this machine; the pull request's Windows CUDA job is the executable proof.
+**FIXED** - The fused entry point is exported, resolved, and forwarded by
+`backend_loader.c`. PR #3's hosted Windows build compiled `coli_cuda.dll` with
+nvcc/MSVC and linked `glm.exe` through the runtime loader.
 
 ```text
-CUDA DLL loader exports, resolves, and forwards pipe_attn_chain
+CUDA build (Windows, MSVC host)	pass	1m57s	https://github.com/anicka-net/colibri/actions/runs/29646746720/job/88086171710
+CUDA syntax check	pass	29s	https://github.com/anicka-net/colibri/actions/runs/29646746720/job/88086171703
+windows	pass	1m42s	https://github.com/anicka-net/colibri/actions/runs/29646746715/job/88086171647
 ```
 
 ### 13. Lower-severity objective defects
@@ -265,9 +267,9 @@ OK
 
 ### Self-check
 
-1. Windows CUDA DLL linkage, allocation failure, a 64-node NUMA host, and the
-   Nix expression were not executable locally; each is identified above as
-   CHANGED-UNVERIFIED.
+1. Allocation failure, a 64-node NUMA host, and the Nix expression were not
+   executable locally; each is identified above as CHANGED-UNVERIFIED. Windows
+   CUDA DLL linkage was verified by PR #3's hosted MSVC job.
 2. Every claim above corresponds to the `origin/dev..HEAD` diff or to pasted
    command output.
 3. The review smoke paths were greedy NaN selection, misleading stop
