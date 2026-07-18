@@ -15,7 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: make check
-        run: make -C c check
+        # GCC 16.1 on UCRT64 currently ICEs in its O3 inline pass on glm.c.
+        # O2 keeps the native Windows build/test gate useful until GCC fixes it.
+        run: make -C c check OPT=-O2
 
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64

@@ -24,10 +24,6 @@ import os
 import subprocess
 import sys
 
-import numpy as np
-import torch
-from transformers import GlmMoeDsaForCausalLM
-
 D = 128  # hidden of the tiny fixture
 SNAP = "./glm_tiny_i8"
 
@@ -45,6 +41,10 @@ def run_engine(env_extra):
 
 
 def main():
+    import numpy as np
+    import torch
+    from transformers import GlmMoeDsaForCausalLM
+
     ref = json.load(open("ref_glm.json"))
     prompt = ref["prompt_ids"]
 
