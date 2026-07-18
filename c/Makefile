@@ -8,6 +8,9 @@
 # cross-compiling (e.g. make CC=x86_64-w64-mingw32-gcc on Linux). CC is chosen
 # per-target below, so probe with the user's CC if they set one, else gcc
 # (present on Linux and mingw, and a clang shim on macOS).
+ifeq ($(strip $(OPT)),)
+OPT := -O3
+endif
 DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
 TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 
@@ -163,8 +166,7 @@ endif
 ifeq ($(OS),Windows_NT)
 PYTHON    ?= python
 else
-PYTHON    ?= python3
-OPT    ?= -O3
+PYTHON ?= python3
 endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_olmoe_ppl$(EXE)

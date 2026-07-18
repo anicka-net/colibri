@@ -25,7 +25,8 @@ class StopMatchingTest(unittest.TestCase):
                 os.environ, {"XDG_RUNTIME_DIR": runtime}):
             path = self.module["serve_pidfile"](8000)
             self.module["write_pidfile"](path, "/model")
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
             self.assertEqual(os.path.dirname(path), runtime)
 
 
