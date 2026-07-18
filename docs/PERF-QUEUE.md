@@ -27,17 +27,22 @@ pays attention twice.
 - Extraction: `convert_fp8_to_int4.py --indexer` re-downloads ~756 GB of shards
   to keep a few GB (resumable per shard).  Run it on the multi-GB/s host, not
   the 1 Gbps ones; the few-GB output then crosses the ~100 Mbps host-to-host
-  link in minutes (never move the raw shards between machines).
+  link in minutes (never move the raw shards between machines).  The fast host
+  has limited disk — fine for extraction (one ~5 GB shard in flight, deleted
+  after conversion; output a few GB); anything bulk belongs on the RAID host.
 - Integration: the CPU DSA paths exist, but the fused pipe2 chain has no index
   support and the pipe gate disables itself past `index_topk` when `has_dsa`.
 - IndexShare for drafts comes nearly free once the above lands.
 
-### 2. MTP multi-step recursion bug
-DRAFT=1 draft: 88-94% acceptance.  DRAFT=3: 23% overall — the self-fed steps
-degenerate (block output norm grows 28→110 across steps, argmax collapses to
-frequent tokens).  Native reports 2.2-2.8 tokens/forward.  Plan: golden-value
-comparison of `mtp_draft`'s recursion inputs (h normalization order, concat,
-eh_proj) against the reference implementation; the step-1 path is known good.
+### 2. MTP multi-step drafts — RESOLVED, now an economics question
+The old-tree "recursion bug" (23% at DRAFT=3) does not reproduce on current
+main: DRAFT=2 gives 2.29 tok/forward (62% acceptance), DRAFT=3 gives 2.37
+(44%) — inside the native 2.2-2.8 range.  Semantics were cross-checked against
+the vLLM Glm4MoeMultiTokenPredictorLayer: same concat order, same recursion;
+colibri's extra final_norm on h at step 0 measures BETTER than the
+reference-exact variant (MTP_PRENORM=1: 53%/42%) — keep the default.
+At short context deeper drafts lose on forward cost (S=3-4); the crossover
+belongs to item 6 (long context), where halving forwards should win.
 
 ### 3. Fused-chain internal fusion
 Attention is 1.5s/64 tok = 0.31 ms/layer, execution-bound across ~15 serial
