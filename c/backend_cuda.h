@@ -14,6 +14,7 @@
 #define COLI_CUDA_DLLEXPORT
 #endif
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -92,6 +93,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,C
                                       const float *rope,int S,int H,int Q,int R,
                                       int V,int K,int T,float attention_scale);
 
+COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
+        float *out,const float *q,const float *const *latent,const float *const *rope,
+        const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
+
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
@@ -102,6 +107,18 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
 
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain(int device,
+        float *x_dev, float *nrm_dev, float *nrm_host,
+        float *kv_host_L, float *kv_host_R,
+        const ColiCudaTensor *qa, const ColiCudaTensor *qb,
+        const ColiCudaTensor *kva, const ColiCudaTensor *kvb,
+        const ColiCudaTensor *o_proj,
+        const float *w_in, const float *w_qa, const float *w_kva, const float *w_post,
+        float *d_Lc, float *d_Rc,
+        int D, int H, int q_lora, int kv_lora,
+        int qk_nope, int qk_rope, int vh,
+        int S, int pos_base, int kv_start,
+        float eps, float theta, float attn_scale);
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
@@ -143,4 +160,3 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 #endif
 
 #endif
-

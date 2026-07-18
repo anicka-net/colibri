@@ -379,14 +379,32 @@ def main():
     if a.indir:    # conversione locale (test)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
+        # BUG #355: questo ramo ignorava --mtp/--indexer. Con --mtp scriveva
+        # out-NNNNN (gli STESSI nomi di una conversione normale) in ebits=8 e
+        # keep_mtp=False -> il "secondo passaggio MTP" nella stessa outdir
+        # SOVRASCRIVEVA il container gia' finito con una riconversione int8
+        # completa, in silenzio (137/141 shard distrutti prima di accorgersene).
+        # Ora il ramo locale rispecchia il download path: prefisso corretto,
+        # flag passate, shard vuoti saltati.
+        prefix = "out-mtp-" if a.mtp else "out-idx-" if a.indexer else "out-"
+        n = 0
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
-            save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
-        # copia config + tokenizer
-        for fn in ["config.json"]:
-            src = os.path.join(a.indir, fn)
-            if os.path.exists(src): shutil.copy(src, a.outdir)
-        print(f"converted {len(shards)} shards -> {a.outdir}")
+            out = {}
+            convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                          keep_mtp=a.mtp, keep_idx=a.indexer,
+                          group_size=a.group_size, bits_map=bits_map)
+            if not out:                                   # shard senza MTP/idx: niente file (come il download path)
+                continue
+            save_file(out, os.path.join(a.outdir, f"{prefix}{n:05d}.safetensors"))
+            n += 1
+        # config/tokenizer solo per la conversione principale — i passaggi mtp/idx
+        # vanno nella stessa outdir di un container gia' completo di metadati.
+        if not a.mtp and not a.indexer:
+            for fn in ["config.json"]:
+                src = os.path.join(a.indir, fn)
+                if os.path.exists(src): shutil.copy(src, a.outdir)
+        tag = "MTP" if a.mtp else "indexer" if a.indexer else "main"
+        print(f"converted {n} {tag} shard(s) -> {a.outdir} ({prefix}NNNNN)")
         return
 
     # reale: scarica shard per shard, converte, cancella

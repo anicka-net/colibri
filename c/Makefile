@@ -8,6 +8,9 @@
 # cross-compiling (e.g. make CC=x86_64-w64-mingw32-gcc on Linux). CC is chosen
 # per-target below, so probe with the user's CC if they set one, else gcc
 # (present on Linux and mingw, and a clang shim on macOS).
+ifeq ($(strip $(OPT)),)
+OPT := -O3
+endif
 DETECT_CC := $(if $(filter default,$(origin CC)),gcc,$(CC))
 TRIPLET   := $(shell $(DETECT_CC) -dumpmachine 2>/dev/null)
 
@@ -54,7 +57,7 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = $(OPT) $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in glm.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
@@ -74,7 +77,7 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -D_FILE_OFFSET_BITS=64 $(OPT) -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
@@ -89,7 +92,7 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = $(OPT) -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 else
@@ -100,7 +103,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = $(OPT) -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -pthread
 EXE     =
 endif
@@ -163,10 +166,10 @@ endif
 ifeq ($(OS),Windows_NT)
 PYTHON    ?= python
 else
-PYTHON    ?= python3
+PYTHON ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_olmoe_ppl$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -212,11 +215,25 @@ all: glm$(EXE)
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
 
-glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ)
+# Config stamp: make only tracks file timestamps, not flag changes. Without this,
+# `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
+# silently keeps the CPU-only binary (no CUDA loader) — a build that looks like it
+# worked but isn't. We record the build-affecting flags in .build-config and rewrite
+# it ONLY when they change (evaluated here at parse time, so the file's timestamp
+# moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
+# on it, so they relink on a config change and stay put otherwise. (#306)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
+BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
+ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
+$(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
+endif
+.build-config: ;
+
+glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) $(METAL_OBJ) -o glm$(EXE) $(LDFLAGS)
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
-backend_loader.o: backend_loader.c backend_cuda.h compat.h
+backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 	$(CC) $(CFLAGS) -c backend_loader.c -o $@
 
 # Windows CUDA DLL: compile backend_cuda.cu with nvcc (+MSVC cl.exe as host
@@ -225,15 +242,15 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
 cuda-dll: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
+	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
+backend_cuda.o: backend_cuda.cu backend_cuda.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
@@ -243,13 +260,13 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	./backend_metal_test
 
 cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
-	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
@@ -279,6 +296,9 @@ iobench$(EXE): iobench.c compat.h
 tests/test_json$(EXE): tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
+	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
 tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -297,6 +317,23 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_stops$(EXE): tests/test_stops.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_topp$(EXE): tests/test_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
+# gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
+tests/bench_topp$(EXE): tests/bench_topp.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -304,6 +341,17 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_olmoe_ppl$(EXE): tests/test_olmoe_ppl.c olmoe.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
+# NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h

@@ -11,8 +11,8 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
-                           READY, Engine, generation_options, parse_tool_calls,
-                           read_engine_turn, render_chat, serve)
+                           READY, Engine, anthropic_messages, generation_options, parse_tool_calls,
+                           read_engine_turn, render_chat, responses_messages, serve, split_reasoning)
 
 
 class FakeEngine:
@@ -39,6 +39,41 @@ class BlockingEngine(FakeEngine):
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
                                 cancelled)
+
+
+class ThinkingEngine(FakeEngine):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
+        if "# Tools" in prompt:
+            chunks = ("<tool_call>lookup<arg_key>q</arg_key>",
+                      "<arg_value>bird</arg_value></tool_call>")
+        else:
+            chunks = ("Reason", "ing</th", "ink>Answer") if prompt.endswith("<think>") else ("Answer",)
+        for chunk in chunks:
+            on_text(chunk)
+        return {"prompt_tokens": 11, "completion_tokens": 4, "length_limited": False}
+
+
+class FailingEngine(FakeEngine):
+    def generate(self, *args, **kwargs):
+        raise RuntimeError("injected engine failure")
+
+
+class PartialFailingEngine(FakeEngine):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
+        on_text("reason</think>hello<think>")
+        raise RuntimeError("injected partial engine failure")
+
+
+class ReasoningToolEngine(FakeEngine):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
+        for chunk in ("<tool_call>lookup<arg_key>q</arg_key><arg_value>secret</arg_value>",
+                      "</tool_call></think>Answer"):
+            on_text(chunk)
+        return {"prompt_tokens": 11, "completion_tokens": 4, "length_limited": False}
 
 
 class TemplateTest(unittest.TestCase):
@@ -69,6 +104,12 @@ class TemplateTest(unittest.TestCase):
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
         )
 
+    def test_truncated_thinking_does_not_leak_into_content(self):
+        self.assertEqual(split_reasoning("private reasoning", True),
+                         ("private reasoning", ""))
+        self.assertEqual(split_reasoning("reason</think>answer</think>done", True),
+                         ("reason", "answerdone"))
+
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
                          (4, 0.0, 1.0))
@@ -85,6 +126,17 @@ class TemplateTest(unittest.TestCase):
             generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
                          (8, 0.7, 0.9))
+
+    def test_anthropic_mixed_blocks_preserve_order(self):
+        messages = anthropic_messages({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+            {"type": "text", "text": "after"},
+        ]}]})
+        self.assertEqual([message["role"] for message in messages], ["tool", "user"])
+
+    def test_responses_function_call_requires_name(self):
+        with self.assertRaisesRegex(APIError, "string `name`"):
+            responses_messages({"input": [{"type": "function_call", "arguments": "{}"}]})
 
 
 class ProtocolTest(unittest.TestCase):
@@ -111,6 +163,31 @@ class ProtocolTest(unittest.TestCase):
             popen.assert_not_called()
         finally:
             listener.close()
+
+    def test_engine_passes_quantization_bits(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine("glm", "model", cap=64, expert_bits=4, dense_bits=4)
+        self.assertEqual(popen.call_args.args[0], ["glm", "64", "4", "4"])
+        engine.close()
+
+    def test_response_history_is_bounded_by_count_and_bytes(self):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model")
+        try:
+            for index in range(40):
+                server.remember_response(f"resp_{index}", [{"role": "user", "content": str(index)}])
+            self.assertEqual(len(server.response_history), 32)
+            with self.assertRaises(APIError):
+                server.response_context("resp_0")
+
+            large = "x" * (9 << 20)
+            server.remember_response("large_1", [{"role": "user", "content": large}])
+            server.remember_response("large_2", [{"role": "user", "content": large}])
+            self.assertLessEqual(server.response_history_bytes, 16 << 20)
+            self.assertNotIn("large_1", server.response_history)
+        finally:
+            server.scheduler.close()
+            server.server_close()
 
 
 class SchedulerTest(unittest.TestCase):
@@ -380,6 +457,25 @@ class DispatcherTest(unittest.TestCase):
         engine.close()
         self.assertEqual(chunks, ["é"])
 
+    def test_records_profile_snapshots_from_prof_lines(self):
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(engine.profile_seq, 1)
+        self.assertEqual(list(engine.profile), [{
+            "wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
+            "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
+            "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
+        }])
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
@@ -401,6 +497,25 @@ class DispatcherTest(unittest.TestCase):
             engine.generate("hello", 8, 0.7, 0.9, output.append, cancelled=lambda: True)
         engine.close()
         self.assertEqual(output, ["x"])
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
+    def test_cancels_before_the_first_output_token(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, cancelled=lambda: True)
+        engine.close()
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
 
@@ -442,6 +557,23 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(scheduler["max_queue"], 8)
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
+
+    def test_profile_requires_auth_and_reports_recent_turns(self):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(self.base + "/profile", timeout=2)
+        self.assertEqual(caught.exception.code, 401)
+        with self.request("/profile") as response:
+            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+        turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
+                "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
+                "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
+        self.engine.profile = [turn]
+        self.engine.profile_seq = 1
+        try:
+            with self.request("/profile") as response:
+                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+        finally:
+            del self.engine.profile, self.engine.profile_seq
 
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={
@@ -510,6 +642,229 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+    def test_anthropic_accepts_x_api_key(self):
+        data = json.dumps({
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4,
+        }).encode()
+        request = Request(self.base + "/v1/messages", data=data, headers={
+            "Content-Type": "application/json", "x-api-key": "secret"})
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(json.load(response)["type"], "message")
+
+    def test_rejects_prompt_over_context_byte_ceiling(self):
+        old = self.server.context_length
+        self.server.context_length = 8
+        try:
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "x" * 200}],
+                    "max_tokens": 1,
+                })
+            self.assertEqual(caught.exception.code, 400)
+            self.assertEqual(json.load(caught.exception)["error"]["code"],
+                             "context_length_exceeded")
+        finally:
+            self.server.context_length = old
+
+
+class DS4CompatibilityHTTPTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = ThinkingEngine()
+        cls.server = APIServer(
+            ("127.0.0.1", 0), cls.engine, "deepseek-v4-flash", max_tokens=32,
+            model_aliases=("deepseek-v4-pro",), hidden_model_aliases=("deepseek-chat",),
+            context_length=131072, default_thinking=True)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def request(self, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        return urlopen(Request(self.base + path, data=data, headers=headers), timeout=2)
+
+    def test_lists_public_aliases_with_context_metadata(self):
+        with self.request("/v1/models") as response:
+            models = json.load(response)["data"]
+        self.assertEqual([model["id"] for model in models],
+                         ["deepseek-v4-flash", "deepseek-v4-pro"])
+        self.assertEqual(models[0]["context_length"], 131072)
+        self.assertEqual(models[0]["top_provider"]["max_completion_tokens"], 32)
+
+    def test_default_thinking_is_split_from_content(self):
+        with self.request("/v1/chat/completions", {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }) as response:
+            message = json.load(response)["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "Reasoning")
+        self.assertEqual(message["content"], "Answer")
+
+    def test_deepseek_chat_and_think_false_disable_thinking(self):
+        for model, extra in (("deepseek-chat", {}), ("deepseek-v4-pro", {"think": False}),
+                             ("deepseek-v4-flash", {"thinking": {"type": "disabled"}})):
+            with self.request("/v1/chat/completions", {
+                "model": model, "messages": [{"role": "user", "content": "Hi"}], **extra,
+            }) as response:
+                message = json.load(response)["choices"][0]["message"]
+            self.assertEqual(message["content"], "Answer")
+            self.assertNotIn("reasoning_content", message)
+
+    def test_streams_reasoning_separately(self):
+        with self.request("/v1/chat/completions", {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        }) as response:
+            stream = response.read().decode()
+        self.assertIn('"reasoning_content":"Reason', stream)
+        self.assertIn('"reasoning_content":"ing"', stream)
+        self.assertIn('"content":"Answer"', stream)
+        self.assertTrue(stream.endswith("data: [DONE]\n\n"))
+
+    def test_responses_json_and_stream(self):
+        body = {"model": "deepseek-v4-flash", "input": "Hi",
+                "reasoning": {"effort": "none"}}
+        with self.request("/v1/responses", body) as response:
+            result = json.load(response)
+        self.assertEqual(result["object"], "response")
+        self.assertEqual(result["output"][0]["content"][0]["text"], "Answer")
+
+        with self.request("/v1/responses", {**body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn('"type":"response.created"', stream)
+        self.assertIn('"type":"response.output_text.delta"', stream)
+        self.assertIn('"type":"response.completed"', stream)
+
+    def test_anthropic_json_and_stream(self):
+        body = {"model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 16, "thinking": {"type": "enabled", "budget_tokens": 8}}
+        with self.request("/v1/messages", body) as response:
+            result = json.load(response)
+        self.assertEqual(result["type"], "message")
+        self.assertEqual(result["content"][0]["thinking"], "Reasoning")
+        self.assertEqual(result["content"][1]["text"], "Answer")
+        self.assertEqual(result["usage"]["input_tokens"], 11)
+        self.assertEqual(result["usage"]["cache_creation_input_tokens"], 0)
+
+        with self.request("/v1/messages", {**body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn("event: message_start", stream)
+        self.assertIn('"type":"thinking_delta"', stream)
+        self.assertIn('"type":"text_delta","text":"Answer"', stream)
+        self.assertIn("event: message_stop", stream)
+
+    def test_responses_and_anthropic_translate_tool_calls(self):
+        response_tool = {"type": "function", "name": "lookup",
+                         "description": "Look up a bird",
+                         "parameters": {"type": "object", "properties": {
+                             "q": {"type": "string"}}}}
+        response_body = {"model": "deepseek-v4-flash", "input": "Find it",
+                         "reasoning": {"effort": "none"}, "tools": [response_tool]}
+        with self.request("/v1/responses", response_body) as response:
+            first_response = json.load(response)
+            output = first_response["output"]
+        self.assertEqual(output[0]["type"], "function_call")
+        self.assertEqual(output[0]["name"], "lookup")
+        self.assertEqual(json.loads(output[0]["arguments"]), {"q": "bird"})
+        with self.request("/v1/responses", {
+            "model": "deepseek-v4-flash",
+            "previous_response_id": first_response["id"],
+            "input": [{"type": "function_call_output",
+                       "call_id": output[0]["call_id"], "output": "sparrow"}],
+            "reasoning": {"effort": "none"},
+        }) as response:
+            follow_up = json.load(response)
+        self.assertEqual(follow_up["output"][0]["content"][0]["text"], "Answer")
+
+        with self.request("/v1/responses", {**response_body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn('"type":"response.function_call_arguments.delta"', stream)
+        self.assertNotIn("<tool_call>", stream)
+
+        anthropic_tool = {"name": "lookup", "description": "Look up a bird",
+                          "input_schema": {"type": "object", "properties": {
+                              "q": {"type": "string"}}}}
+        anthropic_body = {"model": "deepseek-v4-flash",
+                          "messages": [{"role": "user", "content": "Find it"}],
+                          "max_tokens": 16, "thinking": {"type": "disabled"},
+                          "tools": [anthropic_tool], "tool_choice": {"type": "any"}}
+        with self.request("/v1/messages", anthropic_body) as response:
+            result = json.load(response)
+        self.assertEqual(result["stop_reason"], "tool_use")
+        self.assertEqual(result["content"][0]["type"], "tool_use")
+        self.assertEqual(result["content"][0]["input"], {"q": "bird"})
+        with self.request("/v1/messages", {
+            "model": "deepseek-v4-flash", "max_tokens": 16,
+            "thinking": {"type": "disabled"},
+            "messages": [
+                {"role": "user", "content": "Find it"},
+                {"role": "assistant", "content": result["content"]},
+                {"role": "user", "content": [{"type": "tool_result",
+                  "tool_use_id": result["content"][0]["id"], "content": "sparrow"}]},
+            ],
+        }) as response:
+            follow_up = json.load(response)
+        self.assertEqual(follow_up["content"][0]["text"], "Answer")
+
+        with self.request("/v1/messages", {**anthropic_body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn('"type":"tool_use"', stream)
+        self.assertIn('"type":"input_json_delta"', stream)
+        self.assertNotIn("<tool_call>", stream)
+
+    def test_streaming_chat_ignores_tool_calls_inside_reasoning(self):
+        old = self.server.engine
+        self.server.engine = ReasoningToolEngine()
+        try:
+            tool = {"type": "function", "function": {"name": "lookup",
+                    "parameters": {"type": "object", "properties": {}}}}
+            with self.request("/v1/chat/completions", {
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True, "tools": [tool],
+            }) as response:
+                stream = response.read().decode()
+            self.assertIn('"content":"Answer"', stream)
+            self.assertNotIn('"tool_calls"', stream)
+        finally:
+            self.server.engine = old
+
+    def test_protocol_streams_emit_errors_and_finish(self):
+        old = self.server.engine
+        self.server.engine = PartialFailingEngine()
+        try:
+            with self.request("/v1/responses", {
+                "model": "deepseek-v4-flash", "input": "Hi", "stream": True,
+            }) as response:
+                responses_stream = response.read().decode()
+            self.assertIn('"type":"response.failed"', responses_stream)
+            self.assertLess(responses_stream.index('"type":"response.output_text.delta"'),
+                            responses_stream.index('"type":"response.failed"'))
+
+            with self.request("/v1/messages", {
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 4, "stream": True,
+            }) as response:
+                anthropic_stream = response.read().decode()
+            self.assertIn("event: error", anthropic_stream)
+            self.assertLess(anthropic_stream.index("event: content_block_delta"),
+                            anthropic_stream.index("event: error"))
+        finally:
+            self.server.engine = old
 
 
 class StaticServingTest(unittest.TestCase):
@@ -583,6 +938,29 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertEqual(error["code"], "queue_full")
         self.engine.release.set(); first.join(2)
         self.assertEqual(first_errors, [])
+
+    def test_health_identifies_the_watchdog_probe(self):
+        result = []
+        body = json.dumps({"model": "test-model", "messages": [
+            {"role": "user", "content": "Hi"}]}).encode()
+        request = Request(self.url, data=body, headers={
+            "Content-Type": "application/json", "X-Colibri-Watchdog": "1"})
+
+        def run():
+            with urlopen(request, timeout=2) as response:
+                result.append(response.read())
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(self.engine.entered.wait(1))
+        health_url = f"http://127.0.0.1:{self.server.server_port}/health"
+        with urlopen(health_url, timeout=2) as response:
+            health = json.load(response)
+        self.assertEqual(health["watchdog_active"], 1)
+        self.assertEqual(health["scheduler"]["active"], 1)
+        self.engine.release.set()
+        thread.join(2)
+        self.assertTrue(result)
 
 
 

@@ -143,6 +143,12 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
  * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
  * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
  * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
+/* Ultimo GetLastError() di una ReadFile fallita, per thread: il chiamante
+ * (pread_full in glm.c) lo stampa accanto a strerror. Senza questo, OGNI
+ * fallimento Windows collassa in "EIO -> Input/output error" e la diagnosi
+ * dal campo diventa un tirare a indovinare (#307: tre giri di ipotesi tra
+ * tre persone perche' il codice vero non compariva da nessuna parte). */
+static __thread DWORD compat_pread_lasterr __attribute__((unused));
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
@@ -158,6 +164,7 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
         if(!ReadFile(h, (char*)buf + total, chunk32, &rd, &ov)){
             DWORD err = GetLastError();
             if(err == ERROR_HANDLE_EOF) break;  /* past EOF → return bytes read (0 if none, matching POSIX pread) */
+            compat_pread_lasterr = err;         /* preserva il codice VERO per il report (#307) */
             if(err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_FUNCTION) errno = EBADF;
             else errno = EIO;
             return -1;
@@ -237,7 +244,9 @@ static inline int compat_rename(const char *old, const char *new){
 /* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
  * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */
 #include <psapi.h>
-#pragma comment(lib, "psapi.lib")
+#ifdef _MSC_VER
+#pragma comment(lib, "psapi.lib")   /* MSVC: link psapi; MinGW/GCC uses -lpsapi */
+#endif
 struct rusage { long ru_maxrss; };
 #define RUSAGE_SELF 0
 static inline int getrusage(int who, struct rusage *r){

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -104,6 +105,38 @@ static int st_direct_fd(shards *S, int fd) {
 }
 
 /* indicizza tutti i model-*.safetensors in snap_dir */
+/* pread completo: chunk-loop (una singola pread si ferma a ~2^31 byte su Linux
+ * — i tensori bf16 grandi la superano), riprova su EINTR e riporta un errore
+ * ONESTO: perror stampava "Success" su una short-read (errno resta 0), lo
+ * stesso sintomo corretto in glm.c per #236. ST_PREAD_CHUNK e' sovrascrivibile
+ * per i test. EN: full pread — chunk loop (one pread caps at ~2^31 bytes and
+ * big bf16 tensors exceed it), EINTR retry, honest short-read errors.
+ * Exits on failure, like every st.h reader. */
+#ifndef ST_PREAD_CHUNK
+#define ST_PREAD_CHUNK (1u << 30)
+#endif
+static void st_pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag) {
+    char *p = (char *)buf;
+    int64_t got = 0;
+    while (got < n) {
+        int64_t want = n - got;
+        if (want > (int64_t)ST_PREAD_CHUNK) want = ST_PREAD_CHUNK;
+        ssize_t r = pread(fd, p + got, (size_t)want, off + got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "%s: %s (off %lld, %lld/%lld bytes)\n", tag, strerror(errno),
+                    (long long)off, (long long)got, (long long)n);
+            exit(1);
+        }
+        if (r == 0) {
+            fprintf(stderr, "%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated file?\n",
+                    tag, (long long)off, (long long)got, (long long)n);
+            exit(1);
+        }
+        got += r;
+    }
+}
+
 static void st_init(shards *S, const char *snap_dir) {
     memset(S, 0, sizeof(*S));
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
@@ -128,7 +161,7 @@ static void st_init(shards *S, const char *snap_dir) {
         if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
         int64_t fsz = (int64_t)sst.st_size;
         uint64_t hlen;
-        if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
+        st_pread_full(fd, &hlen, 8, 0, "pread hlen");
         /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
          * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
          * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
@@ -138,7 +171,7 @@ static void st_init(shards *S, const char *snap_dir) {
                     files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
         char *hdr = malloc(hlen + 1);
         if (!hdr) { perror("malloc safetensors header"); exit(1); }
-        if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
+        st_pread_full(fd, hdr, (int64_t)hlen, 8, "pread hdr");
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
@@ -218,7 +251,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     void *raw = malloc(t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
-    if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
+    st_pread_full(t->fd, raw, t->nbytes, t->off, "pread data");
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
@@ -243,7 +276,7 @@ static int64_t st_nbytes(shards *S, const char *name) {
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
+    st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
@@ -256,7 +289,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    if (pread(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
+    st_pread_full(t->fd, raw, nb, boff, "pread slice");
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }

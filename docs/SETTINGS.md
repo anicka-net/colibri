@@ -60,6 +60,8 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Seconds a request may wait. |
 | `--kv-slots` | `$COLI_KV_SLOTS` or `1` | Independent KV conversation slots (→ `KV_SLOTS`). |
+| `--expert-bits` | `$COLI_EXPERT_BITS` or `8` | Quantization bits for routed experts. |
+| `--dense-bits` | `$COLI_DENSE_BITS` or `--expert-bits` | Quantization bits for dense and attention weights. |
 
 **`convert`**
 
@@ -87,9 +89,15 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
+| `--model-alias` | none | Additional advertised model id; repeatable. |
+| `--hidden-model-alias` | none | Accepted but unadvertised compatibility id; repeatable. |
+| `--default-thinking` | `$COLI_THINK=1` or off | Enable thinking unless the request disables it. |
+| `--context-length` | `$COLI_CONTEXT_LENGTH`, `--ctx`, or unset | Context length advertised by `/v1/models`. |
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
 | `--cap` | `8` | Expert-cache cap. |
+| `--expert-bits` | `$COLI_EXPERT_BITS` or `8` | Quantization bits for routed experts. |
+| `--dense-bits` | `$COLI_DENSE_BITS` or `--expert-bits` | Quantization bits for dense and attention weights. |
 | `--max-tokens` | `1024` | Default max completion tokens. |
 | `--max-queue` | `$COLI_MAX_QUEUE` or `8` | Max queued requests. |
 | `--queue-timeout` | `$COLI_QUEUE_TIMEOUT` or `300` | Request queue timeout (s). |

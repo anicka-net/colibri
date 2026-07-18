@@ -66,7 +66,7 @@ class MakefilePlatformTests(unittest.TestCase):
             "portable", "arm64-apple-darwin", OMPDIR=missing_libomp
         )
 
-        self.assertIn("clang -O3", result.stdout)
+        self.assertIn("clang ", result.stdout)
         self.assertNotIn("-mcpu=x86-64-v3", result.stdout)
         self.assertNotIn(missing_libomp, result.stdout)
         self.assertNotIn("-fopenmp", result.stdout)
