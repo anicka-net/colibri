@@ -43,16 +43,21 @@ upload path. RAM is smaller than the model, so experts stream from NVMe and the
 expert cache hit rate — not compute — decides throughput.
 
 ```
-COLI_CUDA=1 DIRECT=1 AUTOPIN=0 \
+COLI_CUDA=1 COLI_CUDA_HOST_EXPERTS=1 COLI_CUDA_PIPE=2 \
+CUDA_EXPERT_GB=0 PIN=0 PIN_GB=0 DIRECT=1 AUTOPIN=0 \
 OMP_NUM_THREADS=<cores> ./glm 64 4 4
 ```
 
 - `DIRECT=1` (O_DIRECT): buffered readahead wastes NVMe bandwidth on this path.
+- Keep `CUDA_EXPERT_GB=0`: a separate CUDA tier consumes the same physical LPDDR
+  as the LRU on GB10. Combining a large cache with an inherited device-tier
+  setting can overcommit memory and swap catastrophically.
 - Cache size (first CLI arg) as large as RAM allows after the dense weights;
   every extra slot is hit rate. Steady-state LRU hit rate on a fresh long
   corpus is ~77% — quote that, not the flattering just-after-prefill number.
 - Speculation helps MORE here than on Profile A: drafted tokens share expert
-  loads, and disk is the bottleneck. Use `DRAFT=1` with an int8 MTP head.
+  loads in principle, but current strict-routing measurements lose overlap when
+  miss-containing host groups synchronize safely. Keep `DRAFT=0` for now.
 - The theoretical ceiling is NVMe bandwidth / (misses/token × expert size);
   prefetch/eviction policy work pays more than kernel work on this profile.
 

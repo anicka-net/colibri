@@ -90,7 +90,7 @@ typedef int (*fn_pipe_attn_chain)(int device,
         float eps, float theta, float attn_scale,
         const float *d_router, int E, float *scores_host,
         const ColiCudaTensor *shg, const ColiCudaTensor *shu,
-        const ColiCudaTensor *shd, int sI);
+        const ColiCudaTensor *shd, int sI, float *xn_host);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
 typedef int (*fn_pipe_rmsnorm)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps);
 typedef int (*fn_pipe_rmsnorm_s)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps, int xstride,int ystride);
@@ -446,12 +446,12 @@ int coli_cuda_pipe_attn_chain(int device,
         float eps, float theta, float attn_scale,
         const float *d_router, int E, float *scores_host,
         const ColiCudaTensor *shg, const ColiCudaTensor *shu,
-        const ColiCudaTensor *shd, int sI){
+        const ColiCudaTensor *shd, int sI, float *xn_host){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_attn_chain(device,x_dev,nrm_dev,nrm_host,kv_host_L,kv_host_R,
         qa,qb,kva,kvb,o_proj,w_in,w_qa,w_kva,w_post,d_Lc,d_Rc,D,H,q_lora,kv_lora,
         qk_nope,qk_rope,vh,S,pos_base,kv_start,eps,theta,attn_scale,
-        d_router,E,scores_host,shg,shu,shd,sI);
+        d_router,E,scores_host,shg,shu,shd,sI,xn_host);
 }
 
 int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes){

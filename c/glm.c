@@ -250,9 +250,11 @@ static int qt_cuda_upload(QT *t){
 }
 static int qt_cuda_wrap_host(QT *t,int device){
     if(t->cuda)return 1;
-    if(t->fmt!=2||!t->q4||!t->s)return 0;
+    const void *weights=t->fmt==1?(const void*)t->q8:
+                        t->fmt==2?(const void*)t->q4:NULL;
+    if(!weights||!t->s)return 0;
     t->cuda_device=device;
-    return coli_cuda_tensor_wrap_host(&t->cuda,t->q4,t->s,t->fmt,t->I,t->O,device);
+    return coli_cuda_tensor_wrap_host(&t->cuda,weights,t->s,t->fmt,t->I,t->O,device);
 }
 static int qt_cuda_update(QT *t){
     const void *weights=t->fmt==0?(const void*)t->qf:
@@ -3340,7 +3342,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
         }
 #ifdef COLI_CUDA
-        ESlot *group_e[64]; int group_n[64]; int ngroup=0;
+        ESlot *group_e[64]; int group_n[64],group_miss[64]; int ngroup=0;
 #endif
 #ifdef COLI_METAL
         if(g_metal_enabled){
@@ -3399,7 +3401,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(g_cuda_enabled && cuda_expert) m->gpu_expert_calls++;
             if(group_enabled && g_cuda_enabled && cuda_expert &&
                !omp_in_parallel()){
-                group_e[ngroup]=e; group_n[ngroup]=nr;
+                group_e[ngroup]=e; group_n[ngroup]=nr; group_miss[ngroup]=qof[j]>=0;
                 for(int r=0;r<nr;r++){ group_row[(int64_t)ngroup*S+r]=rows[r]; group_weight[(int64_t)ngroup*S+r]=rw[r]; }
                 ngroup++; continue;
             }
@@ -3431,6 +3433,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
         float dev_w[COLI_CUDA_MAX_DEVICES][256]; int dev_tok[COLI_CUDA_MAX_DEVICES][256];
         int dev_nc[COLI_CUDA_MAX_DEVICES]={0},dev_total[COLI_CUDA_MAX_DEVICES]={0};
+        int dev_has_miss[COLI_CUDA_MAX_DEVICES]={0};
         int dev_off[COLI_CUDA_MAX_DEVICES]={0},dev_ok[COLI_CUDA_MAX_DEVICES]={0};
         double dev_time[COLI_CUDA_MAX_DEVICES]={0};
         for(int di=0;di<g_cuda_ndev;di++) for(int q=0;q<ngroup;q++)
@@ -3442,6 +3445,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 int nc=dev_nc[di]++; ESlot *e=group_e[q];
                 dev_g[di][nc]=e->g.cuda; dev_u[di][nc]=e->u.cuda; dev_d[di][nc]=e->d.cuda;
                 dev_rows[di][nc]=group_n[q]; dev_which[di][nc]=q;
+                dev_has_miss[di]|=group_miss[q];
                 for(int r=0;r<group_n[q]&&cursor+r<256;r++){
                     dev_w[di][cursor+r]=group_weight[(int64_t)q*S+r];
                     dev_tok[di][cursor+r]=group_row[(int64_t)q*S+r];
@@ -3457,7 +3461,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             double td=g_prof?now_s():0;
             dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
                 group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D,
-                dev_w[di],dev_tok[di],S,(g_group_accum_xdev&&S<=4&&dev_total[di]<=256)?1:0);
+                dev_w[di],dev_tok[di],S,
+                (g_group_accum_xdev&&S<=4&&dev_total[di]<=256&&!dev_has_miss[di])?1:0);
             if(g_prof)dev_time[di]=now_s()-td;
         }
         for(int di=0;di<g_cuda_ndev;di++){
