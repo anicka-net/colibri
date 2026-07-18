@@ -992,26 +992,6 @@ __global__ static void memcpy_f32_kernel(float *__restrict__ dst,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
-__global__ static void rope_interleave_kernel(float *__restrict__ x,
-                                               int H, int qh, int qk_nope,
-                                               int rope_dim, int pos,
-                                               float rope_base, int rope_dim_cfg) {
-    int h = blockIdx.x;
-    int tid = threadIdx.x;
-    if (h >= H) return;
-
-    int half = rope_dim / 2;
-    float *v = x + (size_t)h * qh + qk_nope;
-
-    if (tid < half) {
-        float inv = powf(rope_base, -2.0f * tid / rope_dim_cfg);
-        float ang = (float)pos * inv;
-        float cs = cosf(ang), sn = sinf(ang);
-        float a = v[2 * tid], b = v[2 * tid + 1];
-        v[tid] = a * cs - b * sn;
-        v[half + tid] = b * cs + a * sn;
-    }
-}
 __device__ static void absorption_body(
     float *__restrict__ ctx_out,
     const float *__restrict__ Q,
@@ -1222,13 +1202,11 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
           rmsnorm_kernel<<<1,th,(size_t)th*sizeof(float)>>>(d_Lc+(size_t)pos*kv_lora,comp,w_kva,kv_lora,eps); }
         { int th=qk_rope<256?qk_rope:256;
           memcpy_f32_kernel<<<(qk_rope+th-1)/th,th>>>(d_Rc+(size_t)pos*qk_rope,comp+kv_lora,qk_rope); }
-        { int half=qk_rope/2;
-          rope_interleave_kernel<<<1,half<256?half:256>>>(d_Rc+(size_t)pos*qk_rope,
-              1,qk_rope,0,qk_rope,pos,theta,qk_rope); }
+        pipe_rope_rows<<<1,128>>>(d_Rc+(size_t)pos*qk_rope,NULL,pos,
+            qk_rope,0,qk_rope,1,theta);
         gemv_q4<<<((unsigned)(H*qh)+7)/8,256,smem_q>>>(qQ,qres,
             (const uint8_t*)qb->weights,qb->scales,q_lora,H*qh);
-        { int half=qk_rope/2;
-          rope_interleave_kernel<<<H,half<256?half:256>>>(qQ,H,qh,qk_nope,qk_rope,pos,theta,qk_rope); }
+        pipe_rope_rows<<<H,128>>>(qQ,NULL,pos,qh,qk_nope,qk_rope,H,theta);
         absorption_kernel<<<H,256,abs_smem>>>(cx,qQ,
             (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
             d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
