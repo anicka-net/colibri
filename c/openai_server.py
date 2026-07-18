@@ -794,7 +794,15 @@ class Engine:
 
         cancel_sent = False
         while True:
-            kind, value = events.get()
+            try:
+                kind, value = events.get(timeout=0.25)
+            except queue.Empty:
+                if not cancel_sent and cancelled and cancelled():
+                    cancel_sent = True
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
+                continue
             if kind == "data":
                 if not cancel_sent:
                     decode(value)
@@ -830,14 +838,14 @@ class Engine:
             self.dispatcher.join(timeout=5)
 
 
-def model_object(model_id, created, context_length=None):
+def model_object(model_id, created, context_length=None, max_tokens=None):
     model = {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
     if context_length:
         model.update({
             "name": "GLM-5.2 (Colibri)",
             "context_length": context_length,
             "top_provider": {"context_length": context_length,
-                             "max_completion_tokens": context_length,
+                             "max_completion_tokens": max_tokens or context_length,
                              "is_moderated": False},
             "supported_parameters": ["tools", "tool_choice", "max_tokens", "temperature",
                                      "top_p", "stream", "reasoning_effort"],
@@ -866,6 +874,24 @@ class APIServer(ThreadingHTTPServer):
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self.watchdog_lock = threading.Lock()
+        self.watchdog_active = 0
+
+    @contextlib.contextmanager
+    def watchdog_request(self, active):
+        if active:
+            with self.watchdog_lock:
+                self.watchdog_active += 1
+        try:
+            yield
+        finally:
+            if active:
+                with self.watchdog_lock:
+                    self.watchdog_active -= 1
+
+    def watchdog_snapshot(self):
+        with self.watchdog_lock:
+            return self.watchdog_active
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -969,7 +995,8 @@ class APIHandler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             if path == "/health":
                 payload = {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
-                           "kv_slots": self.server.kv_slots}
+                           "kv_slots": self.server.kv_slots,
+                           "watchdog_active": self.server.watchdog_snapshot()}
                 tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
                 if tiers: payload["tiers"] = tiers
                 hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
@@ -996,11 +1023,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.require_auth()
             if path == "/v1/models":
                 self.send_json(200, {"object": "list", "data": [model_object(
-                    model_id, self.server.created, self.server.context_length)
+                    model_id, self.server.created, self.server.context_length,
+                    self.server.max_tokens)
                     for model_id in self.server.model_ids]}, request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) in self.server.model_ids:
                 self.send_json(200, model_object(unquote(path[11:]), self.server.created,
-                                                 self.server.context_length), request_id)
+                                                 self.server.context_length,
+                                                 self.server.max_tokens), request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
@@ -1053,7 +1082,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
         output = []
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        watchdog = self.headers.get("X-Colibri-Watchdog") == "1"
+        with self.server.watchdog_request(watchdog), \
+                self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
             queue_wait, cache_slot = admission
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, output.append, cache_slot,
@@ -1069,7 +1100,9 @@ class APIHandler(BaseHTTPRequestHandler):
                  not 0 <= cache_slot < self.server.kv_slots)):
             raise APIError(400, f"`cache_slot` must be an integer between 0 and {self.server.kv_slots - 1}.",
                            "cache_slot")
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        watchdog = self.headers.get("X-Colibri-Watchdog") == "1"
+        with self.server.watchdog_request(watchdog), \
+                self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
             queue_wait, cache_slot = admission
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1127,12 +1160,21 @@ class APIHandler(BaseHTTPRequestHandler):
         message_id = "msg_" + uuid.uuid4().hex[:24]
         created = int(time.time())
         model = body["model"]
+        tools = normalized.get("tools") or []
 
         if not body.get("stream", False):
             reasoning, text, stats, headers = self.collect_generation(normalized, prompt, thinking)
-            content = [{"type": "output_text", "text": text, "annotations": []}]
-            output = [{"id": message_id, "type": "message", "status": "completed",
-                       "role": "assistant", "content": content}]
+            content_text_value, calls = parse_tool_calls(text, tools) if tools else (text, [])
+            output = []
+            if content_text_value or not calls:
+                content = [{"type": "output_text", "text": content_text_value, "annotations": []}]
+                output.append({"id": message_id, "type": "message", "status": "completed",
+                               "role": "assistant", "content": content})
+            for call in calls:
+                output.append({"id": "fc_" + uuid.uuid4().hex[:24], "type": "function_call",
+                               "status": "completed", "call_id": call["id"],
+                               "name": call["function"]["name"],
+                               "arguments": call["function"]["arguments"]})
             usage = {"input_tokens": stats["prompt_tokens"],
                      "input_tokens_details": {"cached_tokens": 0},
                      "output_tokens": stats["completion_tokens"],
@@ -1145,6 +1187,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         sequence = [0]
         text = []
+        raw_tool_text = []
         def event(write, payload):
             payload["sequence_number"] = sequence[0]
             sequence[0] += 1
@@ -1154,27 +1197,71 @@ class APIHandler(BaseHTTPRequestHandler):
             event(write, {"type": "response.created", "response": {
                 "id": response_id, "object": "response", "created_at": created,
                 "status": "in_progress", "model": model, "output": []}})
-            item = {"id": message_id, "type": "message", "status": "in_progress",
-                    "role": "assistant", "content": []}
-            event(write, {"type": "response.output_item.added", "output_index": 0, "item": item})
-            event(write, {"type": "response.content_part.added", "item_id": message_id,
-                          "output_index": 0, "content_index": 0,
-                          "part": {"type": "output_text", "text": "", "annotations": []}})
+            if not tools:
+                item = {"id": message_id, "type": "message", "status": "in_progress",
+                        "role": "assistant", "content": []}
+                event(write, {"type": "response.output_item.added",
+                              "output_index": 0, "item": item})
+                event(write, {"type": "response.content_part.added", "item_id": message_id,
+                              "output_index": 0, "content_index": 0,
+                              "part": {"type": "output_text", "text": "",
+                                       "annotations": []}})
             def on_content(chunk):
+                if tools:
+                    raw_tool_text.append(chunk)
+                    return
                 text.append(chunk)
                 event(write, {"type": "response.output_text.delta", "item_id": message_id,
                               "output_index": 0, "content_index": 0, "delta": chunk})
             return ReasoningStream(thinking, lambda _chunk: None, on_content)
         def done(write, stats):
-            value = "".join(text)
-            part = {"type": "output_text", "text": value, "annotations": []}
-            event(write, {"type": "response.output_text.done", "item_id": message_id,
-                          "output_index": 0, "content_index": 0, "text": value})
-            event(write, {"type": "response.content_part.done", "item_id": message_id,
-                          "output_index": 0, "content_index": 0, "part": part})
-            item = {"id": message_id, "type": "message", "status": "completed",
-                    "role": "assistant", "content": [part]}
-            event(write, {"type": "response.output_item.done", "output_index": 0, "item": item})
+            calls = []
+            if tools:
+                value, calls = parse_tool_calls("".join(raw_tool_text), tools)
+                if value:
+                    text.append(value)
+                    item = {"id": message_id, "type": "message", "status": "in_progress",
+                            "role": "assistant", "content": []}
+                    event(write, {"type": "response.output_item.added",
+                                  "output_index": 0, "item": item})
+                    event(write, {"type": "response.content_part.added", "item_id": message_id,
+                                  "output_index": 0, "content_index": 0,
+                                  "part": {"type": "output_text", "text": "",
+                                           "annotations": []}})
+                    event(write, {"type": "response.output_text.delta", "item_id": message_id,
+                                  "output_index": 0, "content_index": 0, "delta": value})
+            output = []
+            if text or not calls:
+                value = "".join(text)
+                part = {"type": "output_text", "text": value, "annotations": []}
+                event(write, {"type": "response.output_text.done", "item_id": message_id,
+                              "output_index": 0, "content_index": 0, "text": value})
+                event(write, {"type": "response.content_part.done", "item_id": message_id,
+                              "output_index": 0, "content_index": 0, "part": part})
+                item = {"id": message_id, "type": "message", "status": "completed",
+                        "role": "assistant", "content": [part]}
+                event(write, {"type": "response.output_item.done",
+                              "output_index": 0, "item": item})
+                output.append(item)
+            for call in calls:
+                index = len(output)
+                item = {"id": "fc_" + uuid.uuid4().hex[:24], "type": "function_call",
+                        "status": "in_progress", "call_id": call["id"],
+                        "name": call["function"]["name"], "arguments": ""}
+                event(write, {"type": "response.output_item.added",
+                              "output_index": index, "item": item})
+                arguments = call["function"]["arguments"]
+                event(write, {"type": "response.function_call_arguments.delta",
+                              "item_id": item["id"], "output_index": index,
+                              "delta": arguments})
+                event(write, {"type": "response.function_call_arguments.done",
+                              "item_id": item["id"], "output_index": index,
+                              "arguments": arguments})
+                item["status"] = "completed"
+                item["arguments"] = arguments
+                event(write, {"type": "response.output_item.done",
+                              "output_index": index, "item": item})
+                output.append(item)
             usage = {"input_tokens": stats["prompt_tokens"],
                      "input_tokens_details": {"cached_tokens": 0},
                      "output_tokens": stats["completion_tokens"],
@@ -1182,29 +1269,50 @@ class APIHandler(BaseHTTPRequestHandler):
                      "total_tokens": stats["prompt_tokens"] + stats["completion_tokens"]}
             event(write, {"type": "response.completed", "response": {
                 "id": response_id, "object": "response", "created_at": created,
-                "status": "completed", "model": model, "output": [item], "usage": usage}})
+                "status": "completed", "model": model, "output": output, "usage": usage}})
         self.protocol_stream(normalized, prompt, request_id, factory, done)
 
     def anthropic_message(self, body, request_id):
         normalized = dict(body)
         normalized["messages"] = anthropic_messages(body)
         normalized["tools"] = anthropic_tools(body.get("tools"))
+        choice = body.get("tool_choice")
+        if isinstance(choice, dict):
+            choice_type = choice.get("type")
+            if choice_type == "auto":
+                normalized["tool_choice"] = "auto"
+            elif choice_type == "any":
+                normalized["tool_choice"] = "required"
+            elif choice_type == "none":
+                normalized["tool_choice"] = "none"
+            elif choice_type == "tool" and isinstance(choice.get("name"), str):
+                normalized["tool_choice"] = {"function": {"name": choice["name"]}}
+            else:
+                raise APIError(400, "Unsupported Anthropic `tool_choice`.", "tool_choice")
         thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
         prompt = render_chat(normalized["messages"], thinking, effort,
                              normalized["tools"], normalized.get("tool_choice"))
         completion_id = "msg_" + uuid.uuid4().hex[:24]
         model = body["model"]
+        tools = normalized["tools"]
 
         if not body.get("stream", False):
             reasoning, text, stats, headers = self.collect_generation(normalized, prompt, thinking)
+            text, calls = parse_tool_calls(text, tools) if tools else (text, [])
             content = []
             if reasoning:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": completion_id})
-            content.append({"type": "text", "text": text})
+            if text or not calls:
+                content.append({"type": "text", "text": text})
+            for call in calls:
+                content.append({"type": "tool_use", "id": call["id"],
+                                "name": call["function"]["name"],
+                                "input": json.loads(call["function"]["arguments"])})
             self.send_json(200, {"id": completion_id, "type": "message",
                 "role": "assistant", "model": model, "content": content,
-                "stop_reason": "max_tokens" if stats["length_limited"] else "end_turn",
+                "stop_reason": ("tool_use" if calls else
+                                "max_tokens" if stats["length_limited"] else "end_turn"),
                 "stop_sequence": None,
                 "usage": {"input_tokens": stats["prompt_tokens"],
                           "output_tokens": stats["completion_tokens"],
@@ -1214,6 +1322,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         state = {"index": -1, "kind": None}
+        raw_tool_text = []
         def event(write, name, payload):
             write((f"event: {name}\ndata: "
                    + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -1224,17 +1333,19 @@ class APIHandler(BaseHTTPRequestHandler):
                 "content": [], "stop_reason": None, "stop_sequence": None,
                 "usage": {"input_tokens": 0, "output_tokens": 0,
                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}})
-            def start(kind):
+            def start(kind, block=None):
                 if state["kind"] is not None:
                     event(write, "content_block_stop",
                           {"type": "content_block_stop", "index": state["index"]})
                 state["index"] += 1
                 state["kind"] = kind
-                block = ({"type": "thinking", "thinking": "", "signature": ""}
-                         if kind == "thinking" else {"type": "text", "text": ""})
+                if block is None:
+                    block = ({"type": "thinking", "thinking": "", "signature": ""}
+                             if kind == "thinking" else {"type": "text", "text": ""})
                 event(write, "content_block_start", {"type": "content_block_start",
                                                      "index": state["index"],
                                                      "content_block": block})
+            state["start"] = start
             def reasoning(chunk):
                 if state["kind"] != "thinking":
                     start("thinking")
@@ -1242,17 +1353,35 @@ class APIHandler(BaseHTTPRequestHandler):
                     "index": state["index"], "delta": {"type": "thinking_delta",
                                                        "thinking": chunk}})
             def content(chunk):
+                if tools:
+                    raw_tool_text.append(chunk)
+                    return
                 if state["kind"] != "text":
                     start("text")
                 event(write, "content_block_delta", {"type": "content_block_delta",
                     "index": state["index"], "delta": {"type": "text_delta", "text": chunk}})
             return ReasoningStream(thinking, reasoning, content)
         def done(write, stats):
+            calls = []
+            if tools:
+                text, calls = parse_tool_calls("".join(raw_tool_text), tools)
+                if text:
+                    state["start"]("text")
+                    event(write, "content_block_delta", {"type": "content_block_delta",
+                        "index": state["index"], "delta": {"type": "text_delta",
+                                                           "text": text}})
+                for call in calls:
+                    state["start"]("tool_use", {"type": "tool_use", "id": call["id"],
+                        "name": call["function"]["name"], "input": {}})
+                    event(write, "content_block_delta", {"type": "content_block_delta",
+                        "index": state["index"], "delta": {"type": "input_json_delta",
+                        "partial_json": call["function"]["arguments"]}})
             if state["kind"] is not None:
                 event(write, "content_block_stop",
                       {"type": "content_block_stop", "index": state["index"]})
             event(write, "message_delta", {"type": "message_delta",
-                "delta": {"stop_reason": "max_tokens" if stats["length_limited"] else "end_turn",
+                "delta": {"stop_reason": ("tool_use" if calls else
+                                         "max_tokens" if stats["length_limited"] else "end_turn"),
                           "stop_sequence": None},
                 "usage": {"input_tokens": stats["prompt_tokens"],
                           "output_tokens": stats["completion_tokens"],
@@ -1295,7 +1424,9 @@ class APIHandler(BaseHTTPRequestHandler):
         created = int(time.time())
         response_model = body.get("model", self.server.model_id)
 
-        with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+        watchdog = self.headers.get("X-Colibri-Watchdog") == "1"
+        with self.server.watchdog_request(watchdog), \
+                self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:

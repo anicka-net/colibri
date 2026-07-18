@@ -45,7 +45,11 @@ class ThinkingEngine(FakeEngine):
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None):
         self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
-        chunks = ("Reason", "ing</th", "ink>Answer") if prompt.endswith("<think>") else ("Answer",)
+        if "# Tools" in prompt:
+            chunks = ("<tool_call>lookup<arg_key>q</arg_key>",
+                      "<arg_value>bird</arg_value></tool_call>")
+        else:
+            chunks = ("Reason", "ing</th", "ink>Answer") if prompt.endswith("<think>") else ("Answer",)
         for chunk in chunks:
             on_text(chunk)
         return {"prompt_tokens": 11, "completion_tokens": 4, "length_limited": False}
@@ -445,6 +449,25 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
+    def test_cancels_before_the_first_output_token(self):
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None, cancelled=lambda: True)
+        engine.close()
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
 
 class HTTPTest(unittest.TestCase):
     @classmethod
@@ -598,6 +621,7 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
         self.assertEqual([model["id"] for model in models],
                          ["deepseek-v4-flash", "deepseek-v4-pro"])
         self.assertEqual(models[0]["context_length"], 131072)
+        self.assertEqual(models[0]["top_provider"]["max_completion_tokens"], 32)
 
     def test_default_thinking_is_split_from_content(self):
         with self.request("/v1/chat/completions", {
@@ -662,6 +686,43 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
         self.assertIn('"type":"thinking_delta"', stream)
         self.assertIn('"type":"text_delta","text":"Answer"', stream)
         self.assertIn("event: message_stop", stream)
+
+    def test_responses_and_anthropic_translate_tool_calls(self):
+        response_tool = {"type": "function", "name": "lookup",
+                         "description": "Look up a bird",
+                         "parameters": {"type": "object", "properties": {
+                             "q": {"type": "string"}}}}
+        response_body = {"model": "deepseek-v4-flash", "input": "Find it",
+                         "reasoning": {"effort": "none"}, "tools": [response_tool]}
+        with self.request("/v1/responses", response_body) as response:
+            output = json.load(response)["output"]
+        self.assertEqual(output[0]["type"], "function_call")
+        self.assertEqual(output[0]["name"], "lookup")
+        self.assertEqual(json.loads(output[0]["arguments"]), {"q": "bird"})
+
+        with self.request("/v1/responses", {**response_body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn('"type":"response.function_call_arguments.delta"', stream)
+        self.assertNotIn("<tool_call>", stream)
+
+        anthropic_tool = {"name": "lookup", "description": "Look up a bird",
+                          "input_schema": {"type": "object", "properties": {
+                              "q": {"type": "string"}}}}
+        anthropic_body = {"model": "deepseek-v4-flash",
+                          "messages": [{"role": "user", "content": "Find it"}],
+                          "max_tokens": 16, "thinking": {"type": "disabled"},
+                          "tools": [anthropic_tool], "tool_choice": {"type": "any"}}
+        with self.request("/v1/messages", anthropic_body) as response:
+            result = json.load(response)
+        self.assertEqual(result["stop_reason"], "tool_use")
+        self.assertEqual(result["content"][0]["type"], "tool_use")
+        self.assertEqual(result["content"][0]["input"], {"q": "bird"})
+
+        with self.request("/v1/messages", {**anthropic_body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn('"type":"tool_use"', stream)
+        self.assertIn('"type":"input_json_delta"', stream)
+        self.assertNotIn("<tool_call>", stream)
 
 
 class StaticServingTest(unittest.TestCase):
@@ -735,6 +796,29 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertEqual(error["code"], "queue_full")
         self.engine.release.set(); first.join(2)
         self.assertEqual(first_errors, [])
+
+    def test_health_identifies_the_watchdog_probe(self):
+        result = []
+        body = json.dumps({"model": "test-model", "messages": [
+            {"role": "user", "content": "Hi"}]}).encode()
+        request = Request(self.url, data=body, headers={
+            "Content-Type": "application/json", "X-Colibri-Watchdog": "1"})
+
+        def run():
+            with urlopen(request, timeout=2) as response:
+                result.append(response.read())
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(self.engine.entered.wait(1))
+        health_url = f"http://127.0.0.1:{self.server.server_port}/health"
+        with urlopen(health_url, timeout=2) as response:
+            health = json.load(response)
+        self.assertEqual(health["watchdog_active"], 1)
+        self.assertEqual(health["scheduler"]["active"], 1)
+        self.engine.release.set()
+        thread.join(2)
+        self.assertTrue(result)
 
 
 

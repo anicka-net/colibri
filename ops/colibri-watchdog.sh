@@ -37,7 +37,8 @@ raise SystemExit(0 if s.get("active") == 0 and s.get("queued") == 0 else 1)
 
 payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply OK"}],"max_tokens":1,"think":false}' "$model")
 if timeout "$probe_timeout" curl -fsS "$url/v1/chat/completions" \
-        -H 'Content-Type: application/json' -d "$payload" >/dev/null 2>&1; then
+        -H 'Content-Type: application/json' -H 'X-Colibri-Watchdog: 1' \
+        -d "$payload" >/dev/null 2>&1; then
     exit 0
 fi
 
@@ -50,8 +51,12 @@ gpu_util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 
 health=$(curl -fsS --max-time 5 "$url/health" 2>/dev/null) || exit 0
 printf '%s' "$health" | python3 -c '
 import json, sys
-s = json.load(sys.stdin).get("scheduler", {})
-raise SystemExit(0 if s.get("active") == 0 and s.get("queued") == 0 else 1)
+health = json.load(sys.stdin)
+s = health.get("scheduler", {})
+idle = s.get("active") == 0 and s.get("queued") == 0
+own_wedge = (s.get("active") == 1 and s.get("queued") == 0
+             and health.get("watchdog_active") == 1)
+raise SystemExit(0 if idle or own_wedge else 1)
 ' || exit 0
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
