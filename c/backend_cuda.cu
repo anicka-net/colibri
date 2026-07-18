@@ -1201,6 +1201,24 @@ __global__ static void add_vec_kernel(float *dst, const float *a, const float *b
  * at the end (the canonical-host downloads).  Replaces ~14 pipe_* round trips
  * per layer; measured 0.32 ms/layer vs 0.75 ms for the op-by-op chain on H100.
  * int4 (fmt=2) weights only; S<=4 (decode + MTP verify), falls back otherwise. */
+/* fp32 GEMV for the MoE router: one block per output row. */
+__global__ static void gemv_f32_kernel(float *__restrict__ y, const float *__restrict__ x,
+                                       const float *__restrict__ w, int I, int O) {
+    __shared__ float red[256];
+    int o = blockIdx.x;
+    if (o >= O) return;
+    const float *wr = w + (size_t)o * I;
+    float s = 0;
+    for (int i = threadIdx.x; i < I; i += blockDim.x) s += wr[i] * x[i];
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) y[o] = red[0];
+}
+
 extern "C" int coli_cuda_pipe_attn_chain(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
@@ -1212,7 +1230,8 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
         int D, int H, int q_lora, int kv_lora,
         int qk_nope, int qk_rope, int vh,
         int S, int pos_base, int kv_start,
-        float eps, float theta, float attn_scale) {
+        float eps, float theta, float attn_scale,
+        const float *d_router, int E, float *scores_host) {
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!select_ctx(ctx)) return 0;
     if(qa->fmt!=2||qb->fmt!=2||kva->fmt!=2||kvb->fmt!=2||o_proj->fmt!=2) return 0;
@@ -1265,8 +1284,16 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
     for(int s=0;s<S;s++)
         rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
+    float *sc=NULL;
+    if(d_router&&scores_host&&E>0){
+        sc=coli_cuda_pipe_scratch(device,28,(size_t)S*E*4);
+        if(sc) for(int s=0;s<S;s++)
+            gemv_f32_kernel<<<(unsigned)E,256>>>(sc+(size_t)s*E,nrm_dev+(size_t)s*D,d_router,D,E);
+    }
     /* single sync point: the canonical-host downloads */
     if(cudaMemcpy(nrm_host,nrm_dev,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+    if(sc&&cudaMemcpy(scores_host,sc,(size_t)S*E*4,cudaMemcpyDeviceToHost)!=cudaSuccess) sc=NULL;
+    if(d_router&&scores_host&&E>0&&!sc) scores_host[0]=NAN;   /* signal: no scores, caller recomputes */
     if(cudaMemcpy(kv_host_L,d_Lc+(size_t)pos_base*kv_lora,(size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(cudaMemcpy(kv_host_R,d_Rc+(size_t)pos_base*qk_rope,(size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     return cudaGetLastError()==cudaSuccess;

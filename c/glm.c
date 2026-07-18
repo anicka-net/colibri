@@ -2465,9 +2465,11 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
  * il chiamante riesegue il percorso CPU (idempotente). */
 /* Per-layer device cache for small fp32 vectors (layer norms): these were
  * re-uploaded on every pipe call — 4 uploads per layer per token. */
+static const float *g_cuda_pre_logits=NULL;  /* router logits computed on-device by the fused chain */
+static float chain_scores[4*512];             /* fused-chain router logits [S,E], S<=4 */
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
-    static float *cache[4][256]; static int cdev[4][256];
-    if(layer<0||layer>=256||slot<0||slot>=4) return NULL;
+    static float *cache[8][256]; static int cdev[8][256];
+    if(layer<0||layer>=256||slot<0||slot>=8) return NULL;
     if(cache[slot][layer]&&cdev[slot][layer]==dev) return cache[slot][layer];
     float *p=(float*)coli_cuda_pipe_alloc(dev,n*4);
     if(!p||!coli_cuda_pipe_upload(dev,p,host,n*4)){ if(p)coli_cuda_pipe_free(dev,p); return NULL; }
@@ -2987,7 +2989,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         pre_routed=1;
     }
 #endif
-    if(!pre_routed) matmul(logits_all, x, l->router, S, D, E);
+    if(!pre_routed){
+        if(g_cuda_pre_logits){ memcpy(logits_all,g_cuda_pre_logits,(size_t)S*E*sizeof(float)); g_cuda_pre_logits=NULL; }
+        else matmul(logits_all, x, l->router, S, D, E);
+    }
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
@@ -3862,6 +3867,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!l->sh_gate.cuda_eligible||!l->sh_up.cuda_eligible||!l->sh_down.cuda_eligible||
        !qt_cuda_upload(&l->sh_gate)||!qt_cuda_upload(&l->sh_up)||!qt_cuda_upload(&l->sh_down)||
        l->sh_gate.cuda_device!=dev||l->sh_up.cuda_device!=dev||l->sh_down.cuda_device!=dev) return 0;
+    int chain_pre_logits=0;
     float *w_in =coli_cuda_pipe_scratch(dev,8,(size_t)D*4);
     float *w_post=coli_cuda_pipe_scratch(dev,9,(size_t)D*4);
     float *nrm_d=coli_cuda_pipe_scratch(dev,10,xb);
@@ -3891,8 +3897,11 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                w_in,cw1,cw2,w_post,
                m->kv->cuda_Lc[li],m->kv->cuda_Rc[li],
                D,c->n_heads,c->q_lora,kvl,c->qk_nope,R,c->v_head,
-               S,pos_base,m->kv_start[li],c->eps,c->theta,c->attn_scale)){
+               S,pos_base,m->kv_start[li],c->eps,c->theta,c->attn_scale,
+               pipe_ln_cache(dev,li,4,l->router,(size_t)c->n_experts*D),
+               c->n_experts,chain_scores)){
             m->kv->cuda_valid[li]=pos_base+S;
+            if(!isnan(chain_scores[0])) chain_pre_logits=1;
             m->t_attn+=now_s()-ta;
             goto attn_done;
         }
@@ -3944,7 +3953,9 @@ attn_done:;
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* shared residual (async) */
     m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
+    if(chain_pre_logits) g_cuda_pre_logits=chain_scores;
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
+    g_cuda_pre_logits=NULL;
     te=now_s();
     if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */

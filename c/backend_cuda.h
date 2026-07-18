@@ -118,7 +118,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain(int device,
         int D, int H, int q_lora, int kv_lora,
         int qk_nope, int qk_rope, int vh,
         int S, int pos_base, int kv_start,
-        float eps, float theta, float attn_scale);
+        float eps, float theta, float attn_scale,
+        const float *d_router, int E, float *scores_host);
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);
