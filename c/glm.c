@@ -4697,6 +4697,16 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 /* emit callback: accumula in un array (validazione) */
 typedef struct { int *dst; int n; } EmitStore;
 static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
+/* Headline expert hit rate.  With a VRAM expert tier active, a call only counts
+ * as a hit when the expert was served from a GPU: RAM-resident-but-not-uploaded
+ * still pays a PCIe round trip per call, so "100% RAM hit" can hide a much lower
+ * GPU-ready share.  Without a tier (CPU-only), the RAM-tier rate is the truth. */
+static double expert_hit_pct(const Model *m){
+    double tot=(double)m->hits+(double)m->miss; if(tot<=0) return 0;
+    if(m->gpu_expert_count>0) return 100.0*(double)m->gpu_expert_calls/tot;
+    return 100.0*(double)m->hits/tot;
+}
+
 /* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
 typedef struct { Tok *T; Model *m; double t0; int count; int quiet; } EmitStream;
 static void emit_stream(int t, void *ud){
@@ -4706,11 +4716,11 @@ static void emit_stream(int t, void *ud){
         if(g_cache_route && e->m->route_slots){
             double swap=100.0*e->m->route_swaps/e->m->route_slots;
             fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  swap %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-                rss_gb(), tt?100.0*e->m->hits/tt:0.0, swap, e->count/(now_s()-e->t0),
+                rss_gb(), expert_hit_pct(e->m), swap, e->count/(now_s()-e->t0),
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         } else {
             fprintf(stderr,"\n[t=%d  RSS %.2f GB  hit %.0f%%  %.2f tok/s  %.2f tok/fw]\n", e->count,
-                rss_gb(), tt?100.0*e->m->hits/tt:0.0, e->count/(now_s()-e->t0),
+                rss_gb(), expert_hit_pct(e->m), e->count/(now_s()-e->t0),
                 e->m->n_fw?(double)e->m->n_emit/e->m->n_fw:1.0);
         }
     }
@@ -4800,7 +4810,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
-            nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
+            nreq, now_s()-t0, rss_gb(), expert_hit_pct(m));
     }
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
 }
@@ -4937,8 +4947,8 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
         if(g_prof){ prof_lat(now_s()-tf0); m->n_fw++; m->n_emit++; }
     }
     double dt=now_s()-t0, tot=m->hits+m->miss;
-    printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%%\n",
-        steps,dt,steps/dt,tot?100.0*m->hits/tot:0.0);
+    printf("REPLAY decode: %d tokens in %.3fs | %.2f tok/s | expert hit %.1f%% (ram %.1f%%)\n",
+        steps,dt,steps/dt,expert_hit_pct(m),tot?100.0*m->hits/tot:0.0);
     profile_print(m,dt);
     if(g_prof) prof_report(m,&pb,dt,steps,stdout);
 #ifdef COLI_CUDA
@@ -4990,8 +5000,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
     printf("\n---\nprefill %d tokens in %.2fs | decode %d tokens in %.2fs (%.2f tok/s) | "
-           "expert hit rate %.1f%% (pin %.1f%% + lru %.1f%%) | RSS %.2f GB",       /* split #336: quale tier serve gli hit */
-        np,prefill_t,produced,dt,produced/dt,tot?100.0*m->hits/tot:0.0,
+           "expert hit rate %.1f%% (ram %.1f%%: pin %.1f%% + lru %.1f%%) | RSS %.2f GB",  /* headline: GPU-ready share when a VRAM tier is active; split #336 */
+        np,prefill_t,produced,dt,produced/dt,expert_hit_pct(m),tot?100.0*m->hits/tot:0.0,
         tot?100.0*m->hit_pin/tot:0.0, tot?100.0*m->hit_ecache/tot:0.0, rss_gb());
     if(g_cache_route && m->route_slots)
         printf(" | swap %.1f%% (%llu/%llu)",
