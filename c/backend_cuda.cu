@@ -671,75 +671,95 @@ __global__ static void gemv_q4(float *__restrict__ y, const float *__restrict__ 
  * up projections (dual), so weight bandwidth dominates.  Same signed-nibble
  * decode as gemv_q4. */
 __global__ static void group_accum_kernel(float *__restrict__ acc,
-        const float *__restrict__ y, const float *__restrict__ w, int count, int D) {
+        const float *__restrict__ y, const float *__restrict__ w,
+        const int *__restrict__ tok, int nrows, int S, int D) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= D) return;
-    float s = 0;
-    for (int c = 0; c < count; c++) s += w[c] * y[(size_t)c * D + t];
-    acc[t] = s;
+    float a[4] = {0,0,0,0};
+    for (int rr = 0; rr < nrows; rr++) a[tok[rr]] += w[rr] * y[(size_t)rr * D + t];
+    for (int s = 0; s < S; s++) acc[(size_t)s * D + t] = a[s];
 }
 
-__global__ static void grouped_gemv_q4_dual(float *__restrict__ gate_out,
+template<int RMAX> __global__ static void grouped_gemv_q4_dual(float *__restrict__ gate_out,
         float *__restrict__ up_out, const float *__restrict__ x_all,
         const GroupDesc *__restrict__ g, int I_in, int O) {
     const GroupDesc d = g[blockIdx.y];
+    const int r = d.rows;                      /* <=4, contiguous from d.offset */
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row  = blockIdx.x * 8 + warp;
     extern __shared__ char shmem[];
     __half *sx = reinterpret_cast<__half *>(shmem);
     const float *x = x_all + (size_t)d.offset * I_in;
-    for (int i = threadIdx.x; i < I_in; i += 256) sx[i] = __float2half(x[i]);
+    for (int i = threadIdx.x; i < r * I_in; i += 256) sx[i] = __float2half(x[i]);
     __syncthreads();
     if (row >= O) return;
     const int rb = I_in >> 1;
     const uint8_t *gp = (const uint8_t *)d.g + (size_t)row * rb;
     const uint8_t *up = (const uint8_t *)d.u + (size_t)row * rb;
-    float sg = 0.0f, su = 0.0f;
+    float sg[RMAX], su[RMAX];
+    #pragma unroll
+    for (int j = 0; j < RMAX; j++) { sg[j] = 0; su[j] = 0; }
     for (int b = lane * 4; b < rb; b += 128) {
         uint32_t pg = *reinterpret_cast<const uint32_t *>(gp + b);
         uint32_t pu = *reinterpret_cast<const uint32_t *>(up + b);
         const int e = b * 2;
         #pragma unroll
         for (int k = 0; k < 8; k++) {
-            float xv = __half2float(sx[e + k]);
-            sg += xv * (float)(((int)((pg >> (4 * k)) & 0xF) ^ 8) - 8);
-            su += xv * (float)(((int)((pu >> (4 * k)) & 0xF) ^ 8) - 8);
+            float wg = (float)(((int)((pg >> (4 * k)) & 0xF) ^ 8) - 8);
+            float wu = (float)(((int)((pu >> (4 * k)) & 0xF) ^ 8) - 8);
+            #pragma unroll
+            for (int j = 0; j < RMAX; j++) if (RMAX == 1 || j < r) {
+                float xv = __half2float(sx[j * I_in + e + k]);
+                sg[j] += xv * wg; su[j] += xv * wu;
+            }
         }
     }
-    for (int o = 16; o; o >>= 1) {
-        sg += __shfl_down_sync(0xFFFFFFFF, sg, o);
-        su += __shfl_down_sync(0xFFFFFFFF, su, o);
-    }
-    if (lane == 0) {
-        gate_out[(size_t)d.offset * O + row] = sg * d.gs[row];
-        up_out  [(size_t)d.offset * O + row] = su * d.us[row];
+    #pragma unroll
+    for (int j = 0; j < RMAX; j++)
+        for (int o = 16; o; o >>= 1) {
+            sg[j] += __shfl_down_sync(0xFFFFFFFF, sg[j], o);
+            su[j] += __shfl_down_sync(0xFFFFFFFF, su[j], o);
+        }
+    if (lane == 0) for (int j = 0; j < r; j++) {
+        gate_out[(size_t)(d.offset + j) * O + row] = sg[j] * d.gs[row];
+        up_out  [(size_t)(d.offset + j) * O + row] = su[j] * d.us[row];
     }
 }
 
-__global__ static void grouped_gemv_q4_down(float *__restrict__ y,
+template<int RMAX> __global__ static void grouped_gemv_q4_down(float *__restrict__ y,
         const float *__restrict__ in_all, const GroupDesc *__restrict__ g,
         int I_in, int O) {
     const GroupDesc d = g[blockIdx.y];
+    const int r = d.rows;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row  = blockIdx.x * 8 + warp;
     extern __shared__ char shmem[];
     __half *sx = reinterpret_cast<__half *>(shmem);
     const float *x = in_all + (size_t)d.offset * I_in;
-    for (int i = threadIdx.x; i < I_in; i += 256) sx[i] = __float2half(x[i]);
+    for (int i = threadIdx.x; i < r * I_in; i += 256) sx[i] = __float2half(x[i]);
     __syncthreads();
     if (row >= O) return;
     const int rb = I_in >> 1;
     const uint8_t *rp = (const uint8_t *)d.d + (size_t)row * rb;
-    float sum = 0.0f;
+    float sum[RMAX];
+    #pragma unroll
+    for (int j = 0; j < RMAX; j++) sum[j] = 0;
     for (int b = lane * 4; b < rb; b += 128) {
         uint32_t p = *reinterpret_cast<const uint32_t *>(rp + b);
         const int e = b * 2;
         #pragma unroll
-        for (int k = 0; k < 8; k++)
-            sum += __half2float(sx[e + k]) * (float)(((int)((p >> (4 * k)) & 0xF) ^ 8) - 8);
+        for (int k = 0; k < 8; k++) {
+            float w = (float)(((int)((p >> (4 * k)) & 0xF) ^ 8) - 8);
+            #pragma unroll
+            for (int j = 0; j < RMAX; j++) if (RMAX == 1 || j < r)
+                sum[j] += __half2float(sx[j * I_in + e + k]) * w;
+        }
     }
-    for (int o = 16; o; o >>= 1) sum += __shfl_down_sync(0xFFFFFFFF, sum, o);
-    if (lane == 0) y[(size_t)d.offset * O + row] = sum * d.ds[row];
+    #pragma unroll
+    for (int j = 0; j < RMAX; j++)
+        for (int o = 16; o; o >>= 1) sum[j] += __shfl_down_sync(0xFFFFFFFF, sum[j], o);
+    if (lane == 0) for (int j = 0; j < r; j++)
+        y[(size_t)(d.offset + j) * O + row] = sum[j] * d.ds[row];
 }
 
 extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
@@ -747,7 +767,8 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *downs,
                                         const int *rows, int count,
                                         float *y, const float *x,
-                                        const float *wrow, int accum_ok) {
+                                        const float *wrow, const int *tokrow,
+                                        int S_tok, int accum_ok) {
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
@@ -832,18 +853,26 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
             }
             off16+=r;
         }
-    }else if(all_s4&&max_rows==1&&
+    }else if(all_s4&&max_rows<=4&&(size_t)max_rows*D*sizeof(__half)<=49152&&
              (!getenv("COLI_CUDA_DECODE_GEMV")||atoi(getenv("COLI_CUDA_DECODE_GEMV")))){
         /* Decode shape (one row per expert): the grouped block-per-output kernels
          * reach ~14% of HBM peak here; the warp-per-8-rows gemv_q4 (already
          * validated on these same uploaded tensors by the fused chain) is far
          * denser.  A few extra launches per call, all stream-ordered. */
-        size_t smem_h=(size_t)D*sizeof(__half), smem_d=(size_t)I*sizeof(__half);
-        grouped_gemv_q4_dual<<<dim3(((unsigned)I+7)/8,(unsigned)count),256,smem_h,ctx->stream>>>(
-            ctx->gate,ctx->up,ctx->x,dev,D,I);
+        size_t smem_h=(size_t)max_rows*D*sizeof(__half), smem_d=(size_t)max_rows*I*sizeof(__half);
+        if(max_rows==1)
+            grouped_gemv_q4_dual<1><<<dim3(((unsigned)I+7)/8,(unsigned)count),256,smem_h,ctx->stream>>>(
+                ctx->gate,ctx->up,ctx->x,dev,D,I);
+        else
+            grouped_gemv_q4_dual<4><<<dim3(((unsigned)I+7)/8,(unsigned)count),256,smem_h,ctx->stream>>>(
+                ctx->gate,ctx->up,ctx->x,dev,D,I);
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
-        grouped_gemv_q4_down<<<dim3(((unsigned)D+7)/8,(unsigned)count),256,smem_d,ctx->stream>>>(
-            ctx->y,ctx->gate,dev,I,D);
+        if(max_rows==1)
+            grouped_gemv_q4_down<1><<<dim3(((unsigned)D+7)/8,(unsigned)count),256,smem_d,ctx->stream>>>(
+                ctx->y,ctx->gate,dev,I,D);
+        else
+            grouped_gemv_q4_down<4><<<dim3(((unsigned)D+7)/8,(unsigned)count),256,smem_d,ctx->stream>>>(
+                ctx->y,ctx->gate,dev,I,D);
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
@@ -861,16 +890,21 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }
-    if(wrow&&accum_ok&&all_s4&&max_rows==1){
+    if(wrow&&tokrow&&accum_ok&&all_s4&&max_rows<=4&&S_tok>=1&&S_tok<=4){
         /* Device-side weighted accumulate: no y download, no sync.  The caller
          * orders the NULL stream behind group_ev via _collect before any other
          * write touches the residual. */
-        if(reserve(&ctx->accum,&ctx->accum_cap,(size_t)D*sizeof(float))&&
-           reserve(&ctx->wrow_d,&ctx->wrow_cap,(size_t)count*sizeof(float))&&
-           cuda_ok(cudaMemcpyAsync(ctx->wrow_d,wrow,(size_t)count*sizeof(float),
-                                   cudaMemcpyHostToDevice,ctx->stream),"group weights upload")){
+        /* wrow_d packs the fp32 weights then the int32 token rows */
+        if(reserve(&ctx->accum,&ctx->accum_cap,(size_t)S_tok*D*sizeof(float))&&
+           reserve(&ctx->wrow_d,&ctx->wrow_cap,(size_t)total*(sizeof(float)+sizeof(int)))&&
+           cuda_ok(cudaMemcpyAsync(ctx->wrow_d,wrow,(size_t)total*sizeof(float),
+                                   cudaMemcpyHostToDevice,ctx->stream),"group weights upload")&&
+           cuda_ok(cudaMemcpyAsync((char*)ctx->wrow_d+(size_t)total*sizeof(float),tokrow,
+                                   (size_t)total*sizeof(int),
+                                   cudaMemcpyHostToDevice,ctx->stream),"group tokens upload")){
             group_accum_kernel<<<((unsigned)D+255)/256,256,0,ctx->stream>>>(
-                ctx->accum,ctx->y,ctx->wrow_d,count,D);
+                ctx->accum,ctx->y,ctx->wrow_d,
+                (const int*)((const char*)ctx->wrow_d+(size_t)total*sizeof(float)),total,S_tok,D);
             if(!ctx->group_ev_init){
                 if(cuda_ok(cudaEventCreateWithFlags(&ctx->group_ev,cudaEventDisableTiming),
                            "group event")) ctx->group_ev_init=1;

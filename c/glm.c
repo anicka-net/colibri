@@ -3406,7 +3406,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
         int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
-        float dev_w[COLI_CUDA_MAX_DEVICES][64];
+        float dev_w[COLI_CUDA_MAX_DEVICES][256]; int dev_tok[COLI_CUDA_MAX_DEVICES][256];
         int dev_nc[COLI_CUDA_MAX_DEVICES]={0},dev_total[COLI_CUDA_MAX_DEVICES]={0};
         int dev_off[COLI_CUDA_MAX_DEVICES]={0},dev_ok[COLI_CUDA_MAX_DEVICES]={0};
         double dev_time[COLI_CUDA_MAX_DEVICES]={0};
@@ -3419,7 +3419,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 int nc=dev_nc[di]++; ESlot *e=group_e[q];
                 dev_g[di][nc]=e->g.cuda; dev_u[di][nc]=e->u.cuda; dev_d[di][nc]=e->d.cuda;
                 dev_rows[di][nc]=group_n[q]; dev_which[di][nc]=q;
-                dev_w[di][nc]=group_weight[(int64_t)q*S];
+                for(int r=0;r<group_n[q]&&cursor+r<256;r++){
+                    dev_w[di][cursor+r]=group_weight[(int64_t)q*S+r];
+                    dev_tok[di][cursor+r]=group_row[(int64_t)q*S+r];
+                }
                 for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(dev_off[di]+cursor+r)*D,
                     x+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
                 cursor+=group_n[q];
@@ -3431,7 +3434,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             double td=g_prof?now_s():0;
             dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
                 group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D,
-                dev_w[di],(g_group_accum_xdev&&S==1)?1:0);
+                dev_w[di],dev_tok[di],S,(g_group_accum_xdev&&S<=4&&dev_total[di]<=256)?1:0);
             if(g_prof)dev_time[di]=now_s()-td;
         }
         for(int di=0;di<g_cuda_ndev;di++){
@@ -3973,7 +3976,7 @@ attn_done:;
     g_cuda_pre_logits=NULL;
     g_group_accum_xdev=NULL;
     for(int di2=0;di2<g_cuda_ndev;di2++)
-        coli_cuda_expert_group_collect(g_cuda_devices[di2],dev,x_dev,D);
+        coli_cuda_expert_group_collect(g_cuda_devices[di2],dev,x_dev,S*D);
     te=now_s();
     if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
