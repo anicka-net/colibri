@@ -1,6 +1,11 @@
 #include "backend_cuda.h"
 
 #include <cuda_runtime.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <ctype.h>
+#endif
 #include <mma.h>
 
 #include <cstdio>
@@ -387,9 +392,51 @@ static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
-static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
+/* NUMA node of a GPU's PCIe root (sysfs), cached per CUDA ordinal; -1 = unknown. */
+static int dev_numa_node(int device){
+#ifdef __linux__
+    static int cache[16]; static bool have[16];
+    if(device<0||device>=16) return -1;
+    if(have[device]) return cache[device];
+    have[device]=true; cache[device]=-1;
+    char bus[32];
+    if(cudaDeviceGetPCIBusId(bus,sizeof(bus),device)==cudaSuccess){
+        for(char *p=bus;*p;p++) *p=tolower(*p);
+        char path[96]; snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/numa_node",bus);
+        FILE *f=fopen(path,"r");
+        if(f){ int n=-1; if(fscanf(f,"%d",&n)==1) cache[device]=n; fclose(f); }
+    }
+    return cache[device];
+#else
+    (void)device; return -1;
+#endif
+}
+
+/* Pinned staging feeds one specific GPU: bind it to that GPU's local node so the
+ * DMA and the CPU memcpy into it stay off the socket interconnect.  Raw mbind as
+ * in glm.c's COLI_NUMA (no libnuma); COLI_NUMA_STAGING=0 disables. */
+static void bind_local(void *p,size_t bytes,int device){
+#ifdef __linux__
+    static int on=-1;
+    if(on<0){ const char *e=getenv("COLI_NUMA_STAGING"); on=!(e&&!atoi(e)); }
+    int node=dev_numa_node(device);
+    if(!on||node<0||node>63||!p) return;
+    unsigned long mask=1UL<<node;
+    long pg=sysconf(_SC_PAGESIZE);
+    uintptr_t a=(uintptr_t)p & ~(uintptr_t)(pg-1);
+    size_t len=((uintptr_t)p+bytes+pg-1-a) & ~(uintptr_t)(pg-1);
+    syscall(SYS_mbind,a,len,2/*MPOL_BIND*/,&mask,
+            (unsigned long)65,(unsigned)2/*MPOL_MF_MOVE*/);
+#else
+    (void)p;(void)bytes;(void)device;
+#endif
+}
+
+static int reserve_pinned(float **ptr,size_t *cap,size_t bytes,int device){
     if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
-    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
+    if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;
+    bind_local(*ptr,bytes,device);
+    *cap=bytes;return 1;
 }
 
 extern "C" int coli_cuda_init(const int *devices, int count) {
@@ -593,8 +640,8 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
-       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb,ctx->device)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb,ctx->device))return 0;
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "shared w4a16 input upload"))return 0;
@@ -638,8 +685,8 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
        !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
     int async=!getenv("COLI_CUDA_ASYNC")||atoi(getenv("COLI_CUDA_ASYNC"));
-    if(async&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
-               !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb)))return 0;
+    if(async&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb,ctx->device)||
+               !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb,ctx->device)))return 0;
     cudaError_t copy_desc=async?cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                                 cudaMemcpyHostToDevice,ctx->stream)
                                :cudaMemcpy(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),cudaMemcpyHostToDevice);
