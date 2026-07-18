@@ -89,6 +89,10 @@ Run directly (or via `coli serve`). OpenAI-compatible `/v1/chat/completions`.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `8000` | Port. |
 | `--model-id` | `$COLI_MODEL_ID` or `glm-5.2-colibri` | Model id in API responses. |
+| `--model-alias` | none | Additional advertised model id; repeatable. |
+| `--hidden-model-alias` | none | Accepted but unadvertised compatibility id; repeatable. |
+| `--default-thinking` | `$COLI_THINK=1` or off | Enable thinking unless the request disables it. |
+| `--context-length` | `$COLI_CONTEXT_LENGTH`, `--ctx`, or unset | Context length advertised by `/v1/models`. |
 | `--api-key` | `$COLI_API_KEY` | Required bearer token. |
 | `--cors-origin` | none (repeatable) | Allowed CORS origin(s). |
 | `--cap` | `8` | Expert-cache cap. |

@@ -22,16 +22,26 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
-`POST /v1/chat/completions`, and legacy `POST /v1/completions`. Chat and
-completion requests support JSON responses, SSE streaming, usage counts,
+`POST /v1/chat/completions`, `POST /v1/responses`, Anthropic-compatible
+`POST /v1/messages`, and legacy `POST /v1/completions`. They support JSON
+responses, SSE streaming, usage counts,
 `max_tokens`/`max_completion_tokens`, `temperature`, and `top_p`. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
-`reasoning_effort` field also enables it unless set to `none`.
+`reasoning_effort` field also enables it unless set to `none`. DeepSeek clients
+may use `think: false` or `thinking: {"type": "disabled"}`. Reasoning is
+returned separately as `reasoning_content` in the OpenAI chat API and as
+thinking blocks in the Anthropic API.
 
-The server is deliberately text-only and serves one generation at a time: the
+Use `--model-alias` for additional advertised ids and
+`--hidden-model-alias` for accepted compatibility ids. `--default-thinking`
+enables reasoning when the request has no explicit thinking control. The
+service example in `ops/` advertises `deepseek-v4-flash` and
+`deepseek-v4-pro`, while accepting hidden non-thinking alias `deepseek-chat`.
+
+The server is deliberately text-only. The
 744B model stays in one persistent process, so concurrent HTTP requests queue
-instead of loading duplicate model copies. Tools, image/audio input, custom
-stop sequences, log probabilities, and token penalties return an explicit error
+or use separately allocated KV slots instead of loading duplicate model copies.
+Image/audio input, custom stop sequences, log probabilities, and token penalties return an explicit error
 rather than being silently ignored. The default bind address is localhost; set
 `COLI_API_KEY` before exposing the server beyond the machine.
 

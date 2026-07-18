@@ -1,0 +1,7 @@
+[Unit]
+Description=Check Colibri for an idle inference wedge
+After=colibri-server.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/colibri/ops/colibri-watchdog.sh

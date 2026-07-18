@@ -12,7 +12,7 @@ from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
                            READY, Engine, generation_options, parse_tool_calls,
-                           read_engine_turn, render_chat, serve)
+                           read_engine_turn, render_chat, serve, split_reasoning)
 
 
 class FakeEngine:
@@ -39,6 +39,16 @@ class BlockingEngine(FakeEngine):
         self.release.wait(2)
         return super().generate(prompt, maximum, temperature, top_p, on_text, cache_slot,
                                 cancelled)
+
+
+class ThinkingEngine(FakeEngine):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
+        self.calls.append((prompt, maximum, temperature, top_p, cache_slot))
+        chunks = ("Reason", "ing</th", "ink>Answer") if prompt.endswith("<think>") else ("Answer",)
+        for chunk in chunks:
+            on_text(chunk)
+        return {"prompt_tokens": 11, "completion_tokens": 4, "length_limited": False}
 
 
 class TemplateTest(unittest.TestCase):
@@ -68,6 +78,10 @@ class TemplateTest(unittest.TestCase):
             render_chat([{"role": "user", "content": "Hi"}], True, "high"),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
         )
+
+    def test_truncated_thinking_does_not_leak_into_content(self):
+        self.assertEqual(split_reasoning("private reasoning", True),
+                         ("private reasoning", ""))
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
@@ -550,6 +564,102 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+
+class DS4CompatibilityHTTPTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = ThinkingEngine()
+        cls.server = APIServer(
+            ("127.0.0.1", 0), cls.engine, "deepseek-v4-flash", max_tokens=32,
+            model_aliases=("deepseek-v4-pro",), hidden_model_aliases=("deepseek-chat",),
+            context_length=131072, default_thinking=True)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.scheduler.close()
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def request(self, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        return urlopen(Request(self.base + path, data=data, headers=headers), timeout=2)
+
+    def test_lists_public_aliases_with_context_metadata(self):
+        with self.request("/v1/models") as response:
+            models = json.load(response)["data"]
+        self.assertEqual([model["id"] for model in models],
+                         ["deepseek-v4-flash", "deepseek-v4-pro"])
+        self.assertEqual(models[0]["context_length"], 131072)
+
+    def test_default_thinking_is_split_from_content(self):
+        with self.request("/v1/chat/completions", {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }) as response:
+            message = json.load(response)["choices"][0]["message"]
+        self.assertEqual(message["reasoning_content"], "Reasoning")
+        self.assertEqual(message["content"], "Answer")
+
+    def test_deepseek_chat_and_think_false_disable_thinking(self):
+        for model, extra in (("deepseek-chat", {}), ("deepseek-v4-pro", {"think": False}),
+                             ("deepseek-v4-flash", {"thinking": {"type": "disabled"}})):
+            with self.request("/v1/chat/completions", {
+                "model": model, "messages": [{"role": "user", "content": "Hi"}], **extra,
+            }) as response:
+                message = json.load(response)["choices"][0]["message"]
+            self.assertEqual(message["content"], "Answer")
+            self.assertNotIn("reasoning_content", message)
+
+    def test_streams_reasoning_separately(self):
+        with self.request("/v1/chat/completions", {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        }) as response:
+            stream = response.read().decode()
+        self.assertIn('"reasoning_content":"Reason', stream)
+        self.assertIn('"reasoning_content":"ing"', stream)
+        self.assertIn('"content":"Answer"', stream)
+        self.assertTrue(stream.endswith("data: [DONE]\n\n"))
+
+    def test_responses_json_and_stream(self):
+        body = {"model": "deepseek-v4-flash", "input": "Hi",
+                "reasoning": {"effort": "none"}}
+        with self.request("/v1/responses", body) as response:
+            result = json.load(response)
+        self.assertEqual(result["object"], "response")
+        self.assertEqual(result["output"][0]["content"][0]["text"], "Answer")
+
+        with self.request("/v1/responses", {**body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn('"type":"response.created"', stream)
+        self.assertIn('"type":"response.output_text.delta"', stream)
+        self.assertIn('"type":"response.completed"', stream)
+
+    def test_anthropic_json_and_stream(self):
+        body = {"model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 16, "thinking": {"type": "enabled", "budget_tokens": 8}}
+        with self.request("/v1/messages", body) as response:
+            result = json.load(response)
+        self.assertEqual(result["type"], "message")
+        self.assertEqual(result["content"][0]["thinking"], "Reasoning")
+        self.assertEqual(result["content"][1]["text"], "Answer")
+        self.assertEqual(result["usage"]["input_tokens"], 11)
+        self.assertEqual(result["usage"]["cache_creation_input_tokens"], 0)
+
+        with self.request("/v1/messages", {**body, "stream": True}) as response:
+            stream = response.read().decode()
+        self.assertIn("event: message_start", stream)
+        self.assertIn('"type":"thinking_delta"', stream)
+        self.assertIn('"type":"text_delta","text":"Answer"', stream)
+        self.assertIn("event: message_stop", stream)
 
 
 class StaticServingTest(unittest.TestCase):
