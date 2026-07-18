@@ -786,7 +786,7 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         __m128i by=_mm_loadu_si128((const __m128i*)(w4+(i>>1)));   /* 16 byte = 32 nibble */
         __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
         __m128i n0=_mm_unpacklo_epi8(lo,hi), n1=_mm_unpackhi_epi8(lo,hi);   /* in ordine */
-        __m256i wv=_mm256_sub_epi8(_mm256_set_m128i(n1,n0),b8);
+        __m256i wv=_mm256_sub_epi8(_mm256_insertf128_si256(_mm256_castsi128_si256(n0), n1, 1),b8);
         __m256i xv=_mm256_loadu_si256((const __m256i*)(x+i));
         __m256i p=_mm256_maddubs_epi16(_mm256_sign_epi8(wv,wv),_mm256_sign_epi8(xv,wv));
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
