@@ -1227,11 +1227,12 @@ static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA 
 static void numa_slab_bind(void *p, size_t n){
 #ifdef __linux__
     if(g_numa_nodes<2 || !p || !n) return;
-    unsigned long mask=(1UL<<g_numa_nodes)-1;
+    int nodes=g_numa_nodes<(int)(8*sizeof(unsigned long))?g_numa_nodes:(int)(8*sizeof(unsigned long));
+    unsigned long mask=nodes==(int)(8*sizeof(unsigned long))?~0UL:(1UL<<nodes)-1;
     uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
     size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
     syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
-            (unsigned long)(g_numa_nodes+1),(unsigned)2/*MPOL_MF_MOVE*/);
+            (unsigned long)nodes,(unsigned)2/*MPOL_MF_MOVE*/);
 #else
     (void)p;(void)n;
 #endif

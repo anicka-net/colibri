@@ -16,8 +16,10 @@ cp ops/service.env.example ~/.config/colibri/service.env
 cp ops/systemd/colibri-*.service ops/systemd/colibri-watchdog.timer \
   ~/.config/systemd/user/
 chmod +x ops/colibri-watchdog.sh
+chmod 600 ~/.config/colibri/service.env
 systemctl --user daemon-reload
 systemctl --user enable --now colibri-server.service colibri-watchdog.timer
+loginctl enable-linger "$USER"
 ```
 
 Edit `service.env` first. `COLI_CONTEXT` is both the allocated engine context

@@ -414,7 +414,7 @@ def parse_tool_calls(reply, tools=None):
 
 def reasoning_settings(body, default=False):
     """Normalize the thinking controls used by OpenAI, DeepSeek, and Anthropic clients."""
-    enabled = default and body.get("model") != "deepseek-chat"
+    enabled = default and body.get("model") not in DS4_HIDDEN_MODELS
     effort = body.get("reasoning_effort")
     if effort is None and isinstance(body.get("reasoning"), dict):
         effort = body["reasoning"].get("effort")

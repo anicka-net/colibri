@@ -408,6 +408,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
  * experts) 12.11 ppl vs reference 12.25 (#108). Enabled by PPL=1. */
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
     Cfg *c = &m->c;
+    if(np>=nfull){ *nll_out=NAN; return 0; }
     m->max_t = nfull;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
@@ -464,6 +465,10 @@ int main(int argc, char **argv) {
     if (getenv("PPL") && atoi(getenv("PPL")) == 1) {   /* loss-meter mode: teacher-forced NLL */
         double nll; double t = now_s();
         int scored = tf_nll(&m, full, nfull, np, &nll);
+        if(!scored){
+            fprintf(stderr,"PPL=1 requires at least one reference token after the prompt\n");
+            free(buf); free(arena); return 2;
+        }
         double dt = now_s() - t;
         double tot = m.hits + m.miss;
         printf("TF-NLL: %.4f nats/token over %d tokens  |  ppl = %.2f\n", nll, scored, exp(nll));
