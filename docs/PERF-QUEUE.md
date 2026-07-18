@@ -97,22 +97,40 @@ All tuning so far targets decode.  The DS4/OpenAI server workload prefills
 thousands of tokens (pipe1 `S>=8` path, never profiled here).  Time-to-first-
 token may matter more than decode tok/s for agentic use.
 
-#### Prefill attention rewrite — design (ready to implement)
-The 93 s is naive per-element contraction kernels; the same math as five
-GEMMs is ~0.5 s of tensor-core time:
-1. `qabs[S,H,kvl] = q_nope[S,H,192] @ kvb_k[h][192,kvl]` — int4-weight GEMM
-   per head (w4a16_matmul shape);
-2. `scores[h][S,T] = qabs[h] @ Lc^T + q_rope[h] @ Rc^T` — fp16 GEMM (new
-   kernel; Lc/Rc tiles from the device KV cache, staged fp16);
-3. causal online-softmax over scores (new kernel, row-tiled);
-4. `ctxL[h][S,kvl] = P[h] @ Lc` — fp16 GEMM (same kernel as 2 transposed);
-5. `out = ctxL @ kvb_v + o_proj` — int4-weight GEMM per head.
-Steps 1/5 reuse the existing w4a16 wmma machinery; 2/4 need one fp16 GEMM
-kernel; 3 is small.  Wire into attn_pipe_prefill behind an env
-(COLI_PREFILL_GEMM=0 fallback), validate exact-vs-dense on a 2.7k prompt
-(greedy continuation must match the current path), then default on.
-Expected: prefill 167 s -> ~60-80 s (attention 114 -> ~20-30 incl. proj),
-with the expert 40 s then the next target.
+#### Prefill attention rewrite — IMPLEMENTED (COLI_PREFILL_GEMM=1)
+The five-GEMM tensor-core rewrite of score-softmax-value is in
+(`coli_cuda_prefill_attn_gemm`, backend_cuda.cu): per head, (1) qabs =
+q_nope @ kvb_k (int4-weight wmma, per-reduction-row scales), (2) scores =
+qabs @ Lc^T + q_rope @ Rc^T (fp16-TC GEMM, fp32 accumulate), (3) causal
+softmax (tail zeroed), (4) ctxL = P @ Lc, (5) ctx slice = ctxL @ kvb_v,
+then one o_proj GEMM over the assembled context.  Hooked into
+attn_pipe_prefill for `out_dev && S>=16` (decode/MTP keep the absorb
+kernel); `COLI_PREFILL_GEMM=0` falls back, `=2` launches on the legacy
+stream (debug).  MEASURED on the 2701-token prompt:
+**prefill 161.7 -> 80.4 s (16.7 -> 33.6 tok/s), score-softmax-value
+93.0 -> 11.9 s**, attention 114 -> 33 s.  Numerics validated against the
+absorb kernel in a standalone harness (S/T up to 2701, model dims,
+S<T windows, 30x magnitudes: worst-row rel err ~1e-3..7e-2 = fp16
+input rounding, no structure).  Token-exact greedy match vs the old path
+is NOT a usable bar: expert placement (`.coli_usage` evolves per run)
+makes even two identical GEMM=0 runs diverge after ~16-20 tokens.
+Remaining prefill costs: proj/rope 21 s (pipe_gemm gemv-style — same
+w4a16 treatment applies), experts 40 s, other 13 s.
+
+#### OPEN BUG (pre-existing, NOT the rewrite): intermittent prefill corruption
+~14% of prefill runs (341-token prompt, TAP mode = non-pipe2 fallback
+path, COLI_PREFILL_GEMM inert/never executed; also 1 of 2 pipe2 long-run
+GEMM=0 controls) produce a corrupted CONTIGUOUS TAIL of residual rows
+(~row 270..end at S=341, every element wrong by O(10) rel) visible by
+layer 3, poisoning the KV for those positions -> degenerate decode
+("}"-spam from token 1).  Baseline-only evidence: GEMM=0 control run B
+(/tmp/pfgemm_0b.txt on tekton) after a byte-normal 161 s prefill.
+Intermittent with identical input => timing/state race, in code shared
+by both prefill paths (MoE dispatch, shared-expert overlap, LRU/slab, or
+expert-group staging are the candidates; attention paths are exonerated —
+corruption occurs with the old absorb kernel and without pipe2).
+Repro: short-prompt TAP=3 probe, compare row norms across runs (~90 s/run,
+1-in-7 hit rate).  This gates ANY exact-output validation on main.
 
 ### 5. Expert-group remaining headroom
 Group kernel time is 761 ms/64 tok vs a ~100-150 ms bandwidth floor.  The

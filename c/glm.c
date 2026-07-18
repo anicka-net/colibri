@@ -2597,10 +2597,22 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
                 S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
     } else
 #endif
-    ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
-            S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
-              :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
-            S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+    {
+        /* Prefill score-softmax-value come cinque GEMM tensor-core (design in
+         * docs/PERF-QUEUE.md): solo per batch grandi — il decode S<=4 resta
+         * sul kernel absorb. COLI_PREFILL_GEMM=0 forza il percorso classico. */
+        static int gemm_pref=-1;
+        if(gemm_pref<0){ const char *e=getenv("COLI_PREFILL_GEMM"); gemm_pref=e?atoi(e):1; }
+        ok=0;
+        if(out_dev&&gemm_pref&&S>=16)
+            ok=coli_cuda_prefill_attn_gemm(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+        if(!ok)
+            ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                    S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
+                      :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
+                    S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+    }
     m->t_acore+=now_s()-t0;
 done:
     free(chost);                              /* gli scratch device restano al contesto */

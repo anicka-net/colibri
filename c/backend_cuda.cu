@@ -31,6 +31,7 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
+    float *pf_q,*pf_c,*pf_s; size_t pf_q_cap,pf_c_cap,pf_s_cap; /* prefill GEMM attention */
     float *pipe_buf[32]; size_t pipe_cap[32];   /* scratch persistenti del resident pipeline */
     float *accum; size_t accum_cap;             /* device-side routed-expert accumulate */
     float *wrow_d; size_t wrow_cap;
@@ -1703,6 +1704,175 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev ctx download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev absorb sync"))return 0;
     return 1;
+}
+/* ---- Prefill attention as five GEMMs (per head) --------------------------
+ * Replaces attention_absorb_batch_kernel at prefill sizes, where the naive
+ * per-element contraction is ~60x off the FLOP floor.  Same math on tensor
+ * cores, one head at a time (scores[S,T] for all 64 heads would be GBs):
+ *   1. qabs[S,K]   = q_nope[S,Q] @ (ws*Wk)[Q,K]           int4 weights, NN
+ *   2. scores[S,T] = qabs @ Lc^T + q_rope @ Rc^T           fp16 TC, NT
+ *   3. causal online-softmax rows (scale applied here; tail zeroed so the
+ *      step-4 reduction can run over the full T)
+ *   4. ctxL[S,K]   = P[S,T] @ Lc[T,K]                      fp16 TC, NN
+ *   5. ctx[:,hV:]  = ctxL @ Wv^T ;  out = ctx @ Wo^T       int4 weights, NT
+ * Weight nibbles are SIGNED (upload converts); decode matches w4a16_matmul. */
+__global__ static void gemm_f16_tc(float *C,const float *A,const float *B,
+        int M,int N,int K,int lda,int ldb,int ldc,int transB,int beta){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(A[(size_t)gm*lda+gk]):__float2half(0.f);
+        }
+        if(transB){                                    /* B[N,K] righe: C=A@B^T */
+            for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;
+                bh[warp][z]=(gn<N&&gk<K)?__float2half(B[(size_t)gn*ldb+gk]):__float2half(0.f);}
+        }else{                                         /* B[K,N] righe: C=A@B */
+            for(int z=lane;z<256;z+=32){int k=z/16,gn=n0+(z%16),gk=k0+k;
+                bh[warp][z]=(gn<N&&gk<K)?__float2half(B[(size_t)gk*ldb+gn]):__float2half(0.f);}
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::load_matrix_sync(af,ah,16);
+        if(transB){
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+            wmma::load_matrix_sync(bf,bh[warp],16);wmma::mma_sync(acc,af,bf,acc);
+        }else{
+            wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::row_major> bf;
+            wmma::load_matrix_sync(bf,bh[warp],16);wmma::mma_sync(acc,af,bf,acc);
+        }
+        __syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N){size_t i=(size_t)(m0+m)*ldc+n0+n;C[i]=beta?C[i]+out[warp][z]:out[warp][z];}}
+#endif
+}
+/* y[M,N] = x[M,K] @ dec(w)[K,N] con scala per riga K (l'assorbimento q@Wk:
+ * la riga del tensore e' la dimensione di riduzione, scala inclusa in B). */
+__global__ static void w4a16_nn_scaled(float *y,const float *x,const uint8_t *w,
+        const float *ws,int M,int N,int K,int lda,size_t wrb,int ldy){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*lda+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int k=z/16,n=z%16,gk=k0+k,gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K){uint8_t q=w[(size_t)gk*wrb+(gn>>1)];int a=(gn&1)?q>>4:q&15;
+                v=(float)(a&8?a-16:a)*ws[gk];}
+            bh[warp][z]=__float2half(v);}              /* [Ktile,Ntile] row-major */
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::row_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*ldy+n0+n]=out[warp][z];}
+#endif
+}
+/* w4a16_matmul con passo d'uscita ldy: serve per scrivere la slice di testa
+ * dentro ctx[S,H*V] (e riusato per o_proj con ldy==N). x contigua [M,K]. */
+__global__ static void w4a16_nt_ld(float *y,const float *x,const uint8_t *w,
+        const float *scale,int M,int K,int N,int ldy){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    size_t rb=(size_t)(K+1)/2;
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
+        }
+        for(int z=lane;z<256;z+=32){
+            int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K){uint8_t q=w[(size_t)gn*rb+(gk>>1)];int a=(gk&1)?q>>4:q&15;
+                v=(float)(a&8?a-16:a)*scale[gn];}
+            bh[warp][z]=__float2half(v);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*ldy+n0+n]=out[warp][z];}
+#endif
+}
+/* softmax causale in-place su scores[S,T]: riga s vede nt=T-S+s+1 chiavi.
+ * La coda [nt,T) viene azzerata: il GEMM del passo 4 riduce su tutto T. */
+__global__ static void causal_softmax_rows(float *scores,int S,int T,float scale){
+    int s=blockIdx.x,tid=threadIdx.x; if(s>=S)return;
+    int nt=T-S+s+1; float *row=scores+(size_t)s*T;
+    __shared__ float red[256];
+    float local=-3.402823466e+38F;
+    for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,row[t]*scale);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];__syncthreads();
+    local=0;
+    for(int t=tid;t<nt;t+=blockDim.x){float e=expf(row[t]*scale-mx);row[t]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];
+    for(int t=tid;t<nt;t+=blockDim.x)row[t]*=inv;
+    for(int t=nt+tid;t<T;t+=blockDim.x)row[t]=0.f;
+}
+extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *proj,
+        float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
+        int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(!w||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
+       K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
+       proj->device!=w->device||proj->I!=H*V||w->fmt!=2||proj->fmt!=2||
+       (Q&15)||(K&15)||(R&15)||(V&15)||(proj->I&15))return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    if(dc->compute_major<7)return 0;                  /* wmma fp16 */
+    /* COLI_PREFILL_GEMM=2: lancia sullo stream legacy (debug ordering) */
+    const char *pgenv=getenv("COLI_PREFILL_GEMM");
+    cudaStream_t st=(pgenv&&atoi(pgenv)==2)?0:dc->stream;
+    if(!reserve(&dc->ac,&dc->ac_cap,(size_t)S*H*V*sizeof(float)))return 0;
+    if(!reserve(&dc->pf_q,&dc->pf_q_cap,(size_t)S*K*sizeof(float)))return 0;
+    if(!reserve(&dc->pf_c,&dc->pf_c_cap,(size_t)S*K*sizeof(float)))return 0;
+    if(!reserve(&dc->pf_s,&dc->pf_s_cap,(size_t)S*T*sizeof(float)))return 0;
+    size_t rb=row_bytes(2,K);
+    const uint8_t *wb=(const uint8_t*)w->weights;
+    const float *wsc=w->scales;
+    dim3 gq((unsigned)((K+63)/64),(unsigned)((S+15)/16));
+    dim3 gs((unsigned)((T+63)/64),(unsigned)((S+15)/16));
+    dim3 gv((unsigned)((V+63)/64),(unsigned)((S+15)/16));
+    for(int h=0;h<H;h++){
+        size_t rbase=(size_t)h*(Q+V);
+        const float *qh=q_dev+(size_t)h*(Q+R);
+        w4a16_nn_scaled<<<gq,128,0,st>>>(dc->pf_q,qh,wb+rbase*rb,
+            wsc+rbase,S,K,Q,H*(Q+R),rb,K);
+        gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,dc->pf_q,latent_dev,
+            S,T,K,K,K,T,1,0);
+        gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,qh+Q,rope_dev,
+            S,T,R,H*(Q+R),R,T,1,1);
+        causal_softmax_rows<<<S,256,0,st>>>(dc->pf_s,S,T,scale);
+        gemm_f16_tc<<<gq,128,0,st>>>(dc->pf_c,dc->pf_s,latent_dev,
+            S,K,T,T,K,K,0,0);
+        w4a16_nt_ld<<<gv,128,0,st>>>(dc->ac+(size_t)h*V,dc->pf_c,
+            wb+(rbase+Q)*rb,wsc+rbase+Q,S,K,V,H*V);
+    }
+    if(!cuda_ok(cudaGetLastError(),"prefill gemm attention launch"))return 0;
+    dim3 go((unsigned)((proj->O+63)/64),(unsigned)((S+15)/16));
+    w4a16_nt_ld<<<go,128,0,st>>>(out_dev,dc->ac,
+        (const uint8_t*)proj->weights,proj->scales,S,proj->I,proj->O,proj->O);
+    if(!cuda_ok(cudaGetLastError(),"prefill gemm o_proj launch"))return 0;
+    return cuda_ok(cudaStreamSynchronize(st),"prefill gemm attention sync");
 }
 extern "C" int coli_cuda_pipe_sync(int device){
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
