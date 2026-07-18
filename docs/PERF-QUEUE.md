@@ -63,6 +63,18 @@ rope-Q into absorption) is the proven-shape next step.  CUDA graphs were
 already tried and are NOT the answer (execution-bound, not launch-bound;
 see COLI_GRAPH history).
 
+### 4a. Cold-start (preload) anatomy — measured
+Full cold start on the discrete host, 150 GB VRAM tier from tmpfs: **29 s**
+(was 31 before parallelizing the tier upload): dense load 2.2 s, PIN placement
+15 s (host slab warm-copy of ~213 GB — page-fault bound, ~5 CPU-min of sys
+time — plus the now per-device-parallel VRAM upload), ~10 s misc (st_init,
+CUDA init, wiring, KV).  On the unified host the same phase is NVMe-bound and
+was the "absurdly slow start" complaint; the DS4 daemon (merged) amortizes it
+— cold start is paid once per service start, not per request.  Remaining
+levers if it matters again: zero-copy experts (mmap the snapshot instead of
+slab copies — big architectural win, tmpfs and NVMe both), THP/pre-fault for
+slab pages, pinned double-buffer staging for the uploads.
+
 ### 4. Prefill profiling
 All tuning so far targets decode.  The DS4/OpenAI server workload prefills
 thousands of tokens (pipe1 `S>=8` path, never profiled here).  Time-to-first-
