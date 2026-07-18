@@ -1231,7 +1231,9 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
         int qk_nope, int qk_rope, int vh,
         int S, int pos_base, int kv_start,
         float eps, float theta, float attn_scale,
-        const float *d_router, int E, float *scores_host) {
+        const float *d_router, int E, float *scores_host,
+        const ColiCudaTensor *shg, const ColiCudaTensor *shu,
+        const ColiCudaTensor *shd, int sI) {
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!select_ctx(ctx)) return 0;
     if(qa->fmt!=2||qb->fmt!=2||kva->fmt!=2||kvb->fmt!=2||o_proj->fmt!=2) return 0;
@@ -1284,6 +1286,26 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
     for(int s=0;s<S;s++)
         rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
+    /* Optional fused shared expert: launched before the chain sync so it runs
+     * during the downloads and the host-side gap, instead of after them. */
+    if(shg&&shu&&shd&&sI>0&&shg->fmt==2&&shu->fmt==2&&shd->fmt==2){
+        float *sg=coli_cuda_pipe_scratch(device,29,(size_t)sI*4);
+        float *su=coli_cuda_pipe_scratch(device,30,(size_t)sI*4);
+        size_t smem_sh=(size_t)D*sizeof(__half);
+        size_t smem_dn=(size_t)sI*sizeof(__half);
+        if(sg&&su){
+            for(int s=0;s<S;s++){
+                gemv_q4<<<((unsigned)sI+7)/8,256,smem_sh>>>(sg,nrm_dev+(size_t)s*D,
+                    (const uint8_t*)shg->weights,shg->scales,D,sI);
+                gemv_q4<<<((unsigned)sI+7)/8,256,smem_sh>>>(su,nrm_dev+(size_t)s*D,
+                    (const uint8_t*)shu->weights,shu->scales,D,sI);
+                silu_mul<<<((unsigned)sI+255)/256,256>>>(sg,su,(size_t)sI);
+                gemv_q4<<<((unsigned)D+7)/8,256,smem_dn>>>(aout+(size_t)s*D,sg,
+                    (const uint8_t*)shd->weights,shd->scales,sI,D);
+            }
+            add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
+        }
+    }
     float *sc=NULL;
     if(d_router&&scores_host&&E>0){
         sc=coli_cuda_pipe_scratch(device,28,(size_t)S*E*4);

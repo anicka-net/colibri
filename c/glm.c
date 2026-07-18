@@ -2465,6 +2465,7 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
  * il chiamante riesegue il percorso CPU (idempotente). */
 /* Per-layer device cache for small fp32 vectors (layer norms): these were
  * re-uploaded on every pipe call — 4 uploads per layer per token. */
+static int g_fuse_shared=-1;                  /* COLI_FUSE_SHARED=1: shared expert inside the fused chain */
 static const float *g_cuda_pre_logits=NULL;  /* router logits computed on-device by the fused chain */
 static float chain_scores[4*512];             /* fused-chain router logits [S,E], S<=4 */
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
@@ -3867,7 +3868,8 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!l->sh_gate.cuda_eligible||!l->sh_up.cuda_eligible||!l->sh_down.cuda_eligible||
        !qt_cuda_upload(&l->sh_gate)||!qt_cuda_upload(&l->sh_up)||!qt_cuda_upload(&l->sh_down)||
        l->sh_gate.cuda_device!=dev||l->sh_up.cuda_device!=dev||l->sh_down.cuda_device!=dev) return 0;
-    int chain_pre_logits=0;
+    int chain_pre_logits=0, chain_did_shared=0;
+    if(g_fuse_shared<0){ const char *e=getenv("COLI_FUSE_SHARED"); g_fuse_shared=e&&atoi(e); }
     float *w_in =coli_cuda_pipe_scratch(dev,8,(size_t)D*4);
     float *w_post=coli_cuda_pipe_scratch(dev,9,(size_t)D*4);
     float *nrm_d=coli_cuda_pipe_scratch(dev,10,xb);
@@ -3899,9 +3901,13 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                D,c->n_heads,c->q_lora,kvl,c->qk_nope,R,c->v_head,
                S,pos_base,m->kv_start[li],c->eps,c->theta,c->attn_scale,
                pipe_ln_cache(dev,li,4,l->router,(size_t)c->n_experts*D),
-               c->n_experts,chain_scores)){
+               c->n_experts,chain_scores,
+               g_fuse_shared?l->sh_gate.cuda:NULL,
+               g_fuse_shared?l->sh_up.cuda:NULL,
+               g_fuse_shared?l->sh_down.cuda:NULL,sI)){
             m->kv->cuda_valid[li]=pos_base+S;
             if(!isnan(chain_scores[0])) chain_pre_logits=1;
+            if(g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda) chain_did_shared=1;
             m->t_attn+=now_s()-ta;
             goto attn_done;
         }
@@ -3946,11 +3952,13 @@ attn_done:;
      * including moe(), double-counting the routed-expert time and driving the
      * profile's "other" bucket negative (#292). */
     double te=now_s();
+    if(!chain_did_shared){
     if(!coli_cuda_pipe_gemm(l->sh_gate.cuda,sg_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_up.cuda,su_d,nrm_d,S)) return 0;
     if(!coli_cuda_pipe_silu_mul(dev,sg_d,su_d,(size_t)S*sI)) return 0;
     if(!coli_cuda_pipe_gemm(l->sh_down.cuda,y_d,sg_d,S)) return 0;
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* shared residual (async) */
+    }
     m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
     if(chain_pre_logits) g_cuda_pre_logits=chain_scores;

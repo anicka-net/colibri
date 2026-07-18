@@ -87,3 +87,12 @@ DIRECT=1 DRAFT=0 ./glm <cache-slots> 4 4
 - **Hit-rate telemetry**: on discrete GPUs the headline number is the VRAM-served
   share; on unified/CPU it is the RAM (disk-miss) hit rate. `PROF=1` gives the
   phase breakdown when something is slower than expected.
+
+## Shared-expert placement (COLI_FUSE_SHARED)
+
+By default the shared expert is dispatched async on the GPU right before the
+CPU enters `moe()`, so the two overlap. `COLI_FUSE_SHARED=1` instead folds it
+into the fused attention chain (before the chain's sync). Measured on a
+high-core-count discrete-GPU host: overlap wins (17.0 vs 16.5 tok/s) — fusing
+delays the downloads that unblock the CPU. On machines with weak CPUs (where
+`moe()` routing is slow relative to the GPU), try `=1` and measure.
