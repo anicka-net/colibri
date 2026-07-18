@@ -71,7 +71,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs,
                            const int *rows, int count,
-                           float *y, const float *x);
+                           float *y, const float *x,
+        const float *wrow, int accum_ok);
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_collect(int device,int home_device,float *x_dev,int D);
 
 /* Decode-only MLA weight-absorption core for one token. kv_b is [H*(Q+V),K]. */
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb(ColiCudaTensor *kv_b,float *ctx,const float *q,

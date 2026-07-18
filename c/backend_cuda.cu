@@ -31,6 +31,9 @@ typedef struct {
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pipe_buf[32]; size_t pipe_cap[32];   /* scratch persistenti del resident pipeline */
+    float *accum; size_t accum_cap;             /* device-side routed-expert accumulate */
+    float *wrow_d; size_t wrow_cap;
+    cudaEvent_t group_ev; int group_ev_init, accum_pending;
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -667,6 +670,15 @@ __global__ static void gemv_q4(float *__restrict__ y, const float *__restrict__ 
  * activation row is staged to smem ONCE per block and feeds BOTH the gate and
  * up projections (dual), so weight bandwidth dominates.  Same signed-nibble
  * decode as gemv_q4. */
+__global__ static void group_accum_kernel(float *__restrict__ acc,
+        const float *__restrict__ y, const float *__restrict__ w, int count, int D) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= D) return;
+    float s = 0;
+    for (int c = 0; c < count; c++) s += w[c] * y[(size_t)c * D + t];
+    acc[t] = s;
+}
+
 __global__ static void grouped_gemv_q4_dual(float *__restrict__ gate_out,
         float *__restrict__ up_out, const float *__restrict__ x_all,
         const GroupDesc *__restrict__ g, int I_in, int O) {
@@ -734,7 +746,8 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *ups,
                                         ColiCudaTensor *const *downs,
                                         const int *rows, int count,
-                                        float *y, const float *x) {
+                                        float *y, const float *x,
+                                        const float *wrow, int accum_ok) {
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
@@ -847,6 +860,32 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }
+    if(wrow&&accum_ok&&all_s4&&max_rows==1){
+        /* Device-side weighted accumulate: no y download, no sync.  The caller
+         * orders the NULL stream behind group_ev via _collect before any other
+         * write touches the residual. */
+        if(reserve(&ctx->accum,&ctx->accum_cap,(size_t)D*sizeof(float))&&
+           reserve(&ctx->wrow_d,&ctx->wrow_cap,(size_t)count*sizeof(float))&&
+           cuda_ok(cudaMemcpyAsync(ctx->wrow_d,wrow,(size_t)count*sizeof(float),
+                                   cudaMemcpyHostToDevice,ctx->stream),"group weights upload")){
+            group_accum_kernel<<<((unsigned)D+255)/256,256,0,ctx->stream>>>(
+                ctx->accum,ctx->y,ctx->wrow_d,count,D);
+            if(!ctx->group_ev_init){
+                if(cuda_ok(cudaEventCreateWithFlags(&ctx->group_ev,cudaEventDisableTiming),
+                           "group event")) ctx->group_ev_init=1;
+            }
+            if(ctx->group_ev_init&&
+               cuda_ok(cudaEventRecord(ctx->group_ev,ctx->stream),"group event record")&&
+               cuda_ok(cudaGetLastError(),"group accum launch")){
+                ctx->accum_pending=1;
+                if(profile) for(int i=0;i<4;i++) cudaEventDestroy(ev[i]);
+                { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+                  g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+                return 2;
+            }
+        }
+        /* accumulate setup failed: fall through to the host path */
     }
     if(profile) cudaEventRecord(ev[2],ctx->stream);
     if(!async&&!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group synchronize"))return 0;
@@ -1402,6 +1441,25 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     if(cudaMemcpy(kv_host_L,d_Lc+(size_t)pos_base*kv_lora,(size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(cudaMemcpy(kv_host_R,d_Rc+(size_t)pos_base*qk_rope,(size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     return cudaGetLastError()==cudaSuccess;
+}
+
+extern "C" int coli_cuda_expert_group_collect(int device,int home_device,float *x_dev,int D){
+    DeviceContext *rc=find_ctx(device);
+    if(!rc||!rc->accum_pending) return 1;
+    DeviceContext *hc=find_ctx(home_device);
+    if(!hc||!select_ctx(hc)){ rc->accum_pending=0; return 0; }
+    if(!cuda_ok(cudaStreamWaitEvent(0,rc->group_ev,0),"group collect wait")){ rc->accum_pending=0; return 0; }
+    const float *src=rc->accum;
+    if(device!=home_device){
+        float *tmp=coli_cuda_pipe_scratch(home_device,31,(size_t)D*sizeof(float));
+        if(!tmp||!cuda_ok(cudaMemcpyPeerAsync(tmp,home_device,rc->accum,device,
+                (size_t)D*sizeof(float),0),"group collect peer")){ rc->accum_pending=0; return 0; }
+        src=tmp;
+        select_ctx(hc);
+    }
+    add_vec_kernel<<<((unsigned)D+255)/256,256>>>(x_dev,x_dev,src,D);
+    rc->accum_pending=0;
+    return cuda_ok(cudaGetLastError(),"group collect add");
 }
 
 extern "C" void *coli_cuda_pipe_alloc(int device,size_t bytes){

@@ -2466,7 +2466,9 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
 /* Per-layer device cache for small fp32 vectors (layer norms): these were
  * re-uploaded on every pipe call — 4 uploads per layer per token. */
 static int g_fuse_shared=-1;                  /* COLI_FUSE_SHARED=1: shared expert inside the fused chain */
-static const float *g_cuda_pre_logits=NULL;  /* router logits computed on-device by the fused chain */
+static const float *g_cuda_pre_logits=NULL;
+static float *g_group_accum_xdev=NULL;        /* pipe path: routed experts accumulate on-device into x_dev */
+static int g_group_accum_home=-1;  /* router logits computed on-device by the fused chain */
 static float chain_scores[4*512];             /* fused-chain router logits [S,E], S<=4 */
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
     static float *cache[8][256]; static int cdev[8][256];
@@ -3404,6 +3406,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
         ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
         int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
+        float dev_w[COLI_CUDA_MAX_DEVICES][64];
         int dev_nc[COLI_CUDA_MAX_DEVICES]={0},dev_total[COLI_CUDA_MAX_DEVICES]={0};
         int dev_off[COLI_CUDA_MAX_DEVICES]={0},dev_ok[COLI_CUDA_MAX_DEVICES]={0};
         double dev_time[COLI_CUDA_MAX_DEVICES]={0};
@@ -3416,6 +3419,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 int nc=dev_nc[di]++; ESlot *e=group_e[q];
                 dev_g[di][nc]=e->g.cuda; dev_u[di][nc]=e->u.cuda; dev_d[di][nc]=e->d.cuda;
                 dev_rows[di][nc]=group_n[q]; dev_which[di][nc]=q;
+                dev_w[di][nc]=group_weight[(int64_t)q*S];
                 for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(dev_off[di]+cursor+r)*D,
                     x+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
                 cursor+=group_n[q];
@@ -3426,7 +3430,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
             double td=g_prof?now_s():0;
             dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
-                group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
+                group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D,
+                dev_w[di],(g_group_accum_xdev&&S==1)?1:0);
             if(g_prof)dev_time[di]=now_s()-td;
         }
         for(int di=0;di<g_cuda_ndev;di++){
@@ -3446,6 +3451,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     }
                     if(g_prof)m->t_ecpu+=now_s()-tc;
                 }
+                if(dev_ok[di]==2){ off+=nr; continue; }   /* accumulated on device into x_dev */
                 float *src=dev_ok[di]?group_y+(int64_t)off*D:hh;
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)group_row[(int64_t)gi*S+r]*D,wgt=group_weight[(int64_t)gi*S+r];
                     for(int d=0;d<D;d++) os[d]+=wgt*src[(int64_t)r*D+d]; }
@@ -3962,8 +3968,12 @@ attn_done:;
     m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
     if(chain_pre_logits) g_cuda_pre_logits=chain_scores;
+    g_group_accum_xdev=x_dev; g_group_accum_home=dev;
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
     g_cuda_pre_logits=NULL;
+    g_group_accum_xdev=NULL;
+    for(int di2=0;di2<g_cuda_ndev;di2++)
+        coli_cuda_expert_group_collect(g_cuda_devices[di2],dev,x_dev,D);
     te=now_s();
     if(!coli_cuda_pipe_upload(dev,y_d,out_host,xb)) return 0;     /* sync: waits for moe */
     if(!coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;  /* routed residual (async) */
