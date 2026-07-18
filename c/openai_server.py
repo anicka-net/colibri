@@ -455,11 +455,14 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 class Engine:
-    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1):
+    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None, kv_slots=1,
+                 expert_bits=8, dense_bits=None):
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        dense_bits = expert_bits if dense_bits is None else dense_bits
         self.process = subprocess.Popen(
-            [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
+            [str(executable), str(cap), str(expert_bits), str(dense_bits)],
+            env=child_env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
@@ -1082,7 +1085,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
 def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
           cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1):
+          max_queue=8, queue_timeout=300, kv_slots=1, expert_bits=8, dense_bits=None):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -1103,7 +1106,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        runtime = Engine(engine, model, cap, max_tokens, env, kv_slots,
+                         expert_bits, dense_bits)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -1127,6 +1131,11 @@ def main():
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
     parser.add_argument("--cap", type=int, default=8)
+    parser.add_argument("--expert-bits", type=int,
+                        default=int(os.environ.get("COLI_EXPERT_BITS", "8")))
+    parser.add_argument("--dense-bits", type=int,
+                        default=int(os.environ["COLI_DENSE_BITS"])
+                        if os.environ.get("COLI_DENSE_BITS") else None)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
@@ -1135,7 +1144,8 @@ def main():
     args = parser.parse_args()
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
-          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots)
+          max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
+          expert_bits=args.expert_bits,dense_bits=args.dense_bits)
 
 
 if __name__ == "__main__":

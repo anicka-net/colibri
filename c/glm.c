@@ -153,6 +153,10 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
 typedef struct {
     float **Lc, **Rc, **Ic;
     int *kv_start, max_t;
+#ifdef COLI_CUDA
+    float **cuda_Lc,**cuda_Rc;
+    int *cuda_valid;
+#endif
     int disk_nrec;
     char disk_path[2048];
     FILE *disk_fp;       /* kept-open handle: fopen once, fwrite per turn, fclose at exit (#4) */
@@ -177,7 +181,6 @@ typedef struct {
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
-    float **kv_dev_L, **kv_dev_R; int *kv_dev_valid; /* ombra KV su device (decode) */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -1529,8 +1532,6 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
     m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
-    m->kv_dev_L=calloc(NR,sizeof(float*)); m->kv_dev_R=calloc(NR,sizeof(float*));
-    m->kv_dev_valid=calloc(NR,sizeof(int));
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
@@ -2383,25 +2384,33 @@ static void partial_select_desc(float *a, int n, int k){
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
 #ifdef COLI_CUDA
-/* Ombra KV su device per il DECODE: righe [0,upto) valide sulla scheda di kv_b.
- * L'host resta canonico; l'ombra si riallinea in blocco quando resta indietro e
- * viene invalidata da kv_bind / dalla riscrittura di righe gia' specchiate. */
-static int kv_dev_sync(Model *m, Layer *l, int layer, int upto){
+/* Ombra KV per-KVState sul device: righe [0,upto) valide sulla scheda di kv_b.
+ * L'host resta canonico; ogni slot si riallinea indipendentemente e una
+ * riscrittura accorcia solo l'ombra di quello slot. */
+static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
     Cfg *c=&m->c; int kvl=c->kv_lora, R=c->qk_rope, dev=l->kv_b.cuda_device;
-    if(upto>m->max_t) return 0;
-    if(!m->kv_dev_L[layer]){
-        m->kv_dev_L[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*kvl*4);
-        m->kv_dev_R[layer]=(float*)coli_cuda_pipe_alloc(dev,(size_t)m->max_t*R*4);
-        m->kv_dev_valid[layer]=0;
-        if(!m->kv_dev_L[layer]||!m->kv_dev_R[layer]) return 0;
+    if(!ks||upto>ks->max_t) return 0;
+    if(!ks->cuda_Lc[layer]||!ks->cuda_Rc[layer]){
+        if(ks->cuda_Lc[layer]) coli_cuda_pipe_free(dev,ks->cuda_Lc[layer]);
+        if(ks->cuda_Rc[layer]) coli_cuda_pipe_free(dev,ks->cuda_Rc[layer]);
+        ks->cuda_Lc[layer]=NULL;ks->cuda_Rc[layer]=NULL;
+        float *Lc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*kvl*4);
+        float *Rc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*R*4);
+        if(!Lc||!Rc){
+            if(Lc) coli_cuda_pipe_free(dev,Lc);
+            if(Rc) coli_cuda_pipe_free(dev,Rc);
+            return 0;
+        }
+        ks->cuda_Lc[layer]=Lc;ks->cuda_Rc[layer]=Rc;
+        ks->cuda_valid[layer]=0;
     }
-    int v=m->kv_dev_valid[layer];
+    int v=ks->cuda_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,m->kv_dev_L[layer]+(size_t)v*kvl,
-            coli_kv_row(m->kv->Lc[layer],v,kvl),(size_t)(upto-v)*kvl*4)||
-           !coli_cuda_pipe_upload(dev,m->kv_dev_R[layer]+(size_t)v*R,
-            coli_kv_row(m->kv->Rc[layer],v,R),(size_t)(upto-v)*R*4)) return 0;
-        m->kv_dev_valid[layer]=upto;
+        if(!coli_cuda_pipe_upload(dev,ks->cuda_Lc[layer]+(size_t)v*kvl,
+            coli_kv_row(ks->Lc[layer],v,kvl),(size_t)(upto-v)*kvl*4)||
+           !coli_cuda_pipe_upload(dev,ks->cuda_Rc[layer]+(size_t)v*R,
+            coli_kv_row(ks->Rc[layer],v,R),(size_t)(upto-v)*R*4)) return 0;
+        ks->cuda_valid[layer]=upto;
     }
     return 1;
 }
@@ -2457,7 +2466,7 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
         memcpy(coli_kv_row(m->Lc[layer],pos_base+s,kvl),chost+(size_t)s*(kvl+R),kvl*4);
         memcpy(coli_kv_row(m->Rc[layer],pos_base+s,R),chost+(size_t)s*(kvl+R)+kvl,R*4);
     }
-    if(m->kv_dev_valid[layer]>pos_base) m->kv_dev_valid[layer]=pos_base;
+    if(m->kv->cuda_valid[layer]>pos_base) m->kv->cuda_valid[layer]=pos_base;
     m->t_aproj+=now_s()-t0; t0=now_s();
 #ifdef COLI_CUDA
     /* Negativo (2026-07-13): P2P a stella dal device di casa serializza ~95MB/layer
@@ -2599,8 +2608,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
         float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
 #ifdef COLI_CUDA
-        if(ks==m->kv&&m->kv_dev_valid&&layer<=c->n_layers&&m->kv_dev_valid[layer]>pos)
-            m->kv_dev_valid[layer]=pos;              /* riga riscritta: l'ombra si accorcia */
+        if(ks->cuda_valid&&layer<c->n_layers&&ks->cuda_valid[layer]>pos)
+            ks->cuda_valid[layer]=pos;               /* riga riscritta: l'ombra si accorcia */
 #endif
         memcpy(Ldst, cs, c->kv_lora*sizeof(float));
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
@@ -2759,10 +2768,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 int st0=ks->kv_start[layer],nt=pos+1-st0;
                 if(dnsel&&dnsel[s]>0){cuda_core=0;break;}
                 cuda_core=0;
-                if(g_cuda_pipe&&ks==m->kv&&layer<c->n_layers&&kv_dev_sync(m,l,layer,pos+1))
+                if(g_cuda_pipe&&!kvs&&layer<c->n_layers&&kv_dev_sync(m,l,ks,layer,pos+1))
                     cuda_core=coli_cuda_attention_absorb_kvdev(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
-                        Q+(int64_t)s*H*qh,m->kv_dev_L[layer]+(size_t)st0*kvl,
-                        m->kv_dev_R[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
+                        Q+(int64_t)s*H*qh,ks->cuda_Lc[layer]+(size_t)st0*kvl,
+                        ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
                 if(!cuda_core)
                     cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
@@ -4016,11 +4025,15 @@ static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c;
     KVState *k=m->kv;
 #ifdef COLI_CUDA
-    if(m->kv_dev_L) for(int i=0;i<c->n_layers+1;i++){    /* dimensioni cambiate: ombra da rifare */
-        if(m->kv_dev_L[i]){ coli_cuda_pipe_free(m->L[i<c->n_layers?i:0].kv_b.cuda_device,m->kv_dev_L[i]); m->kv_dev_L[i]=NULL; }
-        if(m->kv_dev_R[i]){ coli_cuda_pipe_free(m->L[i<c->n_layers?i:0].kv_b.cuda_device,m->kv_dev_R[i]); m->kv_dev_R[i]=NULL; }
-        m->kv_dev_valid[i]=0;
+    if(k->cuda_Lc) for(int i=0;i<c->n_layers;i++){
+        int dev=m->L[i].kv_b.cuda_device;
+        if(k->cuda_Lc[i]) coli_cuda_pipe_free(dev,k->cuda_Lc[i]);
+        if(k->cuda_Rc[i]) coli_cuda_pipe_free(dev,k->cuda_Rc[i]);
     }
+    free(k->cuda_Lc);free(k->cuda_Rc);free(k->cuda_valid);
+    k->cuda_Lc=calloc(c->n_layers,sizeof(float*));
+    k->cuda_Rc=calloc(c->n_layers,sizeof(float*));
+    k->cuda_valid=calloc(c->n_layers,sizeof(int));
 #endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
@@ -4054,8 +4067,6 @@ static void kv_alloc(Model *m, int max_t){
 }
 
 static void kv_bind(Model *m, KVState *k){
-    if(m->kv!=k && m->kv_dev_valid)                 /* ombra legata al KVState corrente */
-        for(int i=0;i<m->c.n_layers+1;i++) m->kv_dev_valid[i]=0;
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
 }
@@ -5139,6 +5150,14 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     KVState *k=&s->kv; int NR=m->c.n_layers+1;
     if(k->disk_fp){ fclose(k->disk_fp); k->disk_fp=NULL; }
     free(k->disk_buf); k->disk_buf=NULL;
+#ifdef COLI_CUDA
+    if(k->cuda_Lc) for(int i=0;i<m->c.n_layers;i++){
+        int dev=m->L[i].kv_b.cuda_device;
+        if(k->cuda_Lc[i]) coli_cuda_pipe_free(dev,k->cuda_Lc[i]);
+        if(k->cuda_Rc[i]) coli_cuda_pipe_free(dev,k->cuda_Rc[i]);
+    }
+    free(k->cuda_Lc);free(k->cuda_Rc);free(k->cuda_valid);
+#endif
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);

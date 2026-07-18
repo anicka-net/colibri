@@ -112,6 +112,13 @@ class ProtocolTest(unittest.TestCase):
         finally:
             listener.close()
 
+    def test_engine_passes_quantization_bits(self):
+        process = FakeProcess(lambda _process, _frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process) as popen:
+            engine = Engine("glm", "model", cap=64, expert_bits=4, dense_bits=4)
+        self.assertEqual(popen.call_args.args[0], ["glm", "64", "4", "4"])
+        engine.close()
+
 
 class SchedulerTest(unittest.TestCase):
     def test_admits_up_to_capacity_without_serializing(self):
