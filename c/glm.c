@@ -2480,6 +2480,7 @@ static const float *g_cuda_pre_logits=NULL;
 static float *g_group_accum_xdev=NULL;        /* pipe path: routed experts accumulate on-device into x_dev */
 static int g_group_accum_home=-1;  /* router logits computed on-device by the fused chain */
 static float chain_scores[4*512];             /* fused-chain router logits [S,E], S<=4 */
+static float chain_xn[4*8192];                /* fused-chain in_ln rows [S,D] for DSA k_idx */
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
     static float *cache[8][256]; static int cdev[8][256];
     if(layer<0||layer>=256||slot<0||slot>=8) return NULL;
@@ -3919,7 +3920,9 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     /* Fused chain fast path: whole attention section in one backend call, KV
      * device-resident, single sync.  DSA-indexer layers and non-int4 weights
      * fall back to the op-by-op path below. */
-    if(S<=4 && li<c->n_layers && !(m->has_dsa && c->idx_type[li]) &&
+    int dsa_idx_layer = m->has_dsa && li<c->n_layers && c->idx_type[li];
+    if(S<=4 && li<c->n_layers &&
+       !(dsa_idx_layer && (g_dsa_force || m->kv_start[li]!=0)) &&
        kv_dev_sync(m,l,m->kv,li,pos_base)){
         int kvl=c->kv_lora, R=c->qk_rope;
         float *cw1=pipe_ln_cache(dev,li,0,l->q_a_ln,(size_t)c->q_lora);
@@ -3935,10 +3938,19 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                c->n_experts,chain_scores,
                g_fuse_shared?l->sh_gate.cuda:NULL,
                g_fuse_shared?l->sh_up.cuda:NULL,
-               g_fuse_shared?l->sh_down.cuda:NULL,sI)){
+               g_fuse_shared?l->sh_down.cuda:NULL,sI,
+               dsa_idx_layer?chain_xn:NULL)){
             m->kv->cuda_valid[li]=pos_base+S;
             if(!isnan(chain_scores[0])) chain_pre_logits=1;
             if(g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda) chain_did_shared=1;
+            if(dsa_idx_layer){           /* index keys for future top-k selection */
+                for(int s=0;s<S;s++){ int pos=pos_base+s;
+                    float *kd=m->Ic[li]+(int64_t)pos*c->index_hd;
+                    matmul_qt(kd, chain_xn+(int64_t)s*D, &m->ix_wk[li], 1);
+                    layernorm(kd, m->ix_knw[li], m->ix_knb[li], c->index_hd, 1e-6f);
+                    rope_interleave(kd, pos, c);
+                }
+            }
             m->t_attn+=now_s()-ta;
             goto attn_done;
         }

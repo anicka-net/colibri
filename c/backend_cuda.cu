@@ -1427,7 +1427,7 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
         float eps, float theta, float attn_scale,
         const float *d_router, int E, float *scores_host,
         const ColiCudaTensor *shg, const ColiCudaTensor *shu,
-        const ColiCudaTensor *shd, int sI) {
+        const ColiCudaTensor *shd, int sI, float *xn_host) {
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!select_ctx(ctx)) return 0;
     if(qa->fmt!=2||qb->fmt!=2||kva->fmt!=2||kvb->fmt!=2||o_proj->fmt!=2) return 0;
@@ -1435,7 +1435,7 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     int T=pos_base+S-kv_start;
     size_t abs_smem=(size_t)(kv_lora+T)*sizeof(float)+8*sizeof(float);
     if(abs_smem>200u*1024u) return 0;   /* score window no longer smem-resident */
-    float *xn  =coli_cuda_pipe_scratch(device,22,(size_t)D*4);
+    float *xn  =coli_cuda_pipe_scratch(device,22,(size_t)S*D*4);
     float *qres=coli_cuda_pipe_scratch(device,23,(size_t)q_lora*4);
     float *qQ  =coli_cuda_pipe_scratch(device,24,(size_t)H*qh*4);
     float *comp=coli_cuda_pipe_scratch(device,25,(size_t)kva_O*4);
@@ -1455,10 +1455,11 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         const float *xrow=x_dev+(size_t)s*D;
-        rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(xn,xrow,w_in,D,eps);
-        gemv_q4<<<((unsigned)q_lora+7)/8,256,smem_D>>>(qres,xn,
+        float *xns=xn+(size_t)s*D;
+        rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(xns,xrow,w_in,D,eps);
+        gemv_q4<<<((unsigned)q_lora+7)/8,256,smem_D>>>(qres,xns,
             (const uint8_t*)qa->weights,qa->scales,D,q_lora);
-        gemv_q4<<<((unsigned)kva_O+7)/8,256,smem_D>>>(comp,xn,
+        gemv_q4<<<((unsigned)kva_O+7)/8,256,smem_D>>>(comp,xns,
             (const uint8_t*)kva->weights,kva->scales,D,kva_O);
         { int th=q_lora<256?q_lora:256;
           rmsnorm_kernel<<<1,th,(size_t)th*sizeof(float)>>>(qres,qres,w_qa,q_lora,eps); }
@@ -1507,6 +1508,7 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
             gemv_f32_kernel<<<(unsigned)E,256>>>(sc+(size_t)s*E,nrm_dev+(size_t)s*D,d_router,D,E);
     }
     /* single sync point: the canonical-host downloads */
+    if(xn_host&&cudaMemcpy(xn_host,xn,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(cudaMemcpy(nrm_host,nrm_dev,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(sc&&cudaMemcpy(scores_host,sc,(size_t)S*E*4,cudaMemcpyDeviceToHost)!=cudaSuccess) sc=NULL;
     if(d_router&&scores_host&&E>0&&!sc) scores_host[0]=NAN;   /* signal: no scores, caller recomputes */
