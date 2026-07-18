@@ -126,6 +126,16 @@ Removing the separate CUDA tier did not help: cap 36 holds fewer total experts
 than the hybrid profile and produced the same ~24.8s warm latency.  `DRAFT=1`
 adds a further ~9% on the direct 32-token run (1.61 -> 1.76 tok/s).
 
+The published short-context Spark result is now reproduced on current main.
+With `CTX=4096`, cap 63, no separate CUDA tier, host-backed experts and pipe2,
+strict top-8 reaches **3.27 tok/s** over 208 tokens (89% hit).  `CACHE_ROUTE`
+J2/M12 reaches **4.74 tok/s** (96.3% hit) by substituting 12.9% of route slots;
+top-8 agreement is 87.1%, so keep this labelled as a quality-changing mode.
+Safe `DRAFT=1` does not improve either condition: strict falls to 1.65 tok/s
+because miss-containing groups must complete before their host slabs can be
+reused, while CACHE_ROUTE remains 4.74 tok/s.  Host-wrapping the int8 MTP
+experts removes the CPU fallback but does not change that verdict.
+
 ## Measured dead ends (do not revisit without new evidence)
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).

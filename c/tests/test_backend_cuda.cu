@@ -95,6 +95,23 @@ int main(int argc, char **argv) {
     if (!coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,x,nullptr,nullptr,0,0) ||
         !close_enough(grouped,want_expert,8)) return 1;
 
+    const int8_t q8d[8]={1,0, 0,1, 1,1, 1,-1};const float s8d[4]={1,1,1,1};
+    ColiCudaTensor *d8=nullptr;float device8[8],host8[8];
+    if(!coli_cuda_tensor_upload(&d8,q8d,s8d,1,2,4,d0))return 1;
+    ColiCudaTensor *gg8[2]={t8,t8},*ug8[2]={t8,t8},*dg8[2]={d8,d8};
+    if(!coli_cuda_expert_group(gg8,ug8,dg8,group_rows,2,device8,x,nullptr,nullptr,0,0))return 1;
+    ColiCudaTensor *hg8=nullptr,*hu8=nullptr,*hd8=nullptr;
+    int host8_ok=coli_cuda_tensor_wrap_host(&hg8,q8b,s8b,1,4,2,d0)&&
+                 coli_cuda_tensor_wrap_host(&hu8,q8b,s8b,1,4,2,d0)&&
+                 coli_cuda_tensor_wrap_host(&hd8,q8d,s8d,1,2,4,d0);
+    if(host8_ok){
+        ColiCudaTensor *hgg8[2]={hg8,hg8},*hug8[2]={hu8,hu8},*hdg8[2]={hd8,hd8};
+        if(!coli_cuda_expert_group(hgg8,hug8,hdg8,group_rows,2,host8,x,nullptr,nullptr,0,0)||
+           !close_enough(host8,device8,8))return 1;
+    }
+    coli_cuda_tensor_free(hg8);coli_cuda_tensor_free(hu8);coli_cuda_tensor_free(hd8);
+    coli_cuda_tensor_free(d8);
+
     const float aw[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     const float aq[4]={1,2,.5f,-.5f},al[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
     const float ar[6]={1,0, 0,1, 1,1};float actx[2],aref[2];
@@ -141,7 +158,7 @@ int main(int argc, char **argv) {
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    uint64_t want_groups=host_ok?4:3;
+    uint64_t want_groups=4+(host8_ok?1:0)+(host_ok?1:0);
     if(group_calls!=want_groups||group_experts!=want_groups*2||group_total_rows!=want_groups*2) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);
