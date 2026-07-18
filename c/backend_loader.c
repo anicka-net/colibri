@@ -40,12 +40,16 @@ typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up
                                         ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
-                                          float *y, const float *x);
+                                          float *y, const float *x, const float *wrow,
+                                          const int *tokrow, int S_tok, int accum_ok);
+typedef int            (*fn_expert_group_collect)(int device, int home_device, float *x_dev, int D);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
+typedef int            (*fn_tensor_wrap_host)(ColiCudaTensor **tensor, const void *weights,
+                                              const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device);
@@ -111,8 +115,10 @@ static struct {
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
+    fn_expert_group_collect expert_group_collect;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
+    fn_tensor_wrap_host tensor_wrap_host;
     fn_matmul          matmul;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -206,8 +212,10 @@ static int coli_cuda_load(void){
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
+    RESOLVE(expert_group_collect, fn_expert_group_collect)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
+    RESOLVE(tensor_wrap_host, fn_tensor_wrap_host)
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -297,9 +305,15 @@ int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
 
 int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs, const int *rows, int count,
-                           float *y, const float *x){
+                           float *y, const float *x, const float *wrow,
+                           const int *tokrow, int S_tok, int accum_ok){
     if(!g_cuda.available) return 0;
-    return g_cuda.expert_group(gates, ups, downs, rows, count, y, x);
+    return g_cuda.expert_group(gates,ups,downs,rows,count,y,x,wrow,tokrow,S_tok,accum_ok);
+}
+
+int coli_cuda_expert_group_collect(int device,int home_device,float *x_dev,int D){
+    if(!g_cuda.available) return 0;
+    return g_cuda.expert_group_collect(device,home_device,x_dev,D);
 }
 
 int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,
@@ -313,6 +327,12 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
                             const float *scales, int fmt, int I, int O, int device){
     if(!g_cuda.available) return 0;
     return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device);
+}
+
+int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor, const void *weights,
+                               const float *scales, int fmt, int I, int O, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.tensor_wrap_host(tensor, weights, scales, fmt, I, O, device);
 }
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,

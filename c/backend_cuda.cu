@@ -19,6 +19,7 @@ struct ColiCudaTensor {
     size_t weight_bytes;
     int fmt, I, O, device;
     int tracked;
+    int host_backed;
 };
 
 typedef struct {
@@ -42,6 +43,7 @@ typedef struct {
 typedef struct {
     const void *g,*u,*d; const float *gs,*us,*ds;
     int gf,uf,df,rows,offset;
+    int go,uo,dof;
 } GroupDesc;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -94,6 +96,17 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
     }
     uint8_t v = q[i >> 2];
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
+}
+
+__device__ static float group_weight_at(const void *weights,int fmt,size_t row,int i,int offset_s4){
+    if(fmt!=2||!offset_s4)return weight_at(weights,fmt,row,i);
+    const uint8_t v=static_cast<const uint8_t*>(weights)[row+(i>>1)];
+    const int n=(i&1)?v>>4:v&15;
+    return static_cast<float>(n-8);
+}
+
+__device__ static float decode_group_s4(int n,int offset_s4){
+    return static_cast<float>(offset_s4?n-8:(n^8)-8);
 }
 
 __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
@@ -236,8 +249,9 @@ __global__ static void grouped_hidden(float *y,const float *x,const GroupDesc *d
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z; GroupDesc d=desc[c];
     if(s>=d.rows) return;
     const void *w=which?d.u:d.g; const float *sc=which?d.us:d.gs; int fmt=which?d.uf:d.gf;
+    int off=which?d.uo:d.go;
     size_t rb=row_bytes(fmt,D),row=(size_t)o*rb; const float *xs=x+(size_t)(d.offset+s)*D;
-    float sum=0; for(int i=threadIdx.x;i<D;i+=blockDim.x) sum+=xs[i]*weight_at(w,fmt,row,i);
+    float sum=0; for(int i=threadIdx.x;i<D;i+=blockDim.x) sum+=xs[i]*group_weight_at(w,fmt,row,i,off);
     __shared__ float p[256]; p[threadIdx.x]=sum; __syncthreads();
     for(int n=128;n;n>>=1){ if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n]; __syncthreads(); }
     if(!threadIdx.x) y[(size_t)(d.offset+s)*I+o]=p[0]*(fmt?sc[o]:1.f);
@@ -247,14 +261,16 @@ __global__ static void grouped_down(float *y,const float *x,const GroupDesc *des
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z; GroupDesc d=desc[c];
     if(s>=d.rows) return;
     size_t rb=row_bytes(d.df,I),row=(size_t)o*rb; const float *xs=x+(size_t)(d.offset+s)*I;
-    float sum=0; for(int i=threadIdx.x;i<I;i+=blockDim.x) sum+=xs[i]*weight_at(d.d,d.df,row,i);
+    float sum=0; for(int i=threadIdx.x;i<I;i+=blockDim.x) sum+=xs[i]*group_weight_at(d.d,d.df,row,i,d.dof);
     __shared__ float p[256]; p[threadIdx.x]=sum; __syncthreads();
     for(int n=128;n;n>>=1){ if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n]; __syncthreads(); }
     if(!threadIdx.x) y[(size_t)(d.offset+s)*D+o]=p[0]*(d.df?d.ds[o]:1.f);
 }
 
-__device__ static void unpack_s4(uint8_t v,float *lo,float *hi){
-    int a=v&15,b=v>>4; *lo=(float)(a&8?a-16:a); *hi=(float)(b&8?b-16:b);
+__device__ static void unpack_s4(uint8_t v,int offset,float *lo,float *hi){
+    int a=v&15,b=v>>4;
+    *lo=(float)(offset?(a-8):(a&8?a-16:a));
+    *hi=(float)(offset?(b-8):(b&8?b-16:b));
 }
 
 /* Exact low-row W4A32 path. It consumes each packed weight byte once instead
@@ -264,7 +280,8 @@ __global__ static void grouped_hidden_w4(float *y,const float *x,const GroupDesc
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *w=(const uint8_t*)(which?d.u:d.g);const float *sc=which?d.us:d.gs;
     const uint8_t *row=w+(size_t)o*((D+1)/2);const float *xs=x+(size_t)(d.offset+s)*D;
-    float sum=0;for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],&a,&z);
+    int off=which?d.uo:d.go;
+    float sum=0;for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],off,&a,&z);
         int i=b*2;sum+=xs[i]*a;if(i+1<D)sum+=xs[i+1]*z;}
     __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
@@ -277,7 +294,7 @@ __global__ static void grouped_hidden_w4_dual(float *gate,float *up,const float 
     const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*((D+1)/2);
     const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*((D+1)/2);
     const float *xs=x+(size_t)(d.offset+s)*D;float ga=0,ua=0;
-    for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float g0,g1,u0,u1;unpack_s4(gr[b],&g0,&g1);unpack_s4(ur[b],&u0,&u1);
+    for(int b=threadIdx.x;b<(D+1)/2;b+=blockDim.x){float g0,g1,u0,u1;unpack_s4(gr[b],d.go,&g0,&g1);unpack_s4(ur[b],d.uo,&u0,&u1);
         int i=b*2;ga+=xs[i]*g0;ua+=xs[i]*u0;if(i+1<D){ga+=xs[i+1]*g1;ua+=xs[i+1]*u1;}}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
@@ -288,7 +305,7 @@ __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
     const uint8_t *row=(const uint8_t*)d.d+(size_t)o*((I+1)/2);
     const float *xs=x+(size_t)(d.offset+s)*I;float sum=0;
-    for(int b=threadIdx.x;b<(I+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],&a,&z);
+    for(int b=threadIdx.x;b<(I+1)/2;b+=blockDim.x){float a,z;unpack_s4(row[b],d.dof,&a,&z);
         int i=b*2;sum+=xs[i]*a;if(i+1<I)sum+=xs[i+1]*z;}
     __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
@@ -569,10 +586,29 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
+extern "C" int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor,
+                                           const void *weights,const float *scales,
+                                           int fmt,int I,int O,int device){
+    DeviceContext *ctx=find_ctx(device);
+    if(!tensor||*tensor||!weights||I<1||O<1||!select_ctx(ctx))return 0;
+    size_t rb=row_bytes(fmt,I);
+    if(!rb||(fmt&&!scales))return 0;
+    int pageable=0,host_pt=0;
+    if(cudaDeviceGetAttribute(&pageable,cudaDevAttrPageableMemoryAccess,device)!=cudaSuccess||
+       cudaDeviceGetAttribute(&host_pt,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device)!=cudaSuccess||
+       !pageable||!host_pt)return 0;
+    ColiCudaTensor *t=static_cast<ColiCudaTensor*>(std::calloc(1,sizeof(*t)));
+    if(!t)return 0;
+    t->weights=const_cast<void*>(weights);t->scales=const_cast<float*>(scales);
+    t->weight_bytes=rb*(size_t)O;t->fmt=fmt;t->I=I;t->O=O;t->device=device;t->host_backed=1;
+    *tensor=t;
+    return 1;
+}
+
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (!tensor || !weights || (tensor->fmt && !scales)) return 0;
+    if (!tensor || tensor->host_backed || !weights || (tensor->fmt && !scales)) return 0;
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
     if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
@@ -705,8 +741,8 @@ template<int RMAX> __global__ static void grouped_gemv_q4_dual(float *__restrict
         const int e = b * 2;
         #pragma unroll
         for (int k = 0; k < 8; k++) {
-            float wg = (float)(((int)((pg >> (4 * k)) & 0xF) ^ 8) - 8);
-            float wu = (float)(((int)((pu >> (4 * k)) & 0xF) ^ 8) - 8);
+            float wg=decode_group_s4((int)((pg>>(4*k))&0xF),d.go);
+            float wu=decode_group_s4((int)((pu>>(4*k))&0xF),d.uo);
             #pragma unroll
             for (int j = 0; j < RMAX; j++) if (RMAX == 1 || j < r) {
                 float xv = __half2float(sx[j * I_in + e + k]);
@@ -749,7 +785,7 @@ template<int RMAX> __global__ static void grouped_gemv_q4_down(float *__restrict
         const int e = b * 2;
         #pragma unroll
         for (int k = 0; k < 8; k++) {
-            float w = (float)(((int)((p >> (4 * k)) & 0xF) ^ 8) - 8);
+            float w=decode_group_s4((int)((p>>(4*k))&0xF),d.dof);
             #pragma unroll
             for (int j = 0; j < RMAX; j++) if (RMAX == 1 || j < r)
                 sum[j] += __half2float(sx[j * I_in + e + k]) * w;
@@ -774,14 +810,16 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1;
+    int all_s4=1,all_device=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
            g->I!=D||u->I!=D||g->O!=I||u->O!=I||d->I!=I||d->O!=D) return 0;
         host[c]={g->weights,u->weights,d->weights,g->scales,u->scales,d->scales,
-                 g->fmt,u->fmt,d->fmt,rows[c],total};
+                 g->fmt,u->fmt,d->fmt,rows[c],total,
+                 g->host_backed,u->host_backed,d->host_backed};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        all_device&=!g->host_backed&&!u->host_backed&&!d->host_backed;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
@@ -807,7 +845,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
-    tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
+    tc=tc&&all_s4&&all_device&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(tc){
@@ -821,7 +859,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         quantize_s4_rows<<<total,256,0,ctx->stream>>>(ctx->qx,ctx->qscale,ctx->gate,total,I);
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
-    }else if(all_s4&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
+    }else if(all_s4&&all_device&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
              atoi(getenv("COLI_CUDA_TC_W4A16"))){
         /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al
          * contrario del path W4A4), un lancio per expert dentro lo stream —
@@ -853,7 +891,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
             }
             off16+=r;
         }
-    }else if(all_s4&&max_rows<=4&&(size_t)max_rows*D*sizeof(__half)<=49152&&
+    }else if(all_s4&&D%8==0&&I%8==0&&max_rows<=4&&(size_t)max_rows*D*sizeof(__half)<=49152&&
              (!getenv("COLI_CUDA_DECODE_GEMV")||atoi(getenv("COLI_CUDA_DECODE_GEMV")))){
         /* Decode shape (one row per expert): the grouped block-per-output kernels
          * reach ~14% of HBM peak here; the warp-per-8-rows gemv_q4 (already
@@ -1053,8 +1091,8 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
-    if (tensor->weights) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (!tensor->host_backed && tensor->weights) cudaFree(tensor->weights);
+    if (!tensor->host_backed && tensor->scales) cudaFree(tensor->scales);
     std::free(tensor);
 }
 
