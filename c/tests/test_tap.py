@@ -38,7 +38,8 @@ def run_engine(env_extra):
     if out.returncode != 0:
         sys.exit(f"engine exited {out.returncode}:\n{out.stdout}\n{out.stderr}")
     for line in out.stdout.splitlines():
-        if line.startswith("Motore C GLM"):
+        # "Motore C GLM" pre-#67, "GLM C engine      :" after the English translation
+        if line.startswith(("Motore C GLM", "GLM C engine ")):
             return line
     sys.exit(f"engine produced no generation line:\n{out.stdout}\n{out.stderr}")
 
