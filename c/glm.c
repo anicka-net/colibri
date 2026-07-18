@@ -2481,8 +2481,8 @@ static int g_fuse_shared=-1;                  /* COLI_FUSE_SHARED=1: shared expe
 static const float *g_cuda_pre_logits=NULL;
 static float *g_group_accum_xdev=NULL;        /* pipe path: routed experts accumulate on-device into x_dev */
 static int g_group_accum_home=-1;  /* router logits computed on-device by the fused chain */
-static float chain_scores[4*512];             /* fused-chain router logits [S,E], S<=4 */
-static float chain_xn[4*8192];                /* fused-chain in_ln rows [S,D] for DSA k_idx */
+static float *chain_scores=NULL; size_t chain_scores_cap=0; /* fused-chain router logits [S,E] */
+static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln rows [S,D] for DSA k_idx */
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
     static float *cache[8][256]; static int cdev[8][256];
     if(layer<0||layer>=256||slot<0||slot>=8) return NULL;
@@ -3929,6 +3929,21 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(S<=4 && li<c->n_layers &&
        !(dsa_idx_layer && (g_dsa_force || m->kv_start[li]!=0)) &&
        kv_dev_sync(m,l,m->kv,li,pos_base)){
+        size_t scores_n=(size_t)S*c->n_experts;
+        if(scores_n>chain_scores_cap){
+            float *p=realloc(chain_scores,scores_n*sizeof(float));
+            if(!p) return 0;
+            chain_scores=p; chain_scores_cap=scores_n;
+        }
+        chain_scores[0]=NAN;                  /* missing router cache -> CPU routing fallback */
+        if(dsa_idx_layer){
+            size_t xn_n=(size_t)S*D;
+            if(xn_n>chain_xn_cap){
+                float *p=realloc(chain_xn,xn_n*sizeof(float));
+                if(!p) return 0;
+                chain_xn=p; chain_xn_cap=xn_n;
+            }
+        }
         int kvl=c->kv_lora, R=c->qk_rope;
         float *cw1=pipe_ln_cache(dev,li,0,l->q_a_ln,(size_t)c->q_lora);
         float *cw2=pipe_ln_cache(dev,li,1,l->kv_a_ln,(size_t)kvl);
@@ -6187,11 +6202,11 @@ static void pin_load(Model *m, const char *statspath, double gb){
          * Split it: assign devices first (serial bookkeeping, projected sizes),
          * then upload with one thread per device, then account serially. */
         int *assign=malloc((size_t)gpu_limit*sizeof(int));
+        for(int a=0;a<gpu_limit;a++) assign[a]=-1;
         { double proj=0;
           for(int a=0;a<gpu_limit;a++){
             ESlot *s=&m->pin[r[a].l][slot_of[a]];
             int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-            assign[a]=-1;
             if(proj+need>budget) break;
             int best=-1;
             for(int i=0;i<g_cuda_ndev;i++) if(remaining[i]>=need &&
