@@ -96,7 +96,7 @@ typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
-    int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
+    int stop_ids[64], n_stop;                    /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
@@ -1364,8 +1364,12 @@ static void load_cfg(Cfg *c, const char *snap){
     c->n_stop=0;
     jval *eo=json_get(r,"eos_token_id");
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
-            else if(eo->t==J_ARR) for(int i=0;i<eo->len && c->n_stop<8;i++)
-                c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
+            else if(eo->t==J_ARR){
+                for(int i=0;i<eo->len && c->n_stop<64;i++)
+                    c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num;
+                if(eo->len>64) fprintf(stderr,
+                    "[stop] warning: config.json declares %d eos tokens; only 64 fit\n",eo->len);
+            } }
     /* generation_config.json e' il file AUTOREVOLE per la generazione secondo HuggingFace:
      * config.json ne porta spesso una copia legacy o parziale. Un tool di conversione che
      * rigenera un config.json ridotto lascia il motore fermo su MENO stop del dovuto, e i
@@ -1379,17 +1383,26 @@ static void load_cfg(Cfg *c, const char *snap){
       if(gf){
         fseek(gf,0,SEEK_END); long gn=ftell(gf); fseek(gf,0,SEEK_SET);
         if(gn>0){
-            char *gb=malloc(gn+1); size_t gg=fread(gb,1,gn,gf); gb[gg]=0;
+            char *gb=malloc(gn+1);
+            if(!gb){ fprintf(stderr,"out of memory reading %s\n",gp); fclose(gf); exit(1); }
+            size_t gg=fread(gb,1,gn,gf); gb[gg]=0;
             char *ga=NULL; jval *gr=json_parse(gb,&ga);
             jval *ge=gr?json_get(gr,"eos_token_id"):NULL;
             if(ge){
-                int add[8], na=0;
+                int add[64], na=0;
                 if(ge->t==J_NUM) add[na++]=(int)ge->num;
-                else if(ge->t==J_ARR) for(int i=0;i<ge->len && na<8;i++) add[na++]=(int)ge->kids[i]->num;
-                for(int i=0;i<na && c->n_stop<8;i++){
+                else if(ge->t==J_ARR){
+                    for(int i=0;i<ge->len && na<64;i++) add[na++]=(int)ge->kids[i]->num;
+                    if(ge->len>64) fprintf(stderr,
+                        "[stop] warning: generation_config.json declares %d eos tokens; only 64 fit\n",
+                        ge->len);
+                }
+                for(int i=0;i<na && c->n_stop<64;i++){
                     int dup=0; for(int j=0;j<c->n_stop;j++) if(c->stop_ids[j]==add[i]) dup=1;
                     if(!dup) c->stop_ids[c->n_stop++]=add[i];
                 }
+                if(na && c->n_stop==64) fprintf(stderr,
+                    "[stop] warning: merged eos token set reached its 64-token limit\n");
             }
             free(ga); free(gb);
         }
@@ -4193,8 +4206,17 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
  * Catena DeepSeek-V3: h' = Layer78( eh_proj[ enorm(emb(tok)) ; hnorm(h) ] ),
  * draft = argmax(lm_head(shared_head.norm(h'))). La KV del layer MTP vive alla riga n_layers
  * ed e' valida da kv_start (niente prefill: finestra di solo-decode, basta per il draft). */
+static int finite_argmax(const float *lo, int V){
+    int b=-1; float bv=0;
+    for(int i=0;i<V;i++) if(isfinite(lo[i]) && (b<0 || lo[i]>bv)){ bv=lo[i]; b=i; }
+    if(b>=0) return b;
+    static int warned=0;
+    if(!warned){ warned=1; fprintf(stderr,
+        "[SAMPLE] warning: all logits are non-finite; falling back to token 0\n"); }
+    return 0;
+}
 static int mtp_argmax(const float *lo, int V){
-    int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
+    return finite_argmax(lo,V);
 }
 static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
@@ -4260,7 +4282,7 @@ static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int
 }
 
 static inline int argmax_v(const float *lo, int V){
-    int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
+    return finite_argmax(lo,V);
 }
 
 /* ---- METODO F: draft grammaticale (#48) ----
@@ -4422,15 +4444,15 @@ static int pick_tok(const float *lo, int V, int ban){
 
 /* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
-static int g_stop[64], g_nstop=0;   /* config eos + ogni added-token "special" del tokenizer */
+static int g_stop[256], g_nstop=0;  /* config eos + ogni added-token "special" del tokenizer */
 static void repin_pass_limit(Model *m,int limit);
 static void repin_pass(Model *m){ repin_pass_limit(m,16); }
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
 /* T=NULL -> solo gli stop del config (validazione/oracolo, dove il tokenizer non serve). */
 static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     g_nstop=0;
-    for(int i=0;i<c->n_stop && g_nstop<64;i++) g_stop[g_nstop++]=c->stop_ids[i];
-    if(tok_eos>=0 && !is_stop(tok_eos) && g_nstop<64) g_stop[g_nstop++]=tok_eos;
+    for(int i=0;i<c->n_stop && g_nstop<256;i++) g_stop[g_nstop++]=c->stop_ids[i];
+    if(tok_eos>=0 && !is_stop(tok_eos) && g_nstop<256) g_stop[g_nstop++]=tok_eos;
     int nsp=0;
     /* DIFESA IN PROFONDITA' (woolcoxm, #298): il tokenizer marca "special":true i token di
      * CONTROLLO -- <|user|>, <|assistant|>, <|observation|>, <sop>, [gMASK], i marker
@@ -4442,8 +4464,10 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
      * Fidarsi del config di pesi convertiti da terzi e' precisamente cio' che non
      * possiamo controllare; il flag del tokenizer lo possiamo leggere.
      * NB: <think>/<tool_call>/<arg_key> hanno "special":false e restano contenuto vero. */
-    if(T) for(int id=0; id<T->n_ids && g_nstop<64; id++)
+    if(T) for(int id=0; id<T->n_ids && g_nstop<256; id++)
         if(T->id_special[id] && !is_stop(id)){ g_stop[g_nstop++]=id; nsp++; }
+    if(T && g_nstop==256) fprintf(stderr,
+        "[stop] warning: tokenizer special-token sweep reached its 256-token limit\n");
     fprintf(stderr,"[stop] %d stop tokens:",g_nstop);
     for(int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]);
     if(nsp) fprintf(stderr," (%d from the tokenizer's special set)",nsp);

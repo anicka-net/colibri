@@ -744,19 +744,33 @@ def cmd_chat(a):
         except Exception: pass
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
-def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
+def serve_pidfile(port):
+    root = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "colibri")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    return os.path.join(root, f"serve-{port}.pid")
+
+def write_pidfile(path, model):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"{os.getpid()} {model}\n")
+
+def is_serve_argv(argv):
+    return any(os.path.basename(os.fsdecode(argv[i])) == "coli" and
+               os.fsdecode(argv[i + 1]) == "serve" for i in range(len(argv) - 1))
 
 def cmd_serve(a):
     need_model(a.model)
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
     try:
-        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+        write_pidfile(serve_pidfile(a.port), a.model)
     except OSError: pass
     from openai_server import serve
     try:
+        engine_env=env_for(a); engine_env["COLI_MODE"]="serve"
         serve(a.model, a.host, a.port, a.model_id, a.api_key,
-              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+              a.cap,a.ngen,GLM,engine_env,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,
               expert_bits=a.expert_bits,dense_bits=a.dense_bits,
               model_aliases=a.model_alias,hidden_model_aliases=a.hidden_model_alias,
@@ -781,17 +795,21 @@ def cmd_stop(a):
         pid=int(open(pf).read().split()[0])
         os.kill(pid,0); targets.append((pid,f"coli serve (pidfile, port {a.port})"))
     except (OSError,ValueError,IndexError): pass
-    for pd in os.listdir("/proc"):
+    for pd in os.listdir("/proc") if os.path.isdir("/proc") else ():
         if not pd.isdigit(): continue
         pid=int(pd)
         try:
-            cmd=open(f"/proc/{pd}/cmdline","rb").read().replace(b"\0",b" ").decode("utf-8","replace")
-            if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
+            argv=[arg for arg in open(f"/proc/{pd}/cmdline","rb").read().split(b"\0") if arg]
+            if is_serve_argv(argv) and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
             if comm in ("glm","exe","olmoe"):
-                env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
-                if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
+                env=dict(item.split(b"=",1) for item in
+                         open(f"/proc/{pd}/environ","rb").read().split(b"\0") if b"=" in item)
+                if (env.get(b"SERVE")==b"1" and env.get(b"COLI_MODE")==b"serve" and
+                        os.fsdecode(env.get(b"SNAP",b""))==a.model and
+                        not any(p==pid for p,_ in targets)):
+                    targets.append((pid,f"engine `{comm}` (serve, matching model)"))
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return

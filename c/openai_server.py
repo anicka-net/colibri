@@ -28,6 +28,9 @@ END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
 PROFILE_TURNS = 120           # rolling window of per-turn PROF snapshots kept for /profile
+RESPONSE_HISTORY_ENTRIES = 32
+RESPONSE_HISTORY_BYTES = 16 << 20
+PROMPT_BYTES_PER_TOKEN_LIMIT = 16
 DEFAULT_CORS_ORIGINS = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -180,10 +183,14 @@ def responses_messages(body, previous=()):
                                f"input.{index}")
             item_type = item.get("type")
             if item_type == "function_call":
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    raise APIError(400, "Responses function calls require a string `name`.",
+                                   f"input.{index}.name")
                 messages.append({"role": "assistant", "content": None, "tool_calls": [{
                     "id": item.get("call_id") or item.get("id") or "call_compat",
                     "type": "function",
-                    "function": {"name": item.get("name"),
+                    "function": {"name": name,
                                  "arguments": item.get("arguments", "{}")},
                 }]})
             elif item_type == "function_call_output":
@@ -260,9 +267,14 @@ def anthropic_messages(body):
                 message["tool_calls"] = calls
             messages.append(message)
         else:
-            if text:
-                messages.append({"role": "user", "content": "".join(text)})
-            messages.extend(results)
+            text_index = result_index = 0
+            for part in content:
+                if part.get("type") == "text":
+                    messages.append({"role": "user", "content": text[text_index]})
+                    text_index += 1
+                elif part.get("type") == "tool_result":
+                    messages.append(results[result_index])
+                    result_index += 1
     return messages
 
 
@@ -922,6 +934,7 @@ class APIServer(ThreadingHTTPServer):
         self.watchdog_active = 0
         self.response_history_lock = threading.Lock()
         self.response_history = collections.OrderedDict()
+        self.response_history_bytes = 0
 
     @contextlib.contextmanager
     def watchdog_request(self, active):
@@ -943,18 +956,26 @@ class APIServer(ThreadingHTTPServer):
         if response_id is None:
             return ()
         with self.response_history_lock:
-            messages = self.response_history.get(response_id)
-            if messages is None:
+            stored = self.response_history.get(response_id)
+            if stored is None:
                 raise APIError(404, f"The response `{response_id}` does not exist.",
                                "previous_response_id", "response_not_found")
-            return list(messages)
+            return list(stored[0])
 
     def remember_response(self, response_id, messages):
+        saved = list(messages)
+        size = len(json.dumps(saved, ensure_ascii=False, separators=(",", ":")).encode())
         with self.response_history_lock:
-            self.response_history[response_id] = list(messages)
+            old = self.response_history.pop(response_id, None)
+            if old:
+                self.response_history_bytes -= old[1]
+            self.response_history[response_id] = (saved, size)
+            self.response_history_bytes += size
             self.response_history.move_to_end(response_id)
-            while len(self.response_history) > 128:
-                self.response_history.popitem(last=False)
+            while (len(self.response_history) > RESPONSE_HISTORY_ENTRIES or
+                   self.response_history_bytes > RESPONSE_HISTORY_BYTES):
+                _key, (_messages, removed) = self.response_history.popitem(last=False)
+                self.response_history_bytes -= removed
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -983,7 +1004,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key")
         self.send_header("Access-Control-Expose-Headers",
                          "x-request-id, x-colibri-queue-wait-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
@@ -993,11 +1014,22 @@ class APIHandler(BaseHTTPRequestHandler):
     def require_auth(self):
         if self.server.api_key:
             import hmac
+            if hmac.compare_digest(self.headers.get("x-api-key", ""), self.server.api_key):
+                return
             provided = self.headers.get("Authorization", "")
             expected = f"Bearer {self.server.api_key}"
             if not hmac.compare_digest(provided, expected):
                 raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
                                "authentication_error")
+
+    def validate_prompt(self, prompt, body):
+        if not self.server.context_length:
+            return
+        maximum, _temperature, _top_p = generation_options(body, self.server.max_tokens)
+        input_limit = max(1, self.server.context_length - maximum)
+        if len(prompt.encode()) > input_limit * PROMPT_BYTES_PER_TOKEN_LIMIT:
+            raise APIError(400, "Rendered prompt exceeds the configured context window.",
+                           "messages", "context_length_exceeded")
 
     def read_json(self):
         try:
@@ -1076,6 +1108,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
+                self.require_auth()
                 eng = self.server.engine
                 payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
                            "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
@@ -1155,7 +1188,7 @@ class APIHandler(BaseHTTPRequestHandler):
         reasoning, text = split_reasoning("".join(output), thinking)
         return reasoning, text, stats, {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
 
-    def protocol_stream(self, body, prompt, request_id, consumer_factory, finish):
+    def protocol_stream(self, body, prompt, request_id, consumer_factory, finish, fail):
         maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -1199,17 +1232,27 @@ class APIHandler(BaseHTTPRequestHandler):
                     if time.time() - last_write[0] >= 10:
                         write(b": keep-alive\n\n")
 
-            consumer = consumer_factory(write)
             thread = threading.Thread(target=keepalive, daemon=True)
             thread.start()
-            stats = self.server.engine.generate(
-                prompt, maximum, temperature, top_p, consumer.feed, cache_slot,
-                lambda: not connected)
-            consumer.close()
-            stop.set()
-            thread.join(timeout=2)
-            finish(write, stats)
-            self.close_connection = True
+            consumer = None
+            try:
+                consumer = consumer_factory(write)
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, consumer.feed, cache_slot,
+                    lambda: not connected)
+                consumer.close()
+                finish(write, stats)
+            except ClientCancelled:
+                raise
+            except Exception as error:
+                self.log_error("stream generation failed: %s", error)
+                fail(write, error)
+            finally:
+                if consumer is not None:
+                    consumer.close()
+                stop.set()
+                thread.join(timeout=2)
+                self.close_connection = True
 
     def responses_api(self, body, request_id):
         normalized = dict(body)
@@ -1220,6 +1263,7 @@ class APIHandler(BaseHTTPRequestHandler):
         thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
         prompt = render_chat(normalized["messages"], thinking, effort,
                              normalized.get("tools"), normalized.get("tool_choice"))
+        self.validate_prompt(prompt, normalized)
         response_id = "resp_" + uuid.uuid4().hex[:24]
         message_id = "msg_" + uuid.uuid4().hex[:24]
         created = int(time.time())
@@ -1342,7 +1386,13 @@ class APIHandler(BaseHTTPRequestHandler):
             event(write, {"type": "response.completed", "response": {
                 "id": response_id, "object": "response", "created_at": created,
                 "status": "completed", "model": model, "output": output, "usage": usage}})
-        self.protocol_stream(normalized, prompt, request_id, factory, done)
+        def failed(write, _error):
+            event(write, {"type": "response.failed", "response": {
+                "id": response_id, "object": "response", "created_at": created,
+                "status": "failed", "model": model,
+                "error": {"code": "engine_error",
+                          "message": "The colibri engine failed to process the request."}}})
+        self.protocol_stream(normalized, prompt, request_id, factory, done, failed)
 
     def anthropic_message(self, body, request_id):
         normalized = dict(body)
@@ -1364,6 +1414,7 @@ class APIHandler(BaseHTTPRequestHandler):
         thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
         prompt = render_chat(normalized["messages"], thinking, effort,
                              normalized["tools"], normalized.get("tool_choice"))
+        self.validate_prompt(prompt, normalized)
         completion_id = "msg_" + uuid.uuid4().hex[:24]
         model = body["model"]
         tools = normalized["tools"]
@@ -1460,7 +1511,11 @@ class APIHandler(BaseHTTPRequestHandler):
                           "cache_read_input_tokens": 0,
                           "cache_creation_input_tokens": 0}})
             event(write, "message_stop", {"type": "message_stop"})
-        self.protocol_stream(normalized, prompt, request_id, factory, done)
+        def failed(write, _error):
+            event(write, "error", {"type": "error", "error": {
+                "type": "api_error",
+                "message": "The colibri engine failed to process the request."}})
+        self.protocol_stream(normalized, prompt, request_id, factory, done, failed)
 
     def generation(self, body, prompt, request_id, chat, thinking=False):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
@@ -1606,6 +1661,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 hold = len(BOX_START) - 1
                 raw = []
                 def emit_tools(chunk):
+                    raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
@@ -1622,7 +1678,6 @@ class APIHandler(BaseHTTPRequestHandler):
                         sp["buf"] = sp["buf"][flush:]
                 splitter = ReasoningStream(thinking, emit_reasoning, emit_tools)
                 def emit_tools_raw(chunk):
-                    raw.append(chunk)
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     splitter.feed(chunk)
@@ -1689,6 +1744,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
                              body.get("tool_choice"))
+        self.validate_prompt(prompt, body)
         self.generation(body, prompt, request_id, True, enable_thinking)
 
     def completion(self, body, request_id):
@@ -1697,6 +1753,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "Colibri currently requires `prompt` to be a string.", "prompt")
         if not prompt:
             raise APIError(400, "`prompt` must not be empty.", "prompt")
+        self.validate_prompt(prompt, body)
         self.generation(body, prompt, request_id, False)
 
 

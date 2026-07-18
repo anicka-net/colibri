@@ -6,3 +6,4 @@ After=colibri-server.service
 Type=oneshot
 EnvironmentFile=%h/.config/colibri/service.env
 ExecStart=%h/colibri/ops/colibri-watchdog.sh
+RuntimeMaxSec=90

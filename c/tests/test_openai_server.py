@@ -11,8 +11,8 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled, END, GenerationScheduler,
-                           READY, Engine, generation_options, parse_tool_calls,
-                           read_engine_turn, render_chat, serve, split_reasoning)
+                           READY, Engine, anthropic_messages, generation_options, parse_tool_calls,
+                           read_engine_turn, render_chat, responses_messages, serve, split_reasoning)
 
 
 class FakeEngine:
@@ -51,6 +51,20 @@ class ThinkingEngine(FakeEngine):
         else:
             chunks = ("Reason", "ing</th", "ink>Answer") if prompt.endswith("<think>") else ("Answer",)
         for chunk in chunks:
+            on_text(chunk)
+        return {"prompt_tokens": 11, "completion_tokens": 4, "length_limited": False}
+
+
+class FailingEngine(FakeEngine):
+    def generate(self, *args, **kwargs):
+        raise RuntimeError("injected engine failure")
+
+
+class ReasoningToolEngine(FakeEngine):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
+        for chunk in ("<tool_call>lookup<arg_key>q</arg_key><arg_value>secret</arg_value>",
+                      "</tool_call></think>Answer"):
             on_text(chunk)
         return {"prompt_tokens": 11, "completion_tokens": 4, "length_limited": False}
 
@@ -105,6 +119,17 @@ class TemplateTest(unittest.TestCase):
             generation_options({"top_p": math.inf}, 8)
         self.assertEqual(generation_options({"temperature": None, "top_p": None}, 8),
                          (8, 0.7, 0.9))
+
+    def test_anthropic_mixed_blocks_preserve_order(self):
+        messages = anthropic_messages({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "result"},
+            {"type": "text", "text": "after"},
+        ]}]})
+        self.assertEqual([message["role"] for message in messages], ["tool", "user"])
+
+    def test_responses_function_call_requires_name(self):
+        with self.assertRaisesRegex(APIError, "string `name`"):
+            responses_messages({"input": [{"type": "function_call", "arguments": "{}"}]})
 
 
 class ProtocolTest(unittest.TestCase):
@@ -508,8 +533,11 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
-    def test_profile_reports_recent_turns_without_auth(self):
-        with urlopen(self.base + "/profile", timeout=2) as response:
+    def test_profile_requires_auth_and_reports_recent_turns(self):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(self.base + "/profile", timeout=2)
+        self.assertEqual(caught.exception.code, 401)
+        with self.request("/profile") as response:
             self.assertEqual(json.load(response), {"seq": 0, "turns": []})
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
@@ -517,7 +545,7 @@ class HTTPTest(unittest.TestCase):
         self.engine.profile = [turn]
         self.engine.profile_seq = 1
         try:
-            with urlopen(self.base + "/profile", timeout=2) as response:
+            with self.request("/profile") as response:
                 self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
         finally:
             del self.engine.profile, self.engine.profile_seq
@@ -589,6 +617,32 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+    def test_anthropic_accepts_x_api_key(self):
+        data = json.dumps({
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4,
+        }).encode()
+        request = Request(self.base + "/v1/messages", data=data, headers={
+            "Content-Type": "application/json", "x-api-key": "secret"})
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(json.load(response)["type"], "message")
+
+    def test_rejects_prompt_over_context_byte_ceiling(self):
+        old = self.server.context_length
+        self.server.context_length = 8
+        try:
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "x" * 200}],
+                    "max_tokens": 1,
+                })
+            self.assertEqual(caught.exception.code, 400)
+            self.assertEqual(json.load(caught.exception)["error"]["code"],
+                             "context_length_exceeded")
+        finally:
+            self.server.context_length = old
 
 
 class DS4CompatibilityHTTPTest(unittest.TestCase):
@@ -745,6 +799,43 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
         self.assertIn('"type":"tool_use"', stream)
         self.assertIn('"type":"input_json_delta"', stream)
         self.assertNotIn("<tool_call>", stream)
+
+    def test_streaming_chat_ignores_tool_calls_inside_reasoning(self):
+        old = self.server.engine
+        self.server.engine = ReasoningToolEngine()
+        try:
+            tool = {"type": "function", "function": {"name": "lookup",
+                    "parameters": {"type": "object", "properties": {}}}}
+            with self.request("/v1/chat/completions", {
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True, "tools": [tool],
+            }) as response:
+                stream = response.read().decode()
+            self.assertIn('"content":"Answer"', stream)
+            self.assertNotIn('"tool_calls"', stream)
+        finally:
+            self.server.engine = old
+
+    def test_protocol_streams_emit_errors_and_finish(self):
+        old = self.server.engine
+        self.server.engine = FailingEngine()
+        try:
+            with self.request("/v1/responses", {
+                "model": "deepseek-v4-flash", "input": "Hi", "stream": True,
+            }) as response:
+                responses_stream = response.read().decode()
+            self.assertIn('"type":"response.failed"', responses_stream)
+
+            with self.request("/v1/messages", {
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 4, "stream": True,
+            }) as response:
+                anthropic_stream = response.read().decode()
+            self.assertIn("event: error", anthropic_stream)
+        finally:
+            self.server.engine = old
 
 
 class StaticServingTest(unittest.TestCase):

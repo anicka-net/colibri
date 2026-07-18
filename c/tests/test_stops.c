@@ -128,6 +128,18 @@ int main(void){
       fail|=expect("T=NULL: no tokenizer sweep",101,0);
       if(!fail) printf("  T=NULL -> config stops only (validation path untouched)   ok\n"); }
 
+    /* 6. Oversized metadata must fill the documented cap rather than silently stopping at 8. */
+    { Cfg c; memset(&c,0,sizeof c);
+      char ids[1024]="[";
+      for(int i=0;i<70;i++){ char one[24]; snprintf(one,sizeof one,"%s%d",i?",":"",1000+i);
+          strncat(ids,one,sizeof(ids)-strlen(ids)-1); }
+      strncat(ids,"]",sizeof(ids)-strlen(ids)-1);
+      write_cfg(dir,"config.json",ids);
+      rm_file(dir,"generation_config.json");
+      load_cfg(&c,dir);
+      if(c.n_stop!=64){ fprintf(stderr,"  FAIL oversized eos: expected cap 64, got %d\n",c.n_stop); fail=1; }
+      else printf("  oversized eos metadata -> explicit 64-token cap reached       ok\n"); }
+
     rm_file(dir,"config.json"); rm_file(dir,"generation_config.json"); rm_file(dir,"tokenizer.json");
     rmdir(dir);
     if(fail){ printf("test_stops: FAIL\n"); return 1; }

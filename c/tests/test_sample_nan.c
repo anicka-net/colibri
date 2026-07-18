@@ -51,7 +51,14 @@ int main(void){
     }
     if(!fail) printf("  NaN/+Inf iniettato: argmax dei finiti vince, mai 0/NaN   ok\n");
 
-    /* (c) caso estremo: TUTTI non finiti -> non deve crashare, buffer valido */
+    /* (c) greedy uses the same finite-only rescan; lo[0]=NaN must not pin token 0. */
+    for(int i=0;i<V;i++) lo[i]=-5.f;
+    lo[0]=NAN; lo[123]=7.f;
+    if(pick_tok(lo,V,-1)!=123 || mtp_argmax(lo,V)!=123){
+        printf("  FAIL: greedy/MTP argmax did not skip lo[0]=NaN\n"); fail=1;
+    } else printf("  greedy + MTP: non-finite logits skipped, finite argmax wins ok\n");
+
+    /* (d) caso estremo: TUTTI non finiti -> non deve crashare, buffer valido */
     for(int i=0;i<V;i++) lo[i]=NAN;
     dist_build(lo,V);
     if(pbuf_has_nan(V)){ printf("  FAIL: tutti-NaN lascia NaN nel buffer\n"); fail=1; }
