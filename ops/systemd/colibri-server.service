@@ -1,0 +1,17 @@
+[Unit]
+Description=Colibri OpenAI-compatible inference server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/colibri/service.env
+WorkingDirectory=%h/colibri/c
+ExecStart=%h/colibri/c/coli serve --model ${COLI_MODEL} --host ${COLI_HOST} --port ${COLI_PORT} --model-id ${COLI_MODEL_ID} --model-alias deepseek-v4-pro --hidden-model-alias deepseek-chat --default-thinking --context-length ${COLI_CONTEXT} --cap ${COLI_CAP} --ctx ${COLI_CONTEXT} --ngen ${COLI_MAX_TOKENS} --expert-bits ${COLI_EXPERT_BITS} --dense-bits ${COLI_DENSE_BITS} --kv-slots ${COLI_KV_SLOTS} --cors-origin ${COLI_CORS_ORIGIN}
+Restart=always
+RestartSec=10
+TimeoutStartSec=900
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

@@ -758,7 +758,10 @@ def cmd_serve(a):
         serve(a.model, a.host, a.port, a.model_id, a.api_key,
               a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,
-              expert_bits=a.expert_bits,dense_bits=a.dense_bits)
+              expert_bits=a.expert_bits,dense_bits=a.dense_bits,
+              model_aliases=a.model_alias,hidden_model_aliases=a.hidden_model_alias,
+              context_length=a.context_length or a.ctx or None,
+              default_thinking=a.default_thinking)
     finally:
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
@@ -908,6 +911,12 @@ def main():
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
     ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
+    ps.add_argument("--model-alias",action="append",default=[])
+    ps.add_argument("--hidden-model-alias",action="append",default=[])
+    ps.add_argument("--default-thinking",action="store_true",
+                    default=os.environ.get("COLI_THINK","0")=="1")
+    ps.add_argument("--context-length",type=int,
+                    default=int(os.environ.get("COLI_CONTEXT_LENGTH","0")) or None)
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
@@ -920,6 +929,12 @@ def main():
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
                    ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
+                   ("--model-alias",dict(action="append",default=[])),
+                   ("--hidden-model-alias",dict(action="append",default=[])),
+                   ("--default-thinking",dict(action="store_true",
+                                              default=os.environ.get("COLI_THINK","0")=="1")),
+                   ("--context-length",dict(type=int,
+                                            default=int(os.environ.get("COLI_CONTEXT_LENGTH","0")) or None)),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
                    ("--cors-origin",dict(action="append",default=None)),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
