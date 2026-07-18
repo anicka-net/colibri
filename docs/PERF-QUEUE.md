@@ -78,7 +78,15 @@ mlocked warm-copy: demand paging would trade a one-time load for page-fault
 stalls in the decode path.  Also: THP/pre-fault for slab pages, pinned
 double-buffer staging for the uploads.
 
-### 4. Prefill profiling
+### 4. Prefill profiling — MEASURED, now the top priority
+2701-token prefill takes **246 s (11 tok/s)** — prefill runs at near-decode
+speed; a 10k agentic prompt would be ~15 min.  Same with DSA=0, so it is not
+the indexer.  First suspects: the prefill path's chunking and whether the
+S>=8 pipe path actually engages end-to-end.  Long-context decode at 2.8k ctx:
+DSA=0 **5.31 tok/s** (chain on, attention 115 ms/tok, linear in T);
+DSA-on **2.45 tok/s** (selection active -> chain off -> CPU DSA path,
+attention 44 s/128 tok).  Confirms item 1 phase 2 (selection in chain) is
+mandatory for the model's purpose, and prefill needs work before that.
 All tuning so far targets decode.  The DS4/OpenAI server workload prefills
 thousands of tokens (pipe1 `S>=8` path, never profiled here).  Time-to-first-
 token may matter more than decode tok/s for agentic use.
