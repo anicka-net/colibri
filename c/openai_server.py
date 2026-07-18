@@ -165,8 +165,8 @@ def content_text(content, param):
     return "".join(parts)
 
 
-def responses_messages(body):
-    messages = []
+def responses_messages(body, previous=()):
+    messages = list(previous)
     instructions = body.get("instructions")
     if instructions is not None:
         messages.append({"role": "system", "content": content_text(instructions, "instructions")})
@@ -175,12 +175,40 @@ def responses_messages(body):
         messages.append({"role": "user", "content": value})
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            if not isinstance(item, dict) or item.get("role") not in (
-                    "system", "developer", "user", "assistant"):
+            if not isinstance(item, dict):
                 raise APIError(400, "Responses `input` items must be message objects.",
                                f"input.{index}")
-            messages.append({"role": item["role"],
-                             "content": content_text(item.get("content"), f"input.{index}.content")})
+            item_type = item.get("type")
+            if item_type == "function_call":
+                messages.append({"role": "assistant", "content": None, "tool_calls": [{
+                    "id": item.get("call_id") or item.get("id") or "call_compat",
+                    "type": "function",
+                    "function": {"name": item.get("name"),
+                                 "arguments": item.get("arguments", "{}")},
+                }]})
+            elif item_type == "function_call_output":
+                output = item.get("output", "")
+                messages.append({"role": "tool",
+                                 "content": output if isinstance(output, str)
+                                 else json.dumps(output, ensure_ascii=False),
+                                 "tool_call_id": item.get("call_id")})
+            elif item.get("role") in ("system", "developer", "user", "assistant"):
+                content = item.get("content")
+                if isinstance(content, list):
+                    parts = []
+                    for part_index, part in enumerate(content):
+                        if isinstance(part, dict) and part.get("type") == "output_text":
+                            parts.append(part.get("text", ""))
+                        else:
+                            parts.append(content_text([part],
+                                f"input.{index}.content.{part_index}"))
+                    content = "".join(parts)
+                else:
+                    content = content_text(content, f"input.{index}.content")
+                messages.append({"role": item["role"], "content": content})
+            else:
+                raise APIError(400, "Unsupported Responses input item.",
+                               f"input.{index}", "unsupported_input_type")
     else:
         raise APIError(400, "`input` must be a string or an array of messages.", "input")
     return messages
@@ -199,26 +227,42 @@ def anthropic_messages(body):
             raise APIError(400, "Anthropic messages require user or assistant roles.",
                            f"messages.{index}.role")
         content = item.get("content")
-        if isinstance(content, list):
-            text = []
-            for part_index, part in enumerate(content):
-                if not isinstance(part, dict):
-                    raise APIError(400, "Message content blocks must be objects.",
-                                   f"messages.{index}.content.{part_index}")
-                if part.get("type") == "text":
-                    text.append(content_text([part], f"messages.{index}.content"))
-                elif part.get("type") == "tool_result":
-                    result = content_text(part.get("content", ""), f"messages.{index}.content")
-                    messages.append({"role": "tool", "content": result})
-                else:
-                    raise APIError(400, "Colibri currently supports text and tool_result blocks.",
-                                   f"messages.{index}.content.{part_index}",
-                                   "unsupported_content_type")
-            if text:
-                messages.append({"role": item["role"], "content": "".join(text)})
-        else:
+        if not isinstance(content, list):
             messages.append({"role": item["role"],
                              "content": content_text(content, f"messages.{index}.content")})
+            continue
+        text, calls, results = [], [], []
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict):
+                raise APIError(400, "Message content blocks must be objects.",
+                               f"messages.{index}.content.{part_index}")
+            part_type = part.get("type")
+            if part_type == "text":
+                text.append(content_text([part], f"messages.{index}.content"))
+            elif part_type == "thinking":
+                continue
+            elif part_type == "tool_use" and item["role"] == "assistant":
+                calls.append({"id": part.get("id") or "call_compat", "type": "function",
+                              "function": {"name": part.get("name"),
+                                           "arguments": json.dumps(part.get("input", {}),
+                                                                   ensure_ascii=False)}})
+            elif part_type == "tool_result" and item["role"] == "user":
+                result = content_text(part.get("content", ""), f"messages.{index}.content")
+                results.append({"role": "tool", "content": result,
+                                "tool_call_id": part.get("tool_use_id")})
+            else:
+                raise APIError(400, "Unsupported Anthropic content block.",
+                               f"messages.{index}.content.{part_index}",
+                               "unsupported_content_type")
+        if item["role"] == "assistant":
+            message = {"role": "assistant", "content": "".join(text) or None}
+            if calls:
+                message["tool_calls"] = calls
+            messages.append(message)
+        else:
+            if text:
+                messages.append({"role": "user", "content": "".join(text)})
+            messages.extend(results)
     return messages
 
 
@@ -876,6 +920,8 @@ class APIServer(ThreadingHTTPServer):
         self.created = int(time.time())
         self.watchdog_lock = threading.Lock()
         self.watchdog_active = 0
+        self.response_history_lock = threading.Lock()
+        self.response_history = collections.OrderedDict()
 
     @contextlib.contextmanager
     def watchdog_request(self, active):
@@ -892,6 +938,23 @@ class APIServer(ThreadingHTTPServer):
     def watchdog_snapshot(self):
         with self.watchdog_lock:
             return self.watchdog_active
+
+    def response_context(self, response_id):
+        if response_id is None:
+            return ()
+        with self.response_history_lock:
+            messages = self.response_history.get(response_id)
+            if messages is None:
+                raise APIError(404, f"The response `{response_id}` does not exist.",
+                               "previous_response_id", "response_not_found")
+            return list(messages)
+
+    def remember_response(self, response_id, messages):
+        with self.response_history_lock:
+            self.response_history[response_id] = list(messages)
+            self.response_history.move_to_end(response_id)
+            while len(self.response_history) > 128:
+                self.response_history.popitem(last=False)
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1150,7 +1213,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def responses_api(self, body, request_id):
         normalized = dict(body)
-        normalized["messages"] = responses_messages(body)
+        previous = self.server.response_context(body.get("previous_response_id"))
+        normalized["messages"] = responses_messages(body, previous)
         if "max_output_tokens" in body:
             normalized["max_tokens"] = body["max_output_tokens"]
         thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
@@ -1175,6 +1239,10 @@ class APIHandler(BaseHTTPRequestHandler):
                                "status": "completed", "call_id": call["id"],
                                "name": call["function"]["name"],
                                "arguments": call["function"]["arguments"]})
+            assistant = {"role": "assistant", "content": content_text_value or None}
+            if calls:
+                assistant["tool_calls"] = calls
+            self.server.remember_response(response_id, [*normalized["messages"], assistant])
             usage = {"input_tokens": stats["prompt_tokens"],
                      "input_tokens_details": {"cached_tokens": 0},
                      "output_tokens": stats["completion_tokens"],
@@ -1262,6 +1330,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 event(write, {"type": "response.output_item.done",
                               "output_index": index, "item": item})
                 output.append(item)
+            assistant = {"role": "assistant", "content": "".join(text) or None}
+            if calls:
+                assistant["tool_calls"] = calls
+            self.server.remember_response(response_id, [*normalized["messages"], assistant])
             usage = {"input_tokens": stats["prompt_tokens"],
                      "input_tokens_details": {"cached_tokens": 0},
                      "output_tokens": stats["completion_tokens"],

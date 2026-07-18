@@ -695,10 +695,20 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
         response_body = {"model": "deepseek-v4-flash", "input": "Find it",
                          "reasoning": {"effort": "none"}, "tools": [response_tool]}
         with self.request("/v1/responses", response_body) as response:
-            output = json.load(response)["output"]
+            first_response = json.load(response)
+            output = first_response["output"]
         self.assertEqual(output[0]["type"], "function_call")
         self.assertEqual(output[0]["name"], "lookup")
         self.assertEqual(json.loads(output[0]["arguments"]), {"q": "bird"})
+        with self.request("/v1/responses", {
+            "model": "deepseek-v4-flash",
+            "previous_response_id": first_response["id"],
+            "input": [{"type": "function_call_output",
+                       "call_id": output[0]["call_id"], "output": "sparrow"}],
+            "reasoning": {"effort": "none"},
+        }) as response:
+            follow_up = json.load(response)
+        self.assertEqual(follow_up["output"][0]["content"][0]["text"], "Answer")
 
         with self.request("/v1/responses", {**response_body, "stream": True}) as response:
             stream = response.read().decode()
@@ -717,6 +727,18 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "tool_use")
         self.assertEqual(result["content"][0]["type"], "tool_use")
         self.assertEqual(result["content"][0]["input"], {"q": "bird"})
+        with self.request("/v1/messages", {
+            "model": "deepseek-v4-flash", "max_tokens": 16,
+            "thinking": {"type": "disabled"},
+            "messages": [
+                {"role": "user", "content": "Find it"},
+                {"role": "assistant", "content": result["content"]},
+                {"role": "user", "content": [{"type": "tool_result",
+                  "tool_use_id": result["content"][0]["id"], "content": "sparrow"}]},
+            ],
+        }) as response:
+            follow_up = json.load(response)
+        self.assertEqual(follow_up["content"][0]["text"], "Answer")
 
         with self.request("/v1/messages", {**anthropic_body, "stream": True}) as response:
             stream = response.read().decode()

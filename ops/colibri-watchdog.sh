@@ -9,6 +9,7 @@ probe_timeout=${COLI_WATCHDOG_PROBE_TIMEOUT:-20}
 state_dir=${COLI_WATCHDOG_STATE_DIR:-"$HOME/.colibri"}
 dry_run=${COLI_WATCHDOG_DRY_RUN:-0}
 diagnostics=${COLI_WATCHDOG_DIAGNOSTICS:-1}
+api_key=${COLI_WATCHDOG_API_KEY:-${COLI_API_KEY:-}}
 
 mkdir -p "$state_dir"
 exec 9>"$state_dir/watchdog.lock"
@@ -36,11 +37,18 @@ raise SystemExit(0 if s.get("active") == 0 and s.get("queued") == 0 else 1)
 ' || exit 0
 
 payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply OK"}],"max_tokens":1,"think":false}' "$model")
-if timeout "$probe_timeout" curl -fsS "$url/v1/chat/completions" \
-        -H 'Content-Type: application/json' -H 'X-Colibri-Watchdog: 1' \
-        -d "$payload" >/dev/null 2>&1; then
+auth=()
+[ -z "$api_key" ] || auth=(-H "Authorization: Bearer $api_key")
+set +e
+timeout "$probe_timeout" curl -fsS "$url/v1/chat/completions" \
+    -H 'Content-Type: application/json' -H 'X-Colibri-Watchdog: 1' \
+    "${auth[@]}" -d "$payload" >/dev/null 2>&1
+probe_status=$?
+set -e
+if [ "$probe_status" -eq 0 ]; then
     exit 0
 fi
+[ "$probe_status" -eq 124 ] || [ "$probe_status" -eq 137 ] || exit 0
 
 sleep 3
 gpu_util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null |

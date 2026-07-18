@@ -4,4 +4,5 @@ After=colibri-server.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=%h/.config/colibri/service.env
 ExecStart=%h/colibri/ops/colibri-watchdog.sh
