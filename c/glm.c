@@ -6177,36 +6177,50 @@ static void pin_load(Model *m, const char *statspath, double gb){
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
         int gpu_limit=gpu_prefix?gpu_prefix:npin;
-        for(int a=0;a<gpu_limit && m->gpu_expert_bytes<budget;a++){
-            int li=r[a].l;
-            { ESlot *s=&m->pin[li][slot_of[a]];
-                int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
-                if(m->gpu_expert_bytes+need>budget) break;
-                int tried[COLI_CUDA_MAX_DEVICES]={0}, placed=0;
-                for(int attempt=0;attempt<g_cuda_ndev && !placed;attempt++){
-                    int best=-1;
-                    for(int i=0;i<g_cuda_ndev;i++) if(!tried[i] && remaining[i]>=need &&
-                        (best<0||placed_b[i]<placed_b[best])) best=i;
-                    if(best<0) break;
-                    tried[best]=1;
-                    s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[best];
-                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
-                    if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
-                        int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                                      +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                        m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
-                        remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
-                        if(g_cuda_release_host) expert_host_release(m,s);
-                        placed=1;
-                    } else {
-                        qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
-                        s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                        remaining[best]=0;             /* device rejected its projected capacity */
-                    }
+        /* The tier upload was serial: one sync pageable cudaMemcpy at a time,
+         * alternating devices — ~5 GB/s aggregate for a 150 GB tier (#startup).
+         * Split it: assign devices first (serial bookkeeping, projected sizes),
+         * then upload with one thread per device, then account serially. */
+        int *assign=malloc((size_t)gpu_limit*sizeof(int));
+        { double proj=0;
+          for(int a=0;a<gpu_limit;a++){
+            ESlot *s=&m->pin[r[a].l][slot_of[a]];
+            int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            assign[a]=-1;
+            if(proj+need>budget) break;
+            int best=-1;
+            for(int i=0;i<g_cuda_ndev;i++) if(remaining[i]>=need &&
+                (best<0||placed_b[i]<placed_b[best])) best=i;
+            if(best<0) break;
+            assign[a]=best; proj+=need;
+            remaining[best]-=need; placed_b[best]+=need;
+          } }
+        { int upfail[COLI_CUDA_MAX_DEVICES]={0};
+          #pragma omp parallel for num_threads(g_cuda_ndev) schedule(static,1)
+          for(int d=0;d<g_cuda_ndev;d++){
+            for(int a=0;a<gpu_limit;a++) if(assign[a]==d){
+                if(upfail[d]){ assign[a]=-1; continue; }
+                ESlot *s=&m->pin[r[a].l][slot_of[a]];
+                s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[d];
+                s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+                if(!(qt_cuda_upload(&s->g)&&qt_cuda_upload(&s->u)&&qt_cuda_upload(&s->d))){
+                    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                    s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+                    assign[a]=-1; upfail[d]=1;      /* device full: stop filling it */
                 }
             }
+          } }
+        for(int i=0;i<g_cuda_ndev;i++){ placed_b[i]=0; placed_n[i]=0; }
+        for(int a=0;a<gpu_limit;a++) if(assign[a]>=0){
+            ESlot *s=&m->pin[r[a].l][slot_of[a]];
+            int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                          +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                          +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+            m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+            placed_b[assign[a]]+=actual; placed_n[assign[a]]++;
+            if(g_cuda_release_host) expert_host_release(m,&m->pin[r[a].l][slot_of[a]]);
         }
+        free(assign);
         fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
             m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
