@@ -72,6 +72,18 @@ typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src,
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
+typedef int (*fn_pipe_attn_chain)(int device,
+        float *x_dev, float *nrm_dev, float *nrm_host,
+        float *kv_host_L, float *kv_host_R,
+        const ColiCudaTensor *qa, const ColiCudaTensor *qb,
+        const ColiCudaTensor *kva, const ColiCudaTensor *kvb,
+        const ColiCudaTensor *o_proj,
+        const float *w_in, const float *w_qa, const float *w_kva, const float *w_post,
+        float *d_Lc, float *d_Rc,
+        int D, int H, int q_lora, int kv_lora,
+        int qk_nope, int qk_rope, int vh,
+        int S, int pos_base, int kv_start,
+        float eps, float theta, float attn_scale);
 typedef int (*fn_pipe_peer_copy)(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes);
 typedef int (*fn_pipe_rmsnorm)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps);
 typedef int (*fn_pipe_rmsnorm_s)(int device,float *y_dev,const float *x_dev, const float *w_dev,int S,int D,float eps, int xstride,int ystride);
@@ -119,6 +131,7 @@ static struct {
     fn_pipe_download pipe_download;
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
+    fn_pipe_attn_chain pipe_attn_chain;
     fn_pipe_peer_copy pipe_peer_copy;
     fn_pipe_rmsnorm pipe_rmsnorm;
     fn_pipe_rmsnorm_s pipe_rmsnorm_s;
@@ -213,6 +226,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_download, fn_pipe_download)
     RESOLVE(pipe_free, fn_pipe_free)
     RESOLVE(pipe_gemm, fn_pipe_gemm)
+    RESOLVE(pipe_attn_chain, fn_pipe_attn_chain)
     RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
     RESOLVE(pipe_rmsnorm, fn_pipe_rmsnorm)
     RESOLVE(pipe_rmsnorm_s, fn_pipe_rmsnorm_s)
@@ -393,6 +407,24 @@ void coli_cuda_pipe_free(int device,void *p){
 int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S){
     if(!g_cuda.available){ return 0; }
     return g_cuda.pipe_gemm(t, y_dev, x_dev, S);
+}
+
+int coli_cuda_pipe_attn_chain(int device,
+        float *x_dev, float *nrm_dev, float *nrm_host,
+        float *kv_host_L, float *kv_host_R,
+        const ColiCudaTensor *qa, const ColiCudaTensor *qb,
+        const ColiCudaTensor *kva, const ColiCudaTensor *kvb,
+        const ColiCudaTensor *o_proj,
+        const float *w_in, const float *w_qa, const float *w_kva, const float *w_post,
+        float *d_Lc, float *d_Rc,
+        int D, int H, int q_lora, int kv_lora,
+        int qk_nope, int qk_rope, int vh,
+        int S, int pos_base, int kv_start,
+        float eps, float theta, float attn_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.pipe_attn_chain(device,x_dev,nrm_dev,nrm_host,kv_host_L,kv_host_R,
+        qa,qb,kva,kvb,o_proj,w_in,w_qa,w_kva,w_post,d_Lc,d_Rc,D,H,q_lora,kv_lora,
+        qk_nope,qk_rope,vh,S,pos_base,kv_start,eps,theta,attn_scale);
 }
 
 int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev, const float *src,size_t bytes){

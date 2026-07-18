@@ -60,6 +60,13 @@ class FailingEngine(FakeEngine):
         raise RuntimeError("injected engine failure")
 
 
+class PartialFailingEngine(FakeEngine):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
+                 cancelled=None):
+        on_text("reason</think>hello<think>")
+        raise RuntimeError("injected partial engine failure")
+
+
 class ReasoningToolEngine(FakeEngine):
     def generate(self, prompt, maximum, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None):
@@ -163,6 +170,24 @@ class ProtocolTest(unittest.TestCase):
             engine = Engine("glm", "model", cap=64, expert_bits=4, dense_bits=4)
         self.assertEqual(popen.call_args.args[0], ["glm", "64", "4", "4"])
         engine.close()
+
+    def test_response_history_is_bounded_by_count_and_bytes(self):
+        server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model")
+        try:
+            for index in range(40):
+                server.remember_response(f"resp_{index}", [{"role": "user", "content": str(index)}])
+            self.assertEqual(len(server.response_history), 32)
+            with self.assertRaises(APIError):
+                server.response_context("resp_0")
+
+            large = "x" * (9 << 20)
+            server.remember_response("large_1", [{"role": "user", "content": large}])
+            server.remember_response("large_2", [{"role": "user", "content": large}])
+            self.assertLessEqual(server.response_history_bytes, 16 << 20)
+            self.assertNotIn("large_1", server.response_history)
+        finally:
+            server.scheduler.close()
+            server.server_close()
 
 
 class SchedulerTest(unittest.TestCase):
@@ -819,13 +844,15 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
 
     def test_protocol_streams_emit_errors_and_finish(self):
         old = self.server.engine
-        self.server.engine = FailingEngine()
+        self.server.engine = PartialFailingEngine()
         try:
             with self.request("/v1/responses", {
                 "model": "deepseek-v4-flash", "input": "Hi", "stream": True,
             }) as response:
                 responses_stream = response.read().decode()
             self.assertIn('"type":"response.failed"', responses_stream)
+            self.assertLess(responses_stream.index('"type":"response.output_text.delta"'),
+                            responses_stream.index('"type":"response.failed"'))
 
             with self.request("/v1/messages", {
                 "model": "deepseek-v4-flash",
@@ -834,6 +861,8 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
             }) as response:
                 anthropic_stream = response.read().decode()
             self.assertIn("event: error", anthropic_stream)
+            self.assertLess(anthropic_stream.index("event: content_block_delta"),
+                            anthropic_stream.index("event: error"))
         finally:
             self.server.engine = old
 

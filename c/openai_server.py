@@ -1241,11 +1241,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, consumer.feed, cache_slot,
                     lambda: not connected)
                 consumer.close()
+                consumer = None
                 finish(write, stats)
             except ClientCancelled:
                 raise
             except Exception as error:
                 self.log_error("stream generation failed: %s", error)
+                if consumer is not None:
+                    consumer.close()
+                    consumer = None
                 fail(write, error)
             finally:
                 if consumer is not None:
