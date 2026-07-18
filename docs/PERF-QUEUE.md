@@ -80,6 +80,17 @@ is 77% steady-state; Belady eviction alone 89-91%; oracle prefetch at ~89
 loads/token → 100% within NVMe bandwidth.  A predictor needs ~65-90
 experts/token a few tokens ahead; better eviction alone captures half.
 
+Direct CUDA execution from pageable LRU memory is now implemented behind
+`COLI_CUDA_HOST_EXPERTS=1`.  On GB10, the 30 GB CUDA tier + cap 17 profile
+improves the warm 32-token fixed benchmark from 38.53s to 25.12s and a
+route-diverse 64-token run from ~80.6s to 52.3s.  Routed CPU expert time falls
+from 23.79s to zero (CUDA critical path 2.07s), with byte-identical fixed
+benchmark output.  The remaining dominant cost is felt expert I/O (9.8s/32
+tokens, 21.5s/64 tokens), so cache prediction/eviction is the next Spark lever.
+Removing the separate CUDA tier did not help: cap 36 holds fewer total experts
+than the hybrid profile and produced the same ~24.8s warm latency.  `DRAFT=1`
+adds a further ~9% on the direct 32-token run (1.61 -> 1.76 tok/s).
+
 ## Measured dead ends (do not revisit without new evidence)
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).

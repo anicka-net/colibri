@@ -236,6 +236,7 @@ static double g_cuda_expert_gb;
 static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
+static int g_cuda_host_experts;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -246,6 +247,12 @@ static int qt_cuda_upload(QT *t){
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
+}
+static int qt_cuda_wrap_host(QT *t,int device){
+    if(t->cuda)return 1;
+    if(t->fmt!=2||!t->q4||!t->s)return 0;
+    t->cuda_device=device;
+    return coli_cuda_tensor_wrap_host(&t->cuda,t->q4,t->s,t->fmt,t->I,t->O,device);
 }
 static int qt_cuda_update(QT *t){
     const void *weights=t->fmt==0?(const void*)t->qf:
@@ -2297,6 +2304,9 @@ static inline void pipe_wait(int q){
 #ifdef COLI_CUDA
 static void expert_host_release(Model *m, ESlot *s){
     if(!s->slab&&!s->fslab) return;
+    if(!s->g.cuda_eligible){
+        qt_cuda_reset(&s->g);qt_cuda_reset(&s->u);qt_cuda_reset(&s->d);
+    }
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
     if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
@@ -2993,8 +3003,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 #endif
     if(!pre_routed){
+#ifdef COLI_CUDA
         if(g_cuda_pre_logits){ memcpy(logits_all,g_cuda_pre_logits,(size_t)S*E*sizeof(float)); g_cuda_pre_logits=NULL; }
         else matmul(logits_all, x, l->router, S, D, E);
+#else
+        matmul(logits_all, x, l->router, S, D, E);
+#endif
     }
     if(!pre_routed)
     for(int s=0;s<S;s++){
@@ -3373,8 +3387,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
 #ifdef COLI_CUDA
-            if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
-            if(group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
+            if(group_enabled&&g_cuda_enabled&&g_cuda_host_experts&&!e->g.cuda_eligible&&
+               !e->g.cuda&&!omp_in_parallel()){
+                int dev=g_cuda_devices[0];
+                if(!qt_cuda_wrap_host(&e->g,dev)||!qt_cuda_wrap_host(&e->u,dev)||!qt_cuda_wrap_host(&e->d,dev)){
+                    qt_cuda_reset(&e->g);qt_cuda_reset(&e->u);qt_cuda_reset(&e->d);
+                }
+            }
+            int cuda_expert=e->g.cuda&&e->u.cuda&&e->d.cuda;
+            if(g_cuda_enabled && cuda_expert) m->gpu_expert_calls++;
+            if(group_enabled && g_cuda_enabled && cuda_expert &&
                !omp_in_parallel()){
                 group_e[ngroup]=e; group_n[ngroup]=nr;
                 for(int r=0;r<nr;r++){ group_row[(int64_t)ngroup*S+r]=rows[r]; group_weight[(int64_t)ngroup*S+r]=rw[r]; }
@@ -5168,6 +5190,7 @@ static void repin_pass_limit(Model *m,int limit){
             QT *cq[3]={&s->g,&s->u,&s->d},*hq[3]={&hot->g,&hot->u,&hot->d};
             int ok=1;
             for(int k=0;k<3;k++){
+                qt_cuda_reset(hq[k]);
                 hq[k]->cuda=cq[k]->cuda; cq[k]->cuda=NULL;
                 hq[k]->cuda_device=cq[k]->cuda_device;
                 hq[k]->cuda_eligible=1; cq[k]->cuda_eligible=0;
@@ -6576,6 +6599,7 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_cuda_host_experts=getenv("COLI_CUDA_HOST_EXPERTS")?atoi(getenv("COLI_CUDA_HOST_EXPERTS")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
@@ -6585,14 +6609,17 @@ int main(int argc, char **argv){
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_host_experts&&!g_cuda_enabled){ fprintf(stderr,"COLI_CUDA_HOST_EXPERTS requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
         g_cuda_release_host?"; VRAM experts without host backing":"");
+    if(g_cuda_host_experts) fprintf(stderr,"[CUDA] pageable host experts enabled\n");
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
+       (getenv("COLI_CUDA_HOST_EXPERTS") && atoi(getenv("COLI_CUDA_HOST_EXPERTS"))) ||
         (getenv("CUDA_EXPERT_GB") &&
         (!strcmp(getenv("CUDA_EXPERT_GB"),"auto")||atof(getenv("CUDA_EXPERT_GB"))>0))){
         fprintf(stderr,"CUDA was requested, but this binary is CPU-only; rebuild with: make CUDA=1\n");

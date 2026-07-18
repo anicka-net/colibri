@@ -39,6 +39,12 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+/* Wrap pageable host memory for direct kernel reads on coherent CUDA systems.
+ * No allocation or copy is performed; the caller retains ownership and must
+ * keep weights/scales alive until coli_cuda_tensor_free(). */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor,
+                            const void *weights, const float *scales,
+                            int fmt, int I, int O, int device);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.

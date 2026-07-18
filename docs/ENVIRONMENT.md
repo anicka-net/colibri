@@ -86,6 +86,7 @@ Format: `VAR` — default — effect.
 | `COLI_GPU` / `COLI_GPUS` | unset | Device selection (`auto`, `none`, or a list like `0,1`). Requires `COLI_CUDA=1`. |
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
+| `COLI_CUDA_HOST_EXPERTS` | `0` | Execute RAM/LRU experts through CUDA from pageable host memory on coherent unified-memory devices such as GB10. |
 | `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
