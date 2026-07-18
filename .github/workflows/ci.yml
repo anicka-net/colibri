@@ -110,8 +110,8 @@ jobs:
         run: |
           cd c
           make colibri CUDA_DLL=1
-          test -f glm.exe || { echo "glm CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
-          echo "glm.exe built against the DLL loader"
+          test -f colibri.exe || { echo "colibri CUDA_DLL=1 reported success but produced no exe" >&2; exit 1; }
+          echo "colibri.exe built against the DLL loader"
 
   web:
     name: Web UI
