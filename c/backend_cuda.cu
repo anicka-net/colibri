@@ -351,7 +351,12 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
-    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    /* BARRIERA tra lettura di red[0] (mx) e la sua riscrittura sotto: senza,
+     * un warp veloce scrive red[tid]=somma prima che uno lento legga il MAX
+     * -> softmax incoerente nel blocco. Seme del nondeterminismo run-to-run
+     * (±0.5 sui logit a 2.7k ctx) inseguito in PERF-QUEUE. */
+    float mx=red[0];__syncthreads();
+    local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -386,7 +391,8 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
-    float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    float mx=red[0];__syncthreads();    /* stessa barriera anti-race del kernel batch */
+    local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -1319,6 +1325,10 @@ __device__ static void absorption_body(
     }
     __syncthreads();
     max_s = warp_vals[0];
+    /* Barrier between reading the max and the sum-store below reusing
+     * warp_vals[0]: a fast warp 0 could overwrite it before a slow warp
+     * reads max_s (the run-to-run nondeterminism seed, see PERF-QUEUE). */
+    __syncthreads();
 
     /* Compute exp(score - max) in place and find sum */
     float local_sum = 0.0f;

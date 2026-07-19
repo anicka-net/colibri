@@ -1296,6 +1296,19 @@ static int g_tap_l=-1;   /* TAP=layer:file -> dopo il layer L appende al file un
                           * EN: activation tap on the residual stream, one f32 record
                           * (position + row) per forward position. */
 static FILE *g_tap_f=NULL;
+static FILE *g_xdump_f=NULL;  /* COLI_DBG_XDUMP=file: residuo dopo OGNI layer (caccia alla
+                               * corruzione prefill — vedi PERF-QUEUE).  Record: int32 layer,
+                               * poi S*D f32.  Attivo solo quando x e' host-valido (non-pipe2). */
+static int g_xcrc=0;          /* COLI_DBG_XCRC=1: hash FNV del residuo per layer su stderr */
+static void xcrc_emit(int layer,const float *src,int S,int D){
+    uint64_t h=1469598103934665603ULL;
+    const unsigned char *b=(const unsigned char*)src;
+    for(size_t z=0;z<(size_t)S*D*4;z+=64){ h^=b[z]; h*=1099511628211ULL; }
+    double t2=0; for(int s=S-4;s<S;s++){ double n2=0;
+        for(int j=0;j<D;j+=8){ float v=src[(int64_t)s*D+j]; n2+=(double)v*v; }
+        t2+=n2; }
+    fprintf(stderr,"[XCRC] L%02d %016llx tail4 %.6e\n",layer,(unsigned long long)h,t2);
+}
 static int g_inj_l=-1;   /* INJECT=layer:file -> STEERING additivo: al residuo dopo il layer L
                           * somma INJECT_SCALE * v (v = D float32 raw dal file) su ogni
                           * posizione. Il file DEVE essere esattamente 4*D byte: mismatch =
@@ -4190,7 +4203,14 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                 else dst=x_dev;
                 if(ok){
                     x_dev=dst; x_dev_on=dev;
-                    if(pipe_layer_sparse(m,l,i,x_dev,S,pos_base,nrm,tmp)) continue;
+                    if(pipe_layer_sparse(m,l,i,x_dev,S,pos_base,nrm,tmp)){
+                        if(g_xcrc && S>=8){   /* probe anche sotto PIPE2 (il tail del loop e' saltato) */
+                            static float *cb=NULL; static size_t cc=0;
+                            if(cc<xb){ free(cb); cb=malloc(xb); cc=xb; }
+                            if(cb && coli_cuda_pipe_download(dev,x_dev,cb,xb)) xcrc_emit(i,cb,S,D);
+                        }
+                        continue;
+                    }
                     /* fallback: snapshot -> host, layer rifatto sul percorso CPU */
                     coli_cuda_pipe_peer_copy(dev,x_dev,dev,coli_cuda_pipe_scratch(dev,14,xb),xb);
                     coli_cuda_pipe_download(dev,x_dev,x,xb);
@@ -4219,6 +4239,27 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
         if(i==g_inj_l && g_inj_v)
             for(int s=0;s<S;s++) for(int j=0;j<D;j++)
                 x[(int64_t)s*D+j]+=g_inj_s*g_inj_v[j];
+        /* XDUMP: ogni layer, solo con x host-valido (fuori PIPE2) — zero
+         * perturbazione del timing, la preda e' una race. */
+        if(g_xdump_f && S>=8
+#ifdef COLI_CUDA
+           && x_dev_on<0
+#endif
+          ){
+            int32_t li32=i;
+            if(fwrite(&li32,4,1,g_xdump_f)!=1 ||
+               fwrite(x,sizeof(float),(size_t)S*D,g_xdump_f)!=(size_t)S*D){
+                perror("[XDUMP] fwrite"); exit(1); }
+        }
+        /* XCRC: checksum del residuo per layer (percorso non-PIPE2; il ramo
+         * PIPE2 emette prima del suo continue).  Il download nel ramo PIPE2
+         * forza il drain dello stream: se il jitter SPARISCE col probe attivo,
+         * la race sta nell'overlap asincrono al confine di layer. */
+        if(g_xcrc && S>=8
+#ifdef COLI_CUDA
+           && x_dev_on<0
+#endif
+          ) xcrc_emit(i,x,S,D);
     }
 #ifdef COLI_CUDA
     if(x_dev_on>=0) coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
@@ -4247,6 +4288,12 @@ static void tapinj_init(Model *m){
                 "rifiutati vengono ri-forwardate (record duplicati; tieni l'ULTIMO per pos). "
                 "Per tap puliti: DRAFT=0.\n",g_draft);
     }
+    if((e=getenv("COLI_DBG_XDUMP"))){
+        g_xdump_f=fopen(e,"wb");
+        if(!g_xdump_f){ perror("[XDUMP] fopen"); exit(1); }
+        fprintf(stderr,"[XDUMP] residuo dopo OGNI layer -> %s (int32 layer + S*%d f32; prefill S>=8)\n",e,D);
+    }
+    if((e=getenv("COLI_DBG_XCRC"))) g_xcrc=atoi(e);
     if((e=getenv("INJECT"))){
         const char *colon=strchr(e,':');
         if(!colon||colon==e||!colon[1]){ fprintf(stderr,"[INJECT] formato: INJECT=layer:file\n"); exit(1); }
@@ -5064,6 +5111,21 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double prefill_t=now_s();
     float *logit=step(m,pids,np,0);
+    /* COLI_DBG_LOGITS: top-8 del primo passo di decode — distingue una vera
+     * corruzione (token vincente con logit assurdo) da un near-tie legittimo
+     * che il rumore di piazzamento expert puo' ribaltare. */
+    if(getenv("COLI_DBG_LOGITS")){
+        int ids[8]; float vs[8]; Cfg *cc=&m->c;
+        for(int k=0;k<8;k++){vs[k]=-1e30f;ids[k]=-1;}
+        for(int t=0;t<cc->vocab;t++){ float v=logit[t];
+            int w=0; for(int k=1;k<8;k++) if(vs[k]<vs[w])w=k;
+            if(v>vs[w]){vs[w]=v;ids[w]=t;} }
+        for(int a2=0;a2<8;a2++)for(int b2=a2+1;b2<8;b2++)if(vs[b2]>vs[a2]){
+            float tv=vs[a2];vs[a2]=vs[b2];vs[b2]=tv;int ti=ids[a2];ids[a2]=ids[b2];ids[b2]=ti;}
+        fprintf(stderr,"[LOGITS] prefill top8:");
+        for(int k=0;k<8;k++) fprintf(stderr," %d:%.3f",ids[k],vs[k]);
+        fprintf(stderr," | gap %.4f\n",(double)(vs[0]-vs[1]));
+    }
     if(g_repin>0){
         m->n_emit=(uint64_t)g_repin;
         int limit=32;
@@ -6717,7 +6779,8 @@ int main(int argc, char **argv){
         g_draft = m.has_mtp ? 3 : 0;
 #endif
     }
-    if(getenv("TAP")||getenv("INJECT")) tapinj_init(&m);   /* dopo model_init: serve D e n_layers */
+    if(getenv("TAP")||getenv("INJECT")||getenv("COLI_DBG_XDUMP")||getenv("COLI_DBG_XCRC"))
+        tapinj_init(&m);   /* dopo model_init: serve D e n_layers */
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
     /* Il path MUX (SERVE_BATCH=1, cioe' `coli serve`) forza g_draft=0 sotto —
      * la speculazione non e' ragged-safe nel batch multi-slot. Segnalarlo QUI,

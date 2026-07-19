@@ -117,20 +117,31 @@ makes even two identical GEMM=0 runs diverge after ~16-20 tokens.
 Remaining prefill costs: proj/rope 21 s (pipe_gemm gemv-style — same
 w4a16 treatment applies), experts 40 s, other 13 s.
 
-#### OPEN BUG (pre-existing, NOT the rewrite): intermittent prefill corruption
-~14% of prefill runs (341-token prompt, TAP mode = non-pipe2 fallback
-path, COLI_PREFILL_GEMM inert/never executed; also 1 of 2 pipe2 long-run
-GEMM=0 controls) produce a corrupted CONTIGUOUS TAIL of residual rows
-(~row 270..end at S=341, every element wrong by O(10) rel) visible by
-layer 3, poisoning the KV for those positions -> degenerate decode
-("}"-spam from token 1).  Baseline-only evidence: GEMM=0 control run B
-(/tmp/pfgemm_0b.txt on tekton) after a byte-normal 161 s prefill.
-Intermittent with identical input => timing/state race, in code shared
-by both prefill paths (MoE dispatch, shared-expert overlap, LRU/slab, or
-expert-group staging are the candidates; attention paths are exonerated —
-corruption occurs with the old absorb kernel and without pipe2).
-Repro: short-prompt TAP=3 probe, compare row norms across runs (~90 s/run,
-1-in-7 hit rate).  This gates ANY exact-output validation on main.
+#### FIXED: softmax shared-memory race = the run-to-run nondeterminism
+Root cause found and fixed (2026-07-19).  Three CUDA attention kernels
+(`attention_absorb_batch_kernel`, `attention_absorb_ragged_kernel`, and
+the fused-chain `absorption_kernel`) read the block max (`mx=red[0]` /
+`max_s=warp_vals[0]`) and then re-used the same shared slot for the sum
+reduction WITHOUT a barrier in between: a fast warp could store its
+partial sum over the max before a slow warp had read it, silently
+mis-scaling part of that (head,row) block's softmax.  Effects observed
+before the fix: a handful of residual rows perturbed at ~1e-5..1e-3 per
+forward (first visible at the dense layers), amplified by routing
+discreteness across 78 layers into ±0.5 logit jitter at 2.7k context —
+enough to flip greedy near-ties.  On a degenerate repetitive prompt the
+flip cascades ("</think></think>}}}..."), and the degenerate run's
+routing stats then poison `.coli_usage`, dropping the next runs' pin hit
+rate (observed 92% -> 63%) and amplifying variance further.  The earlier
+"contiguous tail corruption from row ~272" reading of TAP dumps was an
+artifact: rows past the prompt length are DECODE steps, which diverge
+wholesale after any first-token flip.  The Metal shader already had the
+barrier; only CUDA was affected.  Fix: one `__syncthreads()` per kernel
+between the max read and the sum store.  With the fix + a frozen
+`.coli_usage`, repeated greedy runs are bit-identical (logits and text).
+Note for benchmarking: `.coli_usage` still evolves between runs by
+design, so cross-run comparisons should freeze/restore it; tekton's
+poisoned copy from the degenerate-run feedback loop should be deleted
+(or rebuilt from a few clean runs).
 
 ### 5. Expert-group remaining headroom
 Group kernel time is 761 ms/64 tok vs a ~100-150 ms bandwidth floor.  The
