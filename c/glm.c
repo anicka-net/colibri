@@ -303,6 +303,16 @@ static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
     return r.ru_maxrss/(1024.0*1024.0);          /* Linux: in KB */
 #endif
 }
+static double current_rss_gb(void){
+#ifdef __linux__
+    FILE *f=fopen("/proc/self/statm","r"); long total=0,resident=0;
+    if(!f) return 0;
+    int ok=fscanf(f,"%ld %ld",&total,&resident)==2; fclose(f);
+    return ok?(double)resident*(double)sysconf(_SC_PAGESIZE)/1e9:0;
+#else
+    return 0; /* RSS guard is a Linux safety feature; rss_gb() remains peak telemetry. */
+#endif
+}
 /* ---- PROF=1: opt-in performance profile ----------------------------------
  * Records per-forward decode latency and expert-file bytes fetched, then
  * reports percentiles, I/O totals, phase shares and a tuning verdict next to
@@ -2322,6 +2332,44 @@ static inline void pipe_wait(int q){
     }
 #endif
     while(!atomic_load_explicit(&g_pp.ready[q],memory_order_acquire)) sched_yield();
+}
+
+/* Release an LRU slot without touching resident_bytes: that counter tracks dense
+ * and pinned storage, while streamed cache slabs are accounted by ecap. */
+static int64_t expert_lru_release(ESlot *s){
+    int64_t bytes=s->slab_cap+s->fslab_cap*4;
+#ifdef COLI_CUDA
+    qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+#endif
+#ifdef COLI_METAL
+    if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
+    if(s->fslab && g_metal_enabled) coli_metal_unregister(s->fslab);
+#endif
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+    if(s->slab) munlock(s->slab,(size_t)s->slab_cap);
+    if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#elif defined(_WIN32)
+    if(s->slab) compat_munlock(s->slab,(size_t)s->slab_cap);
+    if(s->fslab) compat_munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#endif
+    if(!s->slab && !s->fslab && !g_mmap){
+        QT *q[3]={&s->g,&s->u,&s->d};
+        for(int k=0;k<3;k++){
+            void *data=q[k]->fmt==0?(void*)q[k]->qf:
+                       q[k]->fmt==1?(void*)q[k]->q8:(void*)q[k]->q4;
+#ifdef COLI_METAL
+            if(g_metal_enabled && q[k]->fmt!=0 && data) coli_metal_unregister(data);
+            if(g_metal_enabled && q[k]->s) coli_metal_unregister(q[k]->s);
+#endif
+            free(data); free(q[k]->s);
+        }
+    }
+    compat_aligned_free(s->slab); free(s->fslab);
+    s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
+    QT *q[3]={&s->g,&s->u,&s->d};
+    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+    s->eid=-1; s->used=0;
+    return bytes;
 }
 
 #ifdef COLI_CUDA
@@ -5636,7 +5684,73 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     }
     return nb;
 }
+
+static void pilot_drain_lock(void){
+    while(__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)!=
+          __atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE)) usleep(200);
+    pthread_mutex_lock(&g_pilot_mx);
+    for(;;){
+        int busy=0;
+        for(int i=0;i<256;i++) busy+=g_pilot_inflight[i];
+        if(!busy) return;
+        pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
+    }
+}
+
+/* Caller holds g_pilot_mx after pilot_drain_lock(), so no worker retains a slot
+ * pointer while rows are compacted. */
+static int cache_cap_shrink_locked(Model *m, int target){
+    int dropped=0;
+    if(target<1) target=1;
+    if(target>=m->ecap) return 0;
+    for(int l=0;l<=m->c.n_layers;l++) if(m->ecache[l]){
+        ESlot *s=m->ecache[l]; int *nn=&m->ecn[l];
+        while(*nn>target){
+            int zmin=0;
+            for(int z=1;z<*nn;z++) if(s[z].used<s[zmin].used) zmin=z;
+            expert_lru_release(&s[zmin]);
+            if(zmin!=*nn-1) s[zmin]=s[*nn-1];
+            memset(&s[*nn-1],0,sizeof(*s));
+            (*nn)--; dropped++;
+        }
+    }
+    m->ecap=target;
+    return dropped;
+}
+
+static double g_ram_budget_gb=0, g_rss_slot_b=0;
+static int g_rss_cap_ceiling=INT_MAX;
+static uint64_t g_rssg_last=0;
+
+static int rss_guard_target(int cap, double excess_b, double slot_b){
+    if(cap<=1 || excess_b<=0 || slot_b<=0) return cap;
+    int steps=(int)ceil(excess_b/slot_b);
+    return steps>=cap ? 1 : cap-steps;
+}
+
+static void rss_guard_apply(Model *m, double rss, double lim){
+    if(lim<=0 || rss<=lim*1.02+0.3) return;
+    int old=m->ecap;
+    int target=rss_guard_target(old,(rss-lim)*1e9,g_rss_slot_b);
+    if(target>=old) return;
+    pilot_drain_lock();
+    int dropped=cache_cap_shrink_locked(m,target);
+    if(target<g_rss_cap_ceiling) g_rss_cap_ceiling=target;
+    pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget: "
+        "dropped %d cached experts, cap %d -> %d\n",rss,lim,dropped,old,target);
+}
+
+static void rss_guard(Model *m){
+    double lim=getenv("RSS_GUARD_GB")?atof(getenv("RSS_GUARD_GB")):g_ram_budget_gb;
+    if(lim<=0 || g_mmap || m->n_emit-g_rssg_last<16) return;
+    g_rssg_last=m->n_emit;
+    double rss=current_rss_gb();
+    if(rss>0) rss_guard_apply(m,rss,lim);
+}
+
 static void repin_pass_limit(Model *m,int limit){
+    rss_guard(m);
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
@@ -6078,6 +6192,7 @@ static void run_serve_mux(Model *m, const char *snap){
             if(r->emitted>=r->maximum) mux_done(m,sc,r);
         }
         free(lo);
+        rss_guard(m);                    /* mux decode bypasses spec_decode/repin_pass */
     }
     usage_save(m);
     for(int i=0;i<nctx;i++) serve_ctx_free(m,&ctx[i]); free(ctx); free(req);
@@ -6823,6 +6938,8 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
         if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); ram_gb=8; } }
+    g_ram_budget_gb=ram_gb;
+    g_rss_slot_b=(double)nsp*eb;
     /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):
      *  ws[64] slab del working-set (si materializzano TUTTI nel prefill batch-union),
      *  KV cache a max_ctx, kvb_all della ricostruzione k/v in attention,
@@ -6922,6 +7039,7 @@ static int adaptive_cap_target(Model *m, int planned_ctx){
     int cap=g_adaptive_cap_floor+(int)(free_b/g_adaptive_cap_slot_b);
     if(cap>m->ecap_alloc) cap=m->ecap_alloc;
     if(cap<g_adaptive_cap_floor) cap=g_adaptive_cap_floor;
+    if(cap>g_rss_cap_ceiling) cap=g_rss_cap_ceiling;
     return cap;
 }
 
@@ -6935,31 +7053,12 @@ static void adaptive_cap_set(Model *m, int planned_ctx){
     int target=adaptive_cap_target(m,planned_ctx);
     if(target==m->ecap) return;
 #ifdef COLI_CUDA
-    while(__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)!=
-          __atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE)) usleep(200);
-    pthread_mutex_lock(&g_pilot_mx);
-    for(;;){
-        int busy=0;
-        for(int i=0;i<256;i++) busy+=g_pilot_inflight[i];
-        if(!busy) break;
-        pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
-    }
-    if(target<m->ecap){
-        for(int l=0;l<=m->c.n_layers;l++) if(m->ecache[l]){
-            ESlot *s=m->ecache[l]; int *nn=&m->ecn[l];
-            while(*nn>target){
-                int zmin=0;
-                for(int z=1;z<*nn;z++) if(s[z].used<s[zmin].used) zmin=z;
-                expert_host_release(m,&s[zmin]);
-                if(zmin!=*nn-1) s[zmin]=s[*nn-1];
-                memset(&s[*nn-1],0,sizeof(*s));
-                (*nn)--;
-            }
-        }
-    }
+    pilot_drain_lock();
+    int old=m->ecap;
+    if(target<m->ecap) cache_cap_shrink_locked(m,target);
+    else m->ecap=target;
     fprintf(stderr,"[ADAPTIVE_CAP] context <= %d + margin %d: cap %d -> %d\n",
-        planned_ctx,g_adaptive_cap_margin,m->ecap,target);
-    m->ecap=target;
+        planned_ctx,g_adaptive_cap_margin,old,target);
     pthread_mutex_unlock(&g_pilot_mx);
 #else
     (void)m; (void)planned_ctx;
