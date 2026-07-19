@@ -269,6 +269,24 @@ Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
 ## Measured dead ends (do not revisit without new evidence)
+- Spark 131k/cap-17 coupling prefetch: K1 is neutral; K2/K4/K8 regress as
+  speculative reads evict useful experts.  Depth 2 also thrashes cap 63.
+- Spark prefetch admission at the LRU end: predictions usually expire before
+  demand; replay hit rate falls.
+- Spark pilot budget below K6: K2/K4 save bytes but lose overlap and throughput.
+- Spark late correction: same-layer K6 and early-K4+late-K2 arrive too late to
+  hide NVMe latency.
+- Spark predictor rank fusion: stale+two-step adds no recall at K6;
+  previous-token+two-step is strictly worse.
+- Spark strict MTP: extra routes plus miss-lifetime synchronization cut 3.27 to
+  1.65 tok/s; under `CACHE_ROUTE` it is neutral.
+- Spark cap 62 plus a 30 GB CUDA tier: both consume the same LPDDR and force
+  swap.  Never combine the short-context cache with the production hot tier.
+- Spark removing the CUDA tier while retaining the production-sized cache:
+  cap 36 is neutral; the useful no-tier result requires the short-context
+  cap-63 profile.
+- MTP-head route prediction: recall@8 is 6.2%; the final residual does not
+  preserve early/mid-layer routing.
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).
 - NUMA-binding pinned staging: correct hygiene, neutral at decode volumes
@@ -276,6 +294,29 @@ horizon; late correction alone cannot hide the NVMe read.
 - CPU-expert NUMA affinity: ~6% of expert calls are CPU, <1% ceiling.
 - Fusing the shared expert into the chain: loses to overlap (17.0 vs 16.5) on
   strong-CPU hosts; knob `COLI_FUSE_SHARED=1` exists for weak-CPU machines.
+
+## Next Spark experiments
+1. **Adaptive expert-cache capacity.**  The 131k planner reserves full-context
+   KV and attention workspace up front, although their pages/cost grow with the
+   live context.  Start with more LRU slots for short requests, then evict and
+   free slots before KV growth needs the RAM.  This directly attacks the
+   cap-17/cap-63 gap without changing routing or model computation.  First gate:
+   replay the cap schedule from the existing trace and prove a safe memory
+   watermark; do not implement runtime resizing before that.
+2. **Learned low-rank early route correction.**  Train a small correction to
+   the stale L+1 router logits from the same full-layer-horizon state.  Compare
+   cross-prompt K6 recall against two-step and require enough gain to survive
+   inference overhead before wiring any prefetch.
+3. **Deadline-aware pilot queue.**  Instrument rank, enqueue layer, completion,
+   demand use, and eviction.  If useful predictions are completing behind
+   low-confidence work, prioritize by deadline/confidence and drop stale queue
+   entries.  The K2/K4 regressions show that simply reducing breadth is wrong.
+4. **Learned eviction/reuse scoring.**  Belady's 89-91% ceiling leaves real
+   headroom over LRU's 77%.  Test offline using recency, frequency, layer, and
+   routed-set context; only proceed if it transfers across prompts.
+5. **Two-layer-horizon prediction.**  Evaluate exact and learned L+2 at equal
+   K6 budget only after the above.  Coupling depth 2 already showed the failure
+   mode: extra lead time is worthless when accuracy causes cache pollution.
 
 #### DSA phase 2, increment 1 — GPU absorb+o_proj over the selection (landed)
 `coli_cuda_attention_project_sel` (absorb over the indexer's top-k list +
