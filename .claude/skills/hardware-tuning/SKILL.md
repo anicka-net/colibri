@@ -41,6 +41,41 @@ DIRECT=0 ./glm 256 4 4
   at long context it wins. `DRAFT>1` degrades (self-fed drafts).
 - `COLI_NUMA=1` measured neutral on decode (GPU-bound) — not worth sweeping.
 
+### Running Profile A as a persistent service
+
+`ops/service.env.tekton.example` + `ops/systemd/` (see `ops/README.md`).  Build
+the env file **from the profile above**, not from `service.env.example` — that
+one is the unified-memory profile and carries settings that are actively wrong
+here.  Measured gotchas, each of which produced a working-but-wrong service:
+
+- **Never set `AUTOPIN=0`** on this profile.  It skips the startup pin pass that
+  fills the VRAM tier from `.coli_usage`: the service runs correctly at
+  **1.7 tok/s instead of ~9**, with `nvidia-smi` showing a few hundred MB
+  instead of `CUDA_EXPERT_GB`.  Confirm the banner has both
+  `hot expert tier: N/19200 experts` and `[PIN] placement:`.
+- **Python >= 3.7** (`ThreadingHTTPServer`).  Where the distro default is older
+  (SLES 15 ships 3.6) the unit must invoke a newer interpreter by ABSOLUTE
+  PATH: systemd expands `${VAR}` in arguments but not in the executable
+  position (`203/EXEC`).
+- **tmpfs snapshots vanish on reboot.**  `ops/colibri-preflight.sh` (ExecStartPre)
+  refuses to start on a missing/short snapshot, a wrong `nvidia_uvm` parameter,
+  or an old Python, instead of failing minutes into a load; pair it with a long
+  `RestartSec` so retries do not fight the reload for I/O.
+- **Logs**: the engine banner and per-request lines go to stderr.  If the
+  service user cannot read the journal, add
+  `StandardError=append:%h/.colibri/server.log` — otherwise startup failures are
+  invisible.  `/health` and `/profile` expose tier sizes and per-turn timings.
+
+Expected throughput, short prompts, `CUDA_EXPERT_GB=150`: **~9 tok/s** direct,
+**~5-6 tok/s** through the HTTP/streaming path.  The 19.6 tok/s headline is a
+warmed-cache best case — `.coli_usage` frozen on the *same* prompt.  For
+arbitrary prompts the expert hit rate is ~55-63% and decode is expert-matmul
+bound (45% of wall, CPU tier a ~2.1x straggler over the GPU tier): all 19200
+experts are RAM-pinned (363 GB, zero disk I/O), but only ~7900 fit VRAM.
+Raising the tier to 175 GB buys hit 57.8 -> 62.9% and +3.8% throughput while
+leaving only ~7 GB VRAM margin at a full 32k prompt — not worth it; the cache
+improves on its own as `.coli_usage` learns real traffic.
+
 ### Long context on Profile A: DSA sparse attention
 
 With the `out-idx-*` indexer files present the engine auto-enables DSA, and as
