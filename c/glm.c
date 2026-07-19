@@ -2640,6 +2640,10 @@ static void dsc_report(void){
     if(ts>0||tk>0)
         fprintf(stderr,"[DSAC] chain mid-sync %.3fs (pipeline drain + score dl)"
                 " | host top-k %.3fs\n",ts,tk);
+    { double ph[3]; coli_cuda_dsac_phase_times(ph);
+      if(ph[0]>0||ph[1]>0||ph[2]>0)
+        fprintf(stderr,"[DSAC] chain GPU phases: proj+kv+score %.3fs |"
+                " absorb+o_proj %.3fs | tail %.3fs\n",ph[0],ph[1],ph[2]); }
 }
 static int dsc_enabled(void){
     if(g_dsc_on<0){ g_dsc_on=getenv("COLI_DBG_DSACHAIN")?atoi(getenv("COLI_DBG_DSACHAIN")):0;
@@ -2795,7 +2799,10 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if(sel_need){
         dsc_enabled();
         int sB0=c->index_topk-pos_base; if(sB0<0) sB0=0;
-        if(!(dsa_chain_on() && S>=16)) goto sel_fail;
+        if(!(dsa_chain_on() && S>4)) goto sel_fail;   /* S<=4 e' territorio della catena;
+                                                        * 5..15 riempie tile wmma a meta'
+                                                        * ma batte di GRAN lunga la CPU
+                                                        * O(T)/riga (append agentici!) */
         if(c->idx_type[layer]){
             QT *wq=&m->ix_wq[layer],*wk=&m->ix_wk[layer],*wp=&m->ix_wp[layer];
             if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
@@ -3010,7 +3017,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     if((g_cuda_pipe||g_cuda_prefill)&&
        !kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
        (!(m->has_dsa&&pos_base+S>c->index_topk) ||
-        (dsa_chain_on()&&!g_dsa_force&&S>=16&&m->kv_start[layer]==0))&&
+        (dsa_chain_on()&&!g_dsa_force&&S>4&&m->kv_start[layer]==0))&&
        l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
        l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
        qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
@@ -4384,7 +4391,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
      * ignorerebbe la selezione. */
     int sel_pref = m->has_dsa && li<c->n_layers && !g_dsa_force && S>4 &&
                    pos_base+S>c->index_topk;
-    if(sel_pref && !(S>=16 && m->kv_start[li]==0 && dsa_chain_on())) return 0;
+    if(sel_pref && !(m->kv_start[li]==0 && dsa_chain_on())) return 0;
     /* COLI_DBG_DSACHAIN=1: contatori d'ingaggio (full/shared ok, fallback e dove) */
     dsc_enabled();
     #define DSC_FB(tag) do{ if(g_dsc_on){ g_dsc_fb_pre++; if(g_dsc_fb_pre<=20) \
@@ -4697,14 +4704,15 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                                                      : (g_cuda_ndev<=1 ? 1 : 8);
     /* DSA oltre index_topk: la catena residente gestisce la selezione per i
      * batch decode (S<=4) INTERAMENTE oltre la soglia (fase 2 inc.2); i batch
-     * prefill (S>=16) fanno la selezione per riga nel percorso GEMM (inc.3,
-     * split di fase in attn_pipe_prefill).  Batch 5..15 e batch decode a
-     * cavallo della soglia restano sul percorso CPU.  COLI_DSA_CHAIN=0
+     * S>4 fanno la selezione per riga nel percorso GEMM (inc.3, split di fase
+     * in attn_pipe_prefill; il limite storico S>=16 lasciava gli append
+     * agentici 5..15 sulla CPU O(T)/riga — 80s per 8 token a 13.4k).  Solo i
+     * batch decode a cavallo della soglia restano su CPU.  COLI_DSA_CHAIN=0
      * ripristina il comportamento tutto-CPU. */
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 (!(m->has_dsa && pos_base+S>c->index_topk) ||
                  (dsa_chain_on() && !g_dsa_force &&
-                  (S<=4 ? pos_base>=c->index_topk : S>=16)));
+                  (S<=4 ? pos_base>=c->index_topk : 1)));
     /* TAP/INJECT leggono/scrivono il residuo HOST dopo ogni layer; sotto PIPE2 x resta
      * sul device (stale sul host) -> i hook vedrebbero dati morti. Niente fallback muti. */
     if(pipe2 && (g_tap_l>=0 || g_inj_l>=0)){
@@ -4904,6 +4912,23 @@ static void kv_alloc(Model *m, int max_t){
 static void kv_bind(Model *m, KVState *k){
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
+}
+
+/* Rewind del prefisso (serve/mux/reset): le righe host [len,..) verranno
+ * riscritte, quindi i watermark delle OMBRE device vanno riportati a len.
+ * Senza questo clamp, un prefill post-rewind che ripiega su CPU lascerebbe
+ * cuda_valid oltre la storia vera e l'attention assorbirebbe righe stantie
+ * dall'ombra (il percorso GPU si auto-riparava, quello CPU no). */
+static void kv_shadow_rewind(Model *m, KVState *k, int len){
+#ifdef COLI_CUDA
+    if(!k) return;
+    if(k->cuda_valid)    for(int i=0;i<m->c.n_layers;i++)
+        if(k->cuda_valid[i]>len) k->cuda_valid[i]=len;
+    if(k->cuda_ic_valid) for(int i=0;i<m->c.n_layers;i++)
+        if(k->cuda_ic_valid[i]>len) k->cuda_ic_valid[i]=len;
+#else
+    (void)m;(void)k;(void)len;
+#endif
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
@@ -6205,6 +6230,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
     int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+        kv_shadow_rewind(m,&sc->kv,prefix);
         kv_disk_truncate(m,sc->len); }
     int add=nt-sc->len;
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
@@ -6376,6 +6402,7 @@ static void run_serve(Model *m, const char *snap){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ adaptive_cap_note_used(len);
             len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+            kv_shadow_rewind(m,m->kv,0);
             kv_disk_reset(m);
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
@@ -6437,6 +6464,7 @@ static void run_serve(Model *m, const char *snap){
             if(prefix<old_len){
                 len=prefix;
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+                kv_shadow_rewind(m,m->kv,len);
                 kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
             }
             k=prompt_tokens-len;
@@ -6449,7 +6477,8 @@ static void run_serve(Model *m, const char *snap){
                        bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
-            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
+            if(len+k+8+g_draft>=maxctx){ len=0; first=1;
+                kv_shadow_rewind(m,m->kv,0); kv_disk_reset(m);
                 bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;

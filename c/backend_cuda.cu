@@ -33,6 +33,7 @@ typedef struct {
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *cvt; size_t cvt_cap;                 /* staging fp32 per upload_kv f16 */
+    cudaEvent_t dbg_ev[4]; int dbg_ev_init;     /* COLI_DBG_DSACHAIN=2: fasi catena */
     float *pf_q,*pf_c,*pf_s; size_t pf_q_cap,pf_c_cap,pf_s_cap; /* prefill GEMM attention */
     int smem_optin;                             /* smem opt-in per l'absorb a T lunghi */
     int absorb_attr_set, ragged_attr_set;       /* attributo gia' alzato per kernel */
@@ -561,6 +562,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
         ctx->cvt=nullptr; ctx->cvt_cap=0;
+        ctx->dbg_ev_init=0;
         ctx->pf_q=ctx->pf_c=ctx->pf_s=nullptr;
         ctx->accum=ctx->wrow_d=nullptr;
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
@@ -1638,6 +1640,19 @@ extern "C" void coli_cuda_dsac_times(double *sync_s, double *topk_s){
     if(sync_s) *sync_s=coli_dsac_t_sync;
     if(topk_s) *topk_s=coli_dsac_t_topk;
 }
+/* COLI_DBG_DSACHAIN=2: tempi GPU cumulativi delle tre fasi della catena
+ * (loop1 proiezioni+scritture KV+scoring, loop2 absorb+o_proj, coda
+ * shared/router/norme) via coppie di cudaEvent sul timeline del device —
+ * attribuisce i 256 ms/token di attention decode a lungo contesto. */
+static double coli_dsac_ph[3]={0,0,0};
+static int dsac_level(void){
+    static int v=-1;
+    if(v<0){ const char *e=getenv("COLI_DBG_DSACHAIN"); v=e?atoi(e):0; }
+    return v;
+}
+extern "C" void coli_cuda_dsac_phase_times(double out[3]){
+    for(int i=0;i<3;i++) out[i]=coli_dsac_ph[i];
+}
 static double dsac_now(void){
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1737,6 +1752,14 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
        cudaFuncSetAttribute(f16?(const void*)absorption_kernel<__half>
                                :(const void*)absorption_kernel<float>,
            cudaFuncAttributeMaxDynamicSharedMemorySize,(int)abs_smem)!=cudaSuccess) return 0;
+    int dbg2=dsac_level()>=2;
+    if(dbg2){
+        if(!ctx->dbg_ev_init){
+            for(int i=0;i<4;i++) cudaEventCreate(&ctx->dbg_ev[i]);
+            ctx->dbg_ev_init=1;
+        }
+        cudaEventRecord(ctx->dbg_ev[0],0);
+    }
     /* loop 1: projections + KV/Ic writes + (FULL layers) selection scoring.
      * Rows>pos in d_Lc/d_Rc are written before the absorb reads them, but the
      * absorb of row s only attends up to pos — same math as the fused order. */
@@ -1794,6 +1817,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
                 1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
         }
     }
+    if(dbg2) cudaEventRecord(ctx->dbg_ev[1],0);
     if(dsa_full){
         /* one mid-chain sync: score rows to host, exact CPU top-k, sel back up.
          * t_sync include il drenaggio implicito della pipeline (tutto il lavoro
@@ -1840,6 +1864,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cx,
             (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
     }
+    if(dbg2) cudaEventRecord(ctx->dbg_ev[2],0);
     add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
     for(int s=0;s<S;s++)
         rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
@@ -1869,6 +1894,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         if(sc) for(int s=0;s<S;s++)
             gemv_f32_kernel<<<(unsigned)E,256>>>(sc+(size_t)s*E,nrm_dev+(size_t)s*D,d_router,D,E);
     }
+    if(dbg2) cudaEventRecord(ctx->dbg_ev[3],0);
     /* single sync point: the canonical-host downloads */
     if(xn_host&&cudaMemcpy(xn_host,xn,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(cudaMemcpy(nrm_host,nrm_dev,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
@@ -1885,6 +1911,14 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
     { cudaError_t ce=cudaGetLastError();
       if(ce!=cudaSuccess){ fprintf(stderr,"[CUDA] attn_chain: %s\n",cudaGetErrorString(ce));
                            return 0; }
+    }
+    if(dbg2){
+        /* i download sincroni sopra garantiscono eventi completati */
+        float a=0,b=0,cph=0;
+        cudaEventElapsedTime(&a,ctx->dbg_ev[0],ctx->dbg_ev[1]);
+        cudaEventElapsedTime(&b,ctx->dbg_ev[1],ctx->dbg_ev[2]);
+        cudaEventElapsedTime(&cph,ctx->dbg_ev[2],ctx->dbg_ev[3]);
+        coli_dsac_ph[0]+=a*1e-3; coli_dsac_ph[1]+=b*1e-3; coli_dsac_ph[2]+=cph*1e-3;
     }
     return 1;
 }

@@ -61,7 +61,9 @@ the defaults do this. Knobs and caveats:
 - Context ceiling (post inc.5): DSA/GEMM paths run to **T<=131072**; the dense
   absorb kernels go to ~56k on Hopper via the dynamic-smem opt-in and fall back
   to CPU beyond.  Measured at 13.4k: DSA 2.98 vs dense 1.83 tok/s (+63%) and
-  prefill 780 vs 872 s.
+  prefill 780 vs 872 s.  Validated at 26.8k (CTX=32768): prefill 1621 s
+  (linear in tokens), decode 2.09 tok/s, zero fallbacks; the decode T-growth
+  is the three DENSE layers' O(T) full attention, not DSA.
 - Device KV/Ic shadows are **fp16 by default** (inc.7, `COLI_KV_F16=0` restores
   fp32): ~0.7 GB/GPU at 16k, ~12 GB/GPU at 256k — budget `CUDA_EXPERT_GB`
   accordingly at 32k+.  Host KV stays exact fp32; the mode is performance-

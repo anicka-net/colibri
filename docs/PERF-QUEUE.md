@@ -272,6 +272,40 @@ where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
+### 8. Multi-user serving (reliability first, pipelining later)
+Findings from the 2026-07-19 serve-path review.  What EXISTS: per-slot KV
+isolation + prefix reuse in both serve modes (requests diff against slot
+history, only the delta prefills — the `[API] KV slot N prefix a/b, prefill k`
+line); frontend admission (capacity=KV_SLOTS, bounded queue, 429 overflow);
+mux (`SERVE_BATCH=1`) batched ragged decode with fair per-token interleaving.
+The rewind/shadow-staleness hazard (host truncation without clamping
+`cuda_valid`/`cuda_ic_valid`) is FIXED via `kv_shadow_rewind` at all four
+truncation sites.  Open items, in priority order:
+- **Chunked prefill in mux**: a new submit's prefill runs synchronously in
+  `mux_submit` and stalls every active stream — minutes at 100k+ context.
+  Interleave decode iterations between prefill chunks.
+- **Ragged-safe chain + DSA decode**: `step_decode_batch` passes `kvs[]`, and
+  both the resident chain and the GPU selection decode are gated `!kvs` — so
+  two simultaneous users drop to the slow ragged/CPU attention (and mux
+  disables MTP).  Extending the chain to per-row KV states recovers
+  single-user-class decode for small user counts.
+- **Per-slot memory budget**: each slot costs host KV (~23 GB @131k) plus
+  fp16 device shadows (~12 GB @131k) — KV_SLOTS × CTX collides with
+  `CUDA_EXPERT_GB`; the adaptive-cap idea (borrow untouched reservations)
+  generalizes here.
+- **LONG-TERM (explicit goal, not today): pipeline users across GPUs /
+  interconnected Sparks** — per-user home devices or layer-pipeline
+  parallelism so concurrent users scale with hardware instead of sharing one
+  decode batch.  Prereqs: the ragged-safe chain above, per-slot device
+  residency, and (Spark) network-transparent expert tiers.  The planned Spark
+  fabric is RoCE + NVMe-oF, which changes the shape of all three: the
+  inter-stage payload is one residual vector (~24 KB/token — RDMA makes layer
+  pipelining latency-trivial), a single NVMe-oF expert store serves every
+  Spark (one snapshot copy; remote-miss latency makes prefetch lead time
+  worth MORE than bandwidth), and a peer Spark's RAM over RDMA slots between
+  local RAM and NVMe as a distributed expert-cache tier driven by the
+  placement stats we already collect.
+
 ## Measured dead ends (do not revisit without new evidence)
 - Spark 131k/cap-17 coupling prefetch: K1 is neutral; K2/K4/K8 regress as
   speculative reads evict useful experts.  Depth 2 also thrashes cap 63.
@@ -403,6 +437,36 @@ the deployed path.  Revisit only with a measured concurrent/ragged workload.
 Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
+
+#### Increment 9 — serve-path hardening + attribution + the 5..15 gate (landed)
+Four things from the 2026-07-19 serving/validation pass:
+1. **32k VALIDATED** (26,844 tokens, CTX=32768, frozen usage): prefill
+   1620.8 s — linear in token count vs 780 s at 13.4k — decode 2.09 tok/s,
+   ZERO fallbacks.  First run past 2x the old cap.
+2. **`kv_shadow_rewind`**: history truncation (serve prefix rewind, RESET,
+   context-overflow reset) now clamps the device shadow watermarks
+   (`cuda_valid`/`cuda_ic_valid`).  Before, a post-rewind prefill that hit a
+   CPU-fallback layer left the shadow claiming validity over stale rows —
+   silent corruption on the next decode.  Fixed at all four truncation sites.
+3. **Turn-append smoke (the agentic number)**: serve protocol, 13.4k-token
+   prefix, three turns.  Cold prefill 775 s; an 18-token append (over the
+   rewind path) **7.8 s**.  Prefix/KV reuse across turns works end-to-end.
+   The third turn (8-token append) exposed the **5..15 row hole**: the GPU
+   selection paths were gated `S>=16` while the chain covers `S<=4`, so small
+   appends — exactly the agentic pattern — ran CPU O(T)-per-row selection on
+   all 78 layers: **80 s for 8 tokens**.  Gates relaxed to `S>4` (wmma tiles
+   pad at 5..15 rows; still far ahead of CPU).
+4. **Decode-attention attribution (the inc.6 puzzle, resolved)**:
+   `COLI_DBG_DSACHAIN=2` adds CUDA-event phase timing to the chain.  At
+   13.4k the chain's GPU time is ~120 ms/token — proj+kv+score 0.58 s,
+   **absorb+o_proj 4.73 s (88%)**, tail 0.12 s over the smoke's decode — and
+   the NON-chain residual is the three DENSE layers (L0-2), which bypass the
+   chain, run per-token `attn_pipe_prefill` with an O(T) full absorb in the
+   64-block launch shape, and inflate the misnamed projection/RoPE bucket
+   (8.35 s @13.4k -> 16.56 s @26.8k, exactly linear in T).  NEXT decode
+   levers, in order: (a) route the dense layers through the resident chain
+   (kills the O(T)-with-sync-drain per token), (b) split-T/multi-block absorb
+   launch shape (helps both dense absorb and the 1.4 ms/layer sel-absorb).
 
 #### Increment 8 — device-side top-k for prefill selection (landed, default ON)
 `COLI_DSA_DEVTOPK=1` (default; `=0` restores the host top-k) moves the
