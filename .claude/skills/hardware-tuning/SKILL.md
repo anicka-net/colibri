@@ -65,6 +65,15 @@ here.  Measured gotchas, each of which produced a working-but-wrong service:
   service user cannot read the journal, add
   `StandardError=append:%h/.colibri/server.log` — otherwise startup failures are
   invisible.  `/health` and `/profile` expose tier sizes and per-turn timings.
+- **Model identity**: the shipped unit hardcodes `--model-alias deepseek-v4-pro
+  --hidden-model-alias deepseek-chat` and the other env example sets a
+  `deepseek-*` `COLI_MODEL_ID`, so that a DS4-compatible deployment can keep its
+  existing clients.  Drop both unless something depends on them — otherwise
+  `/v1/models` advertises DeepSeek ids for a GLM model, which confuses every
+  client that lists models.
+- **`enable`, not just `start`**: `loginctl enable-linger` restarts the user
+  manager, which stops a merely-started unit and (being disabled) never brings
+  it back — the same reason it would not survive a reboot.
 
 Expected throughput, short prompts, `CUDA_EXPERT_GB=150`: **~9 tok/s** direct,
 **~5-6 tok/s** through the HTTP/streaming path.  The 19.6 tok/s headline is a
