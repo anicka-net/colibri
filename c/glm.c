@@ -6092,15 +6092,15 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     int64_t planned64=(int64_t)nt+sub.max_tokens;
     int planned=planned64>maxctx?maxctx:(int)planned64;
     adaptive_cap_set(m,planned);
+    ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
+    r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
+    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    prof_base(m,&r->pb);
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
-    ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
-    r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
-    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
-    prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
     int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
     g_temp=r->temp; g_nuc=r->top_p;
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
