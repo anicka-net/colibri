@@ -268,6 +268,16 @@ where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
+A four-prompt score trace found that most of the stale predictor's correctable
+error is a static per-layer expert bias. Leave-one-prompt-out K6 recall rose
+60.74% -> 63.31% on every fold; rank-2/4/8 corrections added nothing beyond
+the 75x256 bias table. The first live cap-17 probe was bandwidth-positive but
+latency-neutral: versus stale K6, hit rate rose 75.7% -> 76.5% and fetched
+bytes fell 739 -> 705 GB, while 128-token wall time moved 118.8 -> 119.9 s.
+The existing shared-expert two-step reached 76.9% hit / 701 GB but took
+122.1 s. Do not deploy from this single prompt; run a fixed-token multi-prompt
+A/B before choosing between stale, bias, and two-step.
+
 ## Measured dead ends (do not revisit without new evidence)
 - Spark 131k/cap-17 coupling prefetch: K1 is neutral; K2/K4/K8 regress as
   speculative reads evict useful experts.  Depth 2 also thrashes cap 63.
