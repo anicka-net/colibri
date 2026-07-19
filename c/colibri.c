@@ -133,7 +133,12 @@ typedef struct {
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+                 int64_t slab_cap, fslab_cap; uint64_t used;
+                 /* pin-arena backing (#419): when set, slab/fslab are interior
+                  * slices of a per-layer arena and must never be free()d —
+                  * expert_host_release detaches them, expert_host_ensure
+                  * re-attaches. NULL for every individually-allocated slot. */
+                 uint8_t *aslab; float *afslab; } ESlot;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -549,8 +554,17 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
  * +40% on a 4-socket (#82). Blanket `numactl --interleave=all` is NOT equivalent:
  * it also interleaves the CUDA pinned staging buffers and cost a 4-socket GPU host
  * 10x (#82) — hence per-region mbind here and nothing else. Raw syscall, no libnuma
- * dependency; MPOL_MF_MOVE migrates pages of reused heap chunks too. Linux-only,
- * silent no-op elsewhere or on single-node hosts. */
+ * dependency. Linux-only, silent no-op elsewhere or on single-node hosts.
+ *
+ * VMA discipline (#419): every mbind carries its own memory policy, so a bound
+ * region cannot merge with its neighbours — measured ~2 VMAs per slab, with or
+ * without MPOL_MF_MOVE. Per-slab binds on a PIN_GB=all load (19,456 experts x
+ * slab+fslab) cross the default vm.max_map_count=65530 and posix_memalign dies
+ * with terabytes free. So the bulk (the pinned hot-store) is bound as ONE arena
+ * per layer (see pin_load), and per-slab mbind remains only for the bounded
+ * allocations: dense qalloc, the LRU ecache, and GPU-tier staging. No flag:
+ * every bind here lands before the pread that first-touches the pages, so
+ * there is nothing to migrate. */
 #ifdef __linux__
 static int g_numa_nodes=0;      /* only touched under __linux__; off-Linux NUMA is a no-op */
 #endif
@@ -561,7 +575,7 @@ static void numa_slab_bind(void *p, size_t n){
     uintptr_t a=(uintptr_t)p & ~(uintptr_t)4095;
     size_t len=(((uintptr_t)p+n+4095) & ~(uintptr_t)4095) - a;
     syscall(SYS_mbind,a,len,3/*MPOL_INTERLEAVE*/,&mask,
-            (unsigned long)(g_numa_nodes+1),(unsigned)2/*MPOL_MF_MOVE*/);
+            (unsigned long)(g_numa_nodes+1),0);
 #else
     (void)p;(void)n;
 #endif
@@ -571,8 +585,25 @@ static void numa_init(void){
     if(!getenv("COLI_NUMA")||!atoi(getenv("COLI_NUMA"))) return;
     for(int i=0;i<64;i++){ char pth[64]; snprintf(pth,sizeof(pth),"/sys/devices/system/node/node%d",i);
         struct stat st; if(stat(pth,&st)) break; g_numa_nodes=i+1; }
-    if(g_numa_nodes>=2) fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
-    else fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n");
+    if(g_numa_nodes<2){ fprintf(stderr,"[NUMA] single node: COLI_NUMA ignored\n"); return; }
+    /* Probe mbind once so a constrained container degrades with a message
+     * instead of silently losing the interleave. The probe page must be
+     * page-aligned (mbind rejects unaligned addresses with EINVAL) and only
+     * errno==EPERM disables — any other failure keeps NUMA on. */
+    { void *pg=NULL;
+      if(!posix_memalign(&pg,4096,4096)){
+          unsigned long mask=(1UL<<g_numa_nodes)-1; errno=0;
+          long rc=syscall(SYS_mbind,pg,4096,3/*MPOL_INTERLEAVE*/,&mask,
+                          (unsigned long)(g_numa_nodes+1),0);
+          int eperm = rc<0 && errno==EPERM;
+          free(pg);
+          if(eperm){
+              fprintf(stderr,"[NUMA] mbind not permitted (EPERM) — COLI_NUMA disabled\n");
+              g_numa_nodes=1; return;
+          }
+      }
+    }
+    fprintf(stderr,"[NUMA] expert slabs interleaved across %d nodes\n",g_numa_nodes);
 #endif
 }
 
@@ -1690,13 +1721,17 @@ static void expert_host_release(Model *m, ESlot *s){
      * fixed at the original expert_load site. fslab is plain malloc/falloc
      * on the CPU path, so its free() stays plain (Metal path frees it before
      * re-alloc and never reaches here with an aligned fslab on _WIN32). */
-    compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
+    if(s->aslab){ s->slab=NULL; s->fslab=NULL; }  /* arena slice (#419): detach, keep caps, never free */
+    else { compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0; }
     QT *q[3]={&s->g,&s->u,&s->d};
     for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
 }
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
-    if(!s->slab) expert_load(m,layer,s->eid,s,1,0);   /* re-materializing a GPU-resident expert's host copy, not a routing miss: demand=0 */
+    if(s->slab) return;
+    if(s->aslab){ s->slab=s->aslab; s->fslab=s->afslab; }  /* re-attach the arena slice; caps survived release */
+    /* re-materializing a GPU-resident expert's host copy, not a routing miss: demand=0 */
+    expert_load(m,layer,s->eid,s,1,0);                     /* rebuild the QT views (release NULLed them) + reload */
 }
 #endif
 
@@ -4960,6 +4995,56 @@ typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
+
+#ifdef __linux__
+/* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
+ * per slab. Per-slab policies cost ~2 unmergeable VMAs each; a PIN_GB=all load
+ * (19,456 experts x slab+fslab) crosses the default vm.max_map_count=65530 and
+ * posix_memalign dies with terabytes free. Experts of one layer share a tensor
+ * shape, so a layer's pins pack into two arenas (weights + scales) at a fixed
+ * stride: 2 binds and a handful of VMAs per layer instead of ~500. Slices are
+ * pre-attached to the slots (slab_cap covers expert_load's realloc check, so
+ * its alloc branch never fires); aslab marks arena ownership for the
+ * release/ensure paths. Arena-OOM just leaves the slots on the individual path. */
+static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
+    if(g_numa_nodes<2 || g_mmap || from>=to) return;
+    Cfg *c=&m->c; int NR=c->n_layers+1;
+    int *cnt=calloc((size_t)NR,sizeof(int)); int *first=malloc((size_t)NR*sizeof(int));
+    if(!cnt||!first){ free(cnt); free(first); return; }
+    for(int i=0;i<NR;i++) first[i]=-1;
+    for(int a=from;a<to;a++){ if(first[r[a].l]<0) first[r[a].l]=a; cnt[r[a].l]++; }
+    const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    for(int l=0;l<NR;l++){
+        if(cnt[l]<2) continue;
+        int64_t wtot=0, qtot=0; int ok=1;
+        for(int k=0;k<3 && ok;k++){
+            char nm[288],qn[300];
+            snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",l,r[first[l]].e,suf[k]);
+            snprintf(qn,sizeof qn,"%s.qs",nm);
+            st_tensor *tw=st_find(&m->S,nm), *tq=st_find(&m->S,qn);
+            if(!tw||!tq) ok=0; else { wtot+=tw->nbytes; qtot+=tq->nbytes; }
+        }
+        if(!ok) continue;                     /* unquantized fallback: individual allocs */
+        size_t ws=((size_t)wtot+8192+4095)&~(size_t)4095;
+        size_t fs=((size_t)(qtot/4)*sizeof(float)+4095)&~(size_t)4095;
+        uint8_t *aw=NULL; float *af=NULL;
+        if(posix_memalign((void**)&aw,4096,(size_t)cnt[l]*ws)) continue;
+        if(posix_memalign((void**)&af,4096,(size_t)cnt[l]*fs)){ free(aw); continue; }
+        numa_slab_bind(aw,(size_t)cnt[l]*ws);
+        numa_slab_bind(af,(size_t)cnt[l]*fs);
+        int i=0;
+        for(int a=from;a<to;a++){
+            if(r[a].l!=l) continue;
+            ESlot *s=&m->pin[l][slot_of[a]];
+            s->slab=aw+(size_t)i*ws;   s->slab_cap=(int64_t)ws;   s->aslab=s->slab;
+            s->fslab=(float*)((uint8_t*)af+(size_t)i*fs);
+            s->fslab_cap=(int64_t)(fs/sizeof(float));             s->afslab=s->fslab;
+            i++;
+        }
+    }
+    free(cnt); free(first);
+}
+#endif
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
 static void pin_load(Model *m, const char *statspath, double gb){
     FILE *f=fopen(statspath,"r"); if(!f){ perror(statspath); return; }
@@ -5034,6 +5119,11 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(prefix_est>0){ gpu_prefix=prefix_est; if(gpu_prefix>npin) gpu_prefix=npin; }
 #else
     int gpu_prefix=0;
+#endif
+#ifdef __linux__
+    /* CPU-resident pins only: the GPU prefix stays on individual allocs (its
+     * host backing is released after upload; arena slices are never freed). */
+    pin_arena_bind(m,r,slot_of,gpu_prefix,npin);
 #endif
     /* Load the VRAM-ranked prefix first.  Once uploaded its host backing is
      * released before the disjoint RAM-ranked suffix is allocated. */
