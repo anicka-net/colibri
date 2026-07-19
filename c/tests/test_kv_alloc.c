@@ -3,6 +3,7 @@
  * call it again. A stale duplicate free block frees every Lc[i]/Rc[i] and both
  * arrays twice on the second call -> allocator abort. No model file needed:
  * the CPU path of kv_alloc only reads c->n_layers/kv_lora/qk_rope. */
+#include <assert.h>
 #define main coli_glm_main_unused
 #include "../glm.c"
 #undef main
@@ -18,6 +19,13 @@ int main(void){
         m.Lc[i][(int64_t)32*m.c.kv_lora-1]=2.0f;
         m.Rc[i][(int64_t)32*m.c.qk_rope-1]=2.0f;
     }
+    m.ecap_alloc=100;
+    g_adaptive_cap_floor=17; g_adaptive_cap_maxctx=100; g_adaptive_cap_margin=10;
+    g_adaptive_cap_kv_token_b=2; g_adaptive_cap_scratch_token_b=1;
+    g_adaptive_cap_slot_b=10; g_adaptive_cap_highwater=0;
+    assert(adaptive_cap_target(&m,10)==41);
+    g_adaptive_cap_highwater=90;
+    assert(adaptive_cap_target(&m,10)==27);
     printf("OK kv_alloc re-allocation\n");
     return 0;
 }
