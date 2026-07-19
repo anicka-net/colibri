@@ -156,6 +156,7 @@ typedef struct {
 #ifdef COLI_CUDA
     float **cuda_Lc,**cuda_Rc;
     int *cuda_valid;
+    float **cuda_Ic; int *cuda_ic_valid;         /* ombra device della cache indexer DSA */
 #endif
     int disk_nrec;
     char disk_path[2048];
@@ -1718,6 +1719,13 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 m->ix_wp[i]=qt_load(m,PI("weights_proj.weight"), c->index_nh, D, dbits);
                 m->ix_knw[i]=ld(m,PI("k_norm.weight")); m->ix_knb[i]=ld(m,PI("k_norm.bias"));
                 #undef PI
+#ifdef COLI_CUDA
+                /* selezione in-chain (fase 2 inc.2): l'indexer vive sulla
+                 * scheda home del layer, come il resto della catena attention */
+                qt_cuda_colocate(&m->ix_wq[i],&m->L[i].kv_b);
+                qt_cuda_colocate(&m->ix_wk[i],&m->L[i].kv_b);
+                qt_cuda_colocate(&m->ix_wp[i],&m->L[i].kv_b);
+#endif
             }
             fprintf(stderr,"[DSA] indexer active: top-%d sparse attention beyond %d context tokens\n",
                 c->index_topk, c->index_topk);
@@ -2483,6 +2491,49 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
     return 1;
 }
 
+/* Ombra device della cache indexer DSA (Ic), stessa disciplina di kv_dev_sync:
+ * host canonico, righe [0,upto) valide sulla scheda di kv_b. */
+static int ic_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
+    Cfg *c=&m->c; int hd=c->index_hd, dev=l->kv_b.cuda_device;
+    if(!ks||!ks->Ic||!ks->Ic[layer]||upto>ks->max_t) return 0;
+    if(!ks->cuda_Ic[layer]){
+        float *Ic=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*hd*4);
+        if(!Ic) return 0;
+        ks->cuda_Ic[layer]=Ic;
+        ks->cuda_ic_valid[layer]=0;
+    }
+    int v=ks->cuda_ic_valid[layer];
+    if(v<upto){
+        if(!coli_cuda_pipe_upload(dev,ks->cuda_Ic[layer]+(size_t)v*hd,
+            coli_kv_row(ks->Ic[layer],v,hd),(size_t)(upto-v)*hd*4)) return 0;
+        ks->cuda_ic_valid[layer]=upto;
+    }
+    return 1;
+}
+
+/* Host top-k per la selezione in-chain: STESSA semantica del blocco CPU in
+ * attention_rows (partial_select threshold, poi scan in ordine di posizione,
+ * > prima e == dopo) sui punteggi calcolati dal device.  scores[s] alla riga
+ * s*(pos_base+S), nk=pos_base+s+1 valori.  Chiamato dal backend a meta' catena. */
+static int chain_dsa_topk(void *u, const float *scores, int S, int pos_base,
+                          int dtopk, int *sel, int *nsel){
+    (void)u; int T=pos_base+S;
+    for(int s=0;s<S;s++){
+        int nk=pos_base+s+1, keep=nk<dtopk?nk:dtopk;
+        const float *isc=scores+(size_t)s*T;
+        float *tmp=falloc(nk); memcpy(tmp,isc,(size_t)nk*sizeof(float));
+        partial_select_desc(tmp,nk,keep);
+        float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
+        int *dst=sel+(int64_t)s*dtopk, nd=0;
+        for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
+        for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
+        nsel[s]=nd;
+        free(tmp);
+        if(nd<1) return 0;
+    }
+    return 1;
+}
+
 /* Inc.1a — catena attention residente sul device del layer / attention chain
  * resident on the layer home device. Proiezioni q/kv, norme, RoPE, batch
  * attention e o_proj girano sulla scheda di kv_b; scaricano solo out [S,D],
@@ -2496,6 +2547,12 @@ static float *g_group_accum_xdev=NULL;        /* pipe path: routed experts accum
 static int g_group_accum_home=-1;  /* router logits computed on-device by the fused chain */
 static float *chain_scores=NULL; size_t chain_scores_cap=0; /* fused-chain router logits [S,E] */
 static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln rows [S,D] for DSA k_idx */
+/* COLI_DBG_DSACHAIN: engagement counters for the in-chain DSA selection */
+static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain; static int g_dsc_on=-1;
+static void dsc_report(void){
+    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld | fallback: pre %ld chain %ld\n",
+            g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain);
+}
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
     static float *cache[8][256]; static int cdev[8][256];
     if(layer<0||layer>=256||slot<0||slot>=8) return NULL;
@@ -2743,6 +2800,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 KVState *ks=kvs?kvs[s]:m->kv;
                 int pos=positions?positions[s]:pos_base+s;
                 float *kd=coli_kv_row(ks->Ic[layer],pos,hd);
+#ifdef COLI_CUDA
+                if(ks->cuda_ic_valid&&ks->cuda_ic_valid[layer]>pos)
+                    ks->cuda_ic_valid[layer]=pos;            /* riga riscritta: ombra accorciata */
+#endif
                 memcpy(kd, KD+(int64_t)s*hd, (size_t)hd*sizeof(float));
                 layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], hd, 1e-6f);
                 rope_interleave(kd, pos, c);                 /* primi qk_rope dim, interleaved */
@@ -4028,8 +4089,67 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
      * device-resident, single sync.  DSA-indexer layers and non-int4 weights
      * fall back to the op-by-op path below. */
     int dsa_idx_layer = m->has_dsa && li<c->n_layers && c->idx_type[li];
+    /* DSA fase 2 inc.2 — selezione DENTRO la catena quando tutte le righe del
+     * batch sono oltre index_topk: i layer FULL calcolano k_idx + punteggi sul
+     * device (ombra Ic), il top-k resta sull'host (chain_dsa_topk, semantica
+     * bit-identica al percorso CPU sui punteggi device), i layer SHARED
+     * riusano m->dsa_sel.  Qualsiasi prerequisito mancante -> return 0: il
+     * layer va per intero sul percorso CPU, che ha la semantica completa
+     * (MAI il fallback op-by-op denso, che ignorerebbe la selezione). */
+    int sel_active = m->has_dsa && li<c->n_layers && !g_dsa_force &&
+                     pos_base>=c->index_topk && m->kv_start[li]==0;
+    /* COLI_DBG_DSACHAIN=1: contatori d'ingaggio (full/shared ok, fallback e dove) */
+    if(g_dsc_on<0){ g_dsc_on=getenv("COLI_DBG_DSACHAIN")?atoi(getenv("COLI_DBG_DSACHAIN")):0;
+                    if(g_dsc_on) atexit(dsc_report); }
+    #define DSC_FB(tag) do{ if(g_dsc_on){ g_dsc_fb_pre++; if(g_dsc_fb_pre<=20) \
+        fprintf(stderr,"[DSAC] pre-fb %s li=%d\n",tag,li);} return 0; }while(0)
+    ColiCudaDsaChain dsac, *pdsa=NULL;
+    int chain_did_sel=0;
+    if(sel_active){
+        if(S>4) DSC_FB("S");
+        if((int64_t)S*c->index_topk > m->dsa_scap){
+            free(m->dsa_sel); free(m->dsa_nsel);
+            m->dsa_scap=(int64_t)S*c->index_topk;
+            m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+            m->dsa_nsel=calloc((size_t)S,sizeof(int));
+            if(!m->dsa_sel||!m->dsa_nsel) DSC_FB("alloc");
+        }
+        memset(&dsac,0,sizeof dsac);
+        dsac.topk=c->index_topk; dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel;
+        if(dsa_idx_layer){
+            QT *wq=&m->ix_wq[li],*wk=&m->ix_wk[li],*wp=&m->ix_wp[li];
+            if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
+               !qt_cuda_upload(wq)||!qt_cuda_upload(wk)||!qt_cuda_upload(wp)||
+               wq->cuda_device!=dev||wk->cuda_device!=dev||wp->cuda_device!=dev)
+                DSC_FB("ix");
+            float *knw=li<256?pipe_ln_cache(dev,li,5,m->ix_knw[li],(size_t)c->index_hd):NULL;
+            float *knb=li<256?pipe_ln_cache(dev,li,6,m->ix_knb[li],(size_t)c->index_hd):NULL;
+            if(!knw||!knb) DSC_FB("kn");
+            if(!ic_dev_sync(m,l,m->kv,li,pos_base)) DSC_FB("icsync");
+            static float *chain_iscore=NULL; static size_t chain_iscore_cap=0;
+            size_t need=(size_t)S*(pos_base+S);
+            if(need>chain_iscore_cap){
+                float *p=realloc(chain_iscore,need*sizeof(float));
+                if(!p) DSC_FB("iscore");
+                chain_iscore=p; chain_iscore_cap=need;
+            }
+            dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
+            dsac.knw_dev=knw; dsac.knb_dev=knb;
+            dsac.d_Ic=m->kv->cuda_Ic[li];
+            dsac.nh=c->index_nh; dsac.hd=c->index_hd;
+            dsac.iscore_host=chain_iscore;
+            dsac.topk_fn=chain_dsa_topk; dsac.topk_user=m;
+            dsac.ic_host=m->Ic[li]+(int64_t)pos_base*c->index_hd;
+        }else{
+            /* SHARED: la selezione dell'ultimo layer FULL deve valere per QUESTE righe */
+            for(int s=0;s<S;s++)
+                if(m->dsa_nsel[s]<1||m->dsa_nsel[s]>c->index_topk) DSC_FB("nsel");
+        }
+        pdsa=&dsac;
+    }
+    #undef DSC_FB
     if(S<=4 && li<c->n_layers &&
-       !(dsa_idx_layer && (g_dsa_force || m->kv_start[li]!=0)) &&
+       (sel_active || !(dsa_idx_layer && (g_dsa_force || m->kv_start[li]!=0))) &&
        kv_dev_sync(m,l,m->kv,li,pos_base)){
         size_t scores_n=(size_t)S*c->n_experts;
         if(scores_n>chain_scores_cap){
@@ -4061,13 +4181,20 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                g_fuse_shared?l->sh_gate.cuda:NULL,
                g_fuse_shared?l->sh_up.cuda:NULL,
                g_fuse_shared?l->sh_down.cuda:NULL,sI,
-               dsa_idx_layer?chain_xn:NULL)){
+               dsa_idx_layer?chain_xn:NULL,pdsa)){
             m->kv->cuda_valid[li]=pos_base+S;
+            if(g_dsc_on&&sel_active){ if(dsa_idx_layer)g_dsc_full++; else g_dsc_shared++; }
+            if(sel_active&&dsa_idx_layer){
+                /* k_idx calcolato sul device: righe host arrivate via ic_host */
+                chain_did_sel=1;
+                m->kv->cuda_ic_valid[li]=pos_base+S;
+            }
             if(!isnan(chain_scores[0])) chain_pre_logits=1;
             if(g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda) chain_did_shared=1;
-            if(dsa_idx_layer){           /* index keys for future top-k selection */
+            if(dsa_idx_layer&&!chain_did_sel){   /* index keys for future top-k selection */
                 for(int s=0;s<S;s++){ int pos=pos_base+s;
                     float *kd=m->Ic[li]+(int64_t)pos*c->index_hd;
+                    if(m->kv->cuda_ic_valid[li]>pos) m->kv->cuda_ic_valid[li]=pos;
                     matmul_qt(kd, chain_xn+(int64_t)s*D, &m->ix_wk[li], 1);
                     layernorm(kd, m->ix_knw[li], m->ix_knb[li], c->index_hd, 1e-6f);
                     rope_interleave(kd, pos, c);
@@ -4076,6 +4203,11 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
             m->t_attn+=now_s()-ta;
             goto attn_done;
         }
+    }
+    if(sel_active){            /* niente fallback denso sotto selezione: layer intero su CPU */
+        if(g_dsc_on){ g_dsc_fb_chain++; if(g_dsc_fb_chain<=20)
+            fprintf(stderr,"[DSAC] chain-fb li=%d\n",li); }
+        return 0;
     }
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_in,S,D,c->eps)) return 0;
     /* DSA: i layer con indexer FULL cachano k_idx dalla nrm pre-attention (CPU, piccolo) */
@@ -4246,8 +4378,15 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     size_t xb=(size_t)S*(size_t)D*4;
     int pipe_s_min = getenv("COLI_CUDA_PIPE_S_MIN") ? atoi(getenv("COLI_CUDA_PIPE_S_MIN"))
                                                      : (g_cuda_ndev<=1 ? 1 : 8);
+    /* DSA oltre index_topk: la catena residente ora gestisce la selezione per i
+     * batch decode (S<=4) INTERAMENTE oltre la soglia (fase 2 inc.2); il prefill
+     * (S>=8) e i batch a cavallo della soglia restano sul percorso CPU.
+     * COLI_DSA_CHAIN=0 ripristina il comportamento precedente (tutto CPU). */
+    static int g_dsa_chain=-1;
+    if(g_dsa_chain<0){ const char *e=getenv("COLI_DSA_CHAIN"); g_dsa_chain=e?atoi(e):1; }
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
-                !(m->has_dsa && pos_base+S>c->index_topk);
+                (!(m->has_dsa && pos_base+S>c->index_topk) ||
+                 (g_dsa_chain && !g_dsa_force && S<=4 && pos_base>=c->index_topk));
     /* TAP/INJECT leggono/scrivono il residuo HOST dopo ogni layer; sotto PIPE2 x resta
      * sul device (stale sul host) -> i hook vedrebbero dati morti. Niente fallback muti. */
     if(pipe2 && (g_tap_l>=0 || g_inj_l>=0)){
@@ -4403,10 +4542,15 @@ static void kv_alloc(Model *m, int max_t){
         if(k->cuda_Lc[i]) coli_cuda_pipe_free(dev,k->cuda_Lc[i]);
         if(k->cuda_Rc[i]) coli_cuda_pipe_free(dev,k->cuda_Rc[i]);
     }
+    if(k->cuda_Ic) for(int i=0;i<c->n_layers;i++)
+        if(k->cuda_Ic[i]) coli_cuda_pipe_free(m->L[i].kv_b.cuda_device,k->cuda_Ic[i]);
     free(k->cuda_Lc);free(k->cuda_Rc);free(k->cuda_valid);
+    free(k->cuda_Ic);free(k->cuda_ic_valid);
     k->cuda_Lc=calloc(c->n_layers,sizeof(float*));
     k->cuda_Rc=calloc(c->n_layers,sizeof(float*));
     k->cuda_valid=calloc(c->n_layers,sizeof(int));
+    k->cuda_Ic=calloc(c->n_layers,sizeof(float*));
+    k->cuda_ic_valid=calloc(c->n_layers,sizeof(int));
 #endif
     if(k->Lc){ for(int i=0;i<c->n_layers+1;i++){
 #ifdef COLI_METAL
@@ -5568,8 +5712,10 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
         int dev=m->L[i].kv_b.cuda_device;
         if(k->cuda_Lc[i]) coli_cuda_pipe_free(dev,k->cuda_Lc[i]);
         if(k->cuda_Rc[i]) coli_cuda_pipe_free(dev,k->cuda_Rc[i]);
+        if(k->cuda_Ic&&k->cuda_Ic[i]) coli_cuda_pipe_free(dev,k->cuda_Ic[i]);
     }
     free(k->cuda_Lc);free(k->cuda_Rc);free(k->cuda_valid);
+    free(k->cuda_Ic);free(k->cuda_ic_valid);
 #endif
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);

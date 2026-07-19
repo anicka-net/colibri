@@ -318,6 +318,41 @@ horizon; late correction alone cannot hide the NVMe read.
    K6 budget only after the above.  Coupling depth 2 already showed the failure
    mode: extra lead time is worthless when accuracy causes cache pollution.
 
+#### DSA phase 2, increment 2 — selection inside the resident chain (landed)
+The pipe2 gate is lifted for decode batches (S<=4) entirely past index_topk:
+`coli_cuda_pipe_attn_chain` gained a DSA mode (`ColiCudaDsaChain`).  FULL
+indexer layers compute the new k_idx row (LayerNorm+RoPE into a per-layer
+device Ic shadow, `ic_dev_sync` mirrors `kv_dev_sync`) and score all context
+tokens on-device (`dsa_score_kernel`), then ONE mid-chain sync downloads the
+score row (~11 KB @2.8k) for the exact host top-k (`chain_dsa_topk` — same
+partial-select + position-order tie-break as the CPU path) and uploads the
+sel list; absorption runs the inc.1 sel-absorb kernel with device-resident q.
+SHARED layers upload the last FULL layer's sel and absorb over it.  Dense
+layers L0-2 (all FULL) keep CPU selection each step, which is what feeds the
+first shared chain layers.  Fallback on any missing prerequisite is the whole
+layer on CPU (full semantics), never dense-under-selection.
+`COLI_DSA_CHAIN=0` restores the old gate; `COLI_DBG_DSACHAIN=1` prints
+engagement counters (full/shared/fallback + reason).
+GOTCHA found on the way: the indexer extraction stores ix_* weights as INT8
+(fmt 1, per-row scales), not int4 — the chain's indexer projections use the
+generic `quant_matmul` (fmt 1/2); a hard `fmt==2` check made every FULL layer
+silently fall back (engagement counters caught it; the run was correct but
+slow, 2.51 tok/s, because CPU fallback preserves semantics).
+MEASURED (2701-token prompt, frozen warmed usage, TEMP=0, MTP=0):
+decode @2.8k **2.48 -> 4.67 tok/s** (2.0x over the 2.34 pre-phase-2 state);
+attention 42.8 -> 19.5 s/128 tok; aproj 26.5 -> 3.6 s (the 3 dense layers'
+CPU selection), score-softmax-value 15.2 -> 0.6 s, chain itself ~15.3 s/128
+(~1.6 ms/layer incl. the per-FULL-layer sync + host top-k).  Engagement
+verified: full 18/18, shared 57/57, fallback 0.  Text identical to dense and
+to the CPU-selection path at DSA_TOPK=32.
+Dense attention at 2.8k is still 5.50 tok/s, so DSA-on decode is now within
+15% of dense at the crossover context and stays ~flat in T while dense grows
+linearly.  Remaining levers (inc.3 candidates): index_topk_freq=4 refresh
+(amortize the 18 per-token sync+topk to every 4th step — native semantics),
+chain-side selection for the 3 dense layers, DSA-on PREFILL (still 268 s,
+non-pipe2 absorb path — per-row prefill selection is the big one), and
+IndexShare for MTP drafts.
+
 #### DSA phase 2, increment 1 — GPU absorb+o_proj over the selection (landed)
 `coli_cuda_attention_project_sel` (absorb over the indexer's top-k list +
 fused o_proj, device KV shadow, selection still CPU/bit-identical) now

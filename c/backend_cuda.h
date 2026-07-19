@@ -115,6 +115,25 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
 
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
+/* DSA selection support for the fused chain (phase 2 inc.2).  All-or-nothing:
+ * pass NULL to keep the dense absorb.  On indexer-FULL layers the ix_* tensors
+ * are set and the chain computes the new k_idx row + selection scores on the
+ * device Ic shadow, downloads the score rows and calls topk_fn (host, exact
+ * CPU top-k) to refresh sel/nsel before the absorb; 'shared' layers pass the
+ * previous FULL layer's sel/nsel with ix_*==NULL.  sel entries are absolute
+ * KV positions (kv_start must be 0). */
+typedef struct {
+    const ColiCudaTensor *ix_wq, *ix_wk, *ix_wp;  /* NULL on 'shared' layers */
+    const float *knw_dev, *knb_dev;   /* k_norm LayerNorm weight/bias, device [hd] */
+    float *d_Ic;                      /* device index-key shadow [max_t, hd] */
+    int nh, hd, topk;
+    int *sel, *nsel;                  /* host [S*topk] / [S]; refreshed on FULL layers */
+    float *iscore_host;               /* host staging [S*(pos_base+S)] for score rows */
+    int (*topk_fn)(void *u, const float *scores, int S, int pos_base, int topk,
+                   int *sel, int *nsel);
+    void *topk_user;
+    float *ic_host;                   /* out: the S new k_idx rows (host Ic canonical) */
+} ColiCudaDsaChain;
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
@@ -129,7 +148,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain(int device,
         float eps, float theta, float attn_scale,
         const float *d_router, int E, float *scores_host,
         const ColiCudaTensor *shg, const ColiCudaTensor *shu,
-        const ColiCudaTensor *shd, int sI, float *xn_host);
+        const ColiCudaTensor *shd, int sI, float *xn_host,
+        ColiCudaDsaChain *dsa);
 COLI_CUDA_DLLEXPORT void *coli_cuda_pipe_alloc(int device,size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_pipe_free(int device,void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload(int device,void *dst,const void *src,size_t bytes);

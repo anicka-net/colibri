@@ -1405,6 +1405,56 @@ __global__ static void add_vec_kernel(float *dst, const float *a, const float *b
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = a[i] + b[i];
 }
+/* LayerNorm (weight+bias) in place, one block — the DSA indexer k_norm. */
+__global__ static void layernorm_kernel(float *x, const float *__restrict__ w,
+                                        const float *__restrict__ b, int n, float eps) {
+    __shared__ float red[256];
+    int tid = threadIdx.x;
+    float s = 0;
+    for (int i = tid; i < n; i += blockDim.x) s += x[i];
+    red[tid] = s; __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float mean = red[0] / n;
+    __syncthreads();                       /* red[] riusato sotto: barriera anti-race */
+    s = 0;
+    for (int i = tid; i < n; i += blockDim.x) { float d = x[i] - mean; s += d * d; }
+    red[tid] = s; __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / n + eps);
+    for (int i = tid; i < n; i += blockDim.x)
+        x[i] = (x[i] - mean) * inv * w[i] + b[i];
+}
+/* DSA lightning-indexer selection scores over the device Ic shadow:
+ *   isc[t] = wsc * Σ_h w32[h] * ReLU(rs * qi[h]·k_idx[t])
+ * qi [nh,hd] (roped) and w32 [nh] live in smem; one thread per token. */
+__global__ static void dsa_score_kernel(float *__restrict__ isc,
+        const float *__restrict__ qi, const float *__restrict__ w32,
+        const float *__restrict__ Ic, int nk, int nh, int hd,
+        float wsc, float rs) {
+    extern __shared__ float sm[];
+    float *sq = sm, *sw = sm + nh * hd;
+    for (int i = threadIdx.x; i < nh * hd; i += blockDim.x) sq[i] = qi[i];
+    for (int i = threadIdx.x; i < nh; i += blockDim.x) sw[i] = w32[i];
+    __syncthreads();
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nk) return;
+    const float *kt = Ic + (size_t)t * hd;
+    float a = 0;
+    for (int h = 0; h < nh; h++) {
+        const float *qh = sq + (size_t)h * hd;
+        float d = 0;
+        for (int i = 0; i < hd; i++) d += qh[i] * kt[i];
+        d *= rs;
+        if (d > 0) a += sw[h] * d;
+    }
+    isc[t] = a * wsc;
+}
 
 /* ---- Fused small-S attention chain (decode fast path) ----
  * The whole per-layer attention — in_ln, q/kv projections, q_a norm, latent+rope
@@ -1431,6 +1481,10 @@ __global__ static void gemv_f32_kernel(float *__restrict__ y, const float *__res
     if (threadIdx.x == 0) y[o] = red[0];
 }
 
+__global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
+        const float *latent,const float *rope,const int *sel,int ns,
+        const void *weights,const float *wscale,int fmt,
+        int H,int Q,int R,int V,int K,float scale);
 extern "C" int coli_cuda_pipe_attn_chain(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
@@ -1445,21 +1499,53 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
         float eps, float theta, float attn_scale,
         const float *d_router, int E, float *scores_host,
         const ColiCudaTensor *shg, const ColiCudaTensor *shu,
-        const ColiCudaTensor *shd, int sI, float *xn_host) {
+        const ColiCudaTensor *shd, int sI, float *xn_host,
+        ColiCudaDsaChain *dsa) {
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!select_ctx(ctx)) return 0;
     if(qa->fmt!=2||qb->fmt!=2||kva->fmt!=2||kvb->fmt!=2||o_proj->fmt!=2) return 0;
     int qh=qk_nope+qk_rope, kva_O=kv_lora+qk_rope;
     int T=pos_base+S-kv_start;
+    /* DSA selection mode (phase 2 inc.2): sel entries are absolute positions,
+     * so a shifted window is out of contract.  FULL layers additionally score
+     * the shadow and refresh sel/nsel through the host top-k callback. */
+    int selm = dsa && dsa->sel && dsa->nsel && dsa->topk>0;
+    int dsa_full = selm && dsa->ix_wq && dsa->ix_wk && dsa->ix_wp &&
+                   dsa->knw_dev && dsa->knb_dev && dsa->d_Ic &&
+                   dsa->nh>0 && dsa->hd>0 && dsa->topk_fn && dsa->iscore_host;
+    if(dsa && !selm) return 0;
+    if(selm && kv_start!=0) return 0;
+    if(dsa && dsa->topk_fn && !dsa_full) return 0;  /* FULL inteso ma prerequisiti carenti:
+                                                     * mai degradare a riuso-selezione muto */
+    /* l'estrazione scrive l'indexer a int8 (fmt 1, scale per riga): le sue tre
+     * proiezioni passano dal quant_matmul generico, che accetta fmt 1 e 2 */
+    if(dsa_full && !((dsa->ix_wq->fmt==1||dsa->ix_wq->fmt==2)&&
+                     (dsa->ix_wk->fmt==1||dsa->ix_wk->fmt==2)&&
+                     (dsa->ix_wp->fmt==1||dsa->ix_wp->fmt==2))){
+        fprintf(stderr,"[CUDA] attn_chain: ix fmt %d/%d/%d\n",
+                dsa->ix_wq->fmt,dsa->ix_wk->fmt,dsa->ix_wp->fmt);
+        return 0;
+    }
     size_t abs_smem=(size_t)(kv_lora+T)*sizeof(float)+8*sizeof(float);
-    if(abs_smem>200u*1024u) return 0;   /* score window no longer smem-resident */
+    if(!selm && abs_smem>200u*1024u) return 0;   /* score window no longer smem-resident */
     float *xn  =coli_cuda_pipe_scratch(device,22,(size_t)S*D*4);
     float *qres=coli_cuda_pipe_scratch(device,23,(size_t)q_lora*4);
-    float *qQ  =coli_cuda_pipe_scratch(device,24,(size_t)H*qh*4);
+    float *qQ  =coli_cuda_pipe_scratch(device,24,(size_t)S*H*qh*4);
     float *comp=coli_cuda_pipe_scratch(device,25,(size_t)kva_O*4);
     float *cx  =coli_cuda_pipe_scratch(device,26,(size_t)H*vh*4);
     float *aout=coli_cuda_pipe_scratch(device,27,(size_t)S*D*4);
     if(!xn||!qres||!qQ||!comp||!cx||!aout) return 0;
+    float *sc_d=NULL,*qi_d=NULL,*w32_d=NULL; int *dsel_d=NULL;
+    if(dsa_full){
+        sc_d =coli_cuda_pipe_scratch(device,18,(size_t)S*T*4);
+        qi_d =coli_cuda_pipe_scratch(device,19,(size_t)dsa->nh*dsa->hd*4);
+        w32_d=coli_cuda_pipe_scratch(device,20,(size_t)dsa->nh*4);
+        if(!sc_d||!qi_d||!w32_d){ fprintf(stderr,"[CUDA] attn_chain: dsa scratch\n"); return 0; }
+    }
+    if(selm){
+        dsel_d=(int*)coli_cuda_pipe_scratch(device,21,(size_t)S*dsa->topk*sizeof(int));
+        if(!dsel_d){ fprintf(stderr,"[CUDA] attn_chain: sel scratch\n"); return 0; }
+    }
     size_t smem_D=(size_t)D*sizeof(__half);
     size_t smem_q=(size_t)q_lora*sizeof(__half);
     size_t smem_o=(size_t)(H*vh)*sizeof(__half);
@@ -1467,13 +1553,17 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     if(smem_max>48u*1024u &&
        cudaFuncSetAttribute((const void*)gemv_q4,
            cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem_max)!=cudaSuccess) return 0;
-    if(abs_smem>48u*1024u &&
+    if(!selm && abs_smem>48u*1024u &&
        cudaFuncSetAttribute((const void*)absorption_kernel,
            cudaFuncAttributeMaxDynamicSharedMemorySize,(int)abs_smem)!=cudaSuccess) return 0;
+    /* loop 1: projections + KV/Ic writes + (FULL layers) selection scoring.
+     * Rows>pos in d_Lc/d_Rc are written before the absorb reads them, but the
+     * absorb of row s only attends up to pos — same math as the fused order. */
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         const float *xrow=x_dev+(size_t)s*D;
         float *xns=xn+(size_t)s*D;
+        float *qQs=qQ+(size_t)s*H*qh;
         rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(xns,xrow,w_in,D,eps);
         gemv_q4<<<((unsigned)q_lora+7)/8,256,smem_D>>>(qres,xns,
             (const uint8_t*)qa->weights,qa->scales,D,q_lora);
@@ -1487,12 +1577,60 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
           memcpy_f32_kernel<<<(qk_rope+th-1)/th,th>>>(d_Rc+(size_t)pos*qk_rope,comp+kv_lora,qk_rope); }
         pipe_rope_rows<<<1,128>>>(d_Rc+(size_t)pos*qk_rope,NULL,pos,
             qk_rope,0,qk_rope,1,theta);
-        gemv_q4<<<((unsigned)(H*qh)+7)/8,256,smem_q>>>(qQ,qres,
+        gemv_q4<<<((unsigned)(H*qh)+7)/8,256,smem_q>>>(qQs,qres,
             (const uint8_t*)qb->weights,qb->scales,q_lora,H*qh);
-        pipe_rope_rows<<<H,128>>>(qQ,NULL,pos,qh,qk_nope,qk_rope,H,theta);
-        absorption_kernel<<<H,256,abs_smem>>>(cx,qQ,
-            (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
-            d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
+        pipe_rope_rows<<<H,128>>>(qQs,NULL,pos,qh,qk_nope,qk_rope,H,theta);
+        if(dsa_full){
+            int nh=dsa->nh, hd=dsa->hd, nk=pos+1;
+            float *icrow=dsa->d_Ic+(size_t)pos*hd;
+            quant_matmul<<<dim3(hd,1),256>>>(icrow,xns,dsa->ix_wk->weights,
+                dsa->ix_wk->scales,dsa->ix_wk->fmt,1,D,hd,
+                row_bytes(dsa->ix_wk->fmt,D));
+            layernorm_kernel<<<1,128>>>(icrow,dsa->knw_dev,dsa->knb_dev,hd,1e-6f);
+            pipe_rope_rows<<<1,128>>>(icrow,NULL,pos,hd,0,qk_rope,1,theta);
+            quant_matmul<<<dim3(nh*hd,1),256>>>(qi_d,qres,dsa->ix_wq->weights,
+                dsa->ix_wq->scales,dsa->ix_wq->fmt,1,q_lora,nh*hd,
+                row_bytes(dsa->ix_wq->fmt,q_lora));
+            pipe_rope_rows<<<nh,128>>>(qi_d,NULL,pos,hd,0,qk_rope,nh,theta);
+            quant_matmul<<<dim3(nh,1),256>>>(w32_d,xns,dsa->ix_wp->weights,
+                dsa->ix_wp->scales,dsa->ix_wp->fmt,1,D,nh,
+                row_bytes(dsa->ix_wp->fmt,D));
+            size_t smem_sc=(size_t)(nh*hd+nh)*sizeof(float);
+            dsa_score_kernel<<<((unsigned)nk+127)/128,128,smem_sc>>>(
+                sc_d+(size_t)s*T,qi_d,w32_d,dsa->d_Ic,nk,nh,hd,
+                1.f/sqrtf((float)nh),1.f/sqrtf((float)hd));
+        }
+    }
+    if(dsa_full){
+        /* one mid-chain sync: score rows to host, exact CPU top-k, sel back up */
+        for(int s=0;s<S;s++)
+            if(!cuda_ok(cudaMemcpy(dsa->iscore_host+(size_t)s*T,sc_d+(size_t)s*T,
+                (size_t)(pos_base+s+1)*4,cudaMemcpyDeviceToHost),"chain score dl")) return 0;
+        if(!dsa->topk_fn(dsa->topk_user,dsa->iscore_host,S,pos_base,dsa->topk,
+                         dsa->sel,dsa->nsel)){
+            fprintf(stderr,"[CUDA] attn_chain: topk_fn\n"); return 0; }
+    }
+    if(selm){
+        for(int s=0;s<S;s++) if(dsa->nsel[s]<1||dsa->nsel[s]>dsa->topk){
+            fprintf(stderr,"[CUDA] attn_chain: nsel[%d]=%d\n",s,dsa->nsel[s]); return 0; }
+        if(!cuda_ok(cudaMemcpyAsync(dsel_d,dsa->sel,(size_t)S*dsa->topk*sizeof(int),
+            cudaMemcpyHostToDevice,0),"chain sel ul")) return 0;
+    }
+    /* loop 2: absorb + o_proj per row (over the selection when active) */
+    for(int s=0;s<S;s++){
+        int pos=pos_base+s;
+        float *qQs=qQ+(size_t)s*H*qh;
+        if(selm){
+            int ns=dsa->nsel[s];
+            size_t smem_sel=(size_t)(2*kv_lora+ns+256)*sizeof(float);
+            attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cx,qQs,
+                d_Lc,d_Rc,dsel_d+(size_t)s*dsa->topk,ns,
+                kvb->weights,kvb->scales,kvb->fmt,
+                H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
+        }else
+            absorption_kernel<<<H,256,abs_smem>>>(cx,qQs,
+                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
         gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cx,
             (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
     }
@@ -1532,7 +1670,14 @@ extern "C" int coli_cuda_pipe_attn_chain(int device,
     if(d_router&&scores_host&&E>0&&!sc) scores_host[0]=NAN;   /* signal: no scores, caller recomputes */
     if(cudaMemcpy(kv_host_L,d_Lc+(size_t)pos_base*kv_lora,(size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(cudaMemcpy(kv_host_R,d_Rc+(size_t)pos_base*qk_rope,(size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
-    return cudaGetLastError()==cudaSuccess;
+    if(dsa_full&&dsa->ic_host&&
+       cudaMemcpy(dsa->ic_host,dsa->d_Ic+(size_t)pos_base*dsa->hd,
+                  (size_t)S*dsa->hd*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+    { cudaError_t ce=cudaGetLastError();
+      if(ce!=cudaSuccess){ fprintf(stderr,"[CUDA] attn_chain: %s\n",cudaGetErrorString(ce));
+                           return 0; }
+    }
+    return 1;
 }
 
 extern "C" int coli_cuda_expert_group_collect(int device,int home_device,float *x_dev,int D){
