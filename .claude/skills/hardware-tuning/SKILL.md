@@ -12,12 +12,15 @@ MoE (78 layers, 256 experts/layer, ~19 MB/expert int4); scale expectations accor
 ## Profile A — discrete GPU(s) + RAM larger than the model
 
 The model lives wired in RAM; the GPUs hold a hot expert tier, all dense weights,
-and the resident decode pipeline. This is the fastest profile (order of 15+ tok/s).
+and the resident decode pipeline. This is the fastest profile: **19.6 tok/s**
+greedy short-context on 2× H100 NVL (`MTP=0`), **17.9 tok/s** with `DRAFT=1`
+at 91% acceptance.
 
 ```
 COLI_CUDA=1 COLI_GPUS=0,1 CUDA_DENSE=1 \
 CUDA_EXPERT_GB=<see below> \
 COLI_CUDA_PIPE=2 COLI_CUDA_PIPE_S_MIN=1 \
+COLI_CUDA_TC_W4A16=1 \
 OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=spread \
 DIRECT=0 ./glm 256 4 4
 ```
@@ -31,33 +34,73 @@ DIRECT=0 ./glm 256 4 4
 - `COLI_CUDA_PIPE=2` + `COLI_CUDA_PIPE_S_MIN=1` enables the resident decode
   stream with the fused attention chain (S<=4). On multi-GPU, layers get
   contiguous home-device blocks, so the residual crosses P2P once per forward.
+- `COLI_CUDA_TC_W4A16=1` is safe to keep on always: it only engages at rows>=16
+  (prefill/batch), never decode, and the weights path is lossless.
 - Speculative decoding: with an **int8** MTP head present, `DRAFT=1` reaches
   ~90% acceptance. At short context it is roughly break-even with `MTP=0`;
   at long context it wins. `DRAFT>1` degrades (self-fed drafts).
-- Two-socket hosts: try `COLI_NUMA=1` (interleaves resident weights).
+- `COLI_NUMA=1` measured neutral on decode (GPU-bound) — not worth sweeping.
+
+### Long context on Profile A: DSA sparse attention
+
+With the `out-idx-*` indexer files present the engine auto-enables DSA, and as
+of inc.4 (2026-07-19) it is a **strict win past the ~4k crossover**: at 6.7k
+context, prefill 392 s vs 411 s dense and decode 3.8 vs 3.2 tok/s (+20%), with
+decode attention ~flat in T while dense grows linearly. Below index_topk (2048)
+DSA-on costs nothing (the chain caches k_idx itself). Nothing to configure —
+the defaults do this. Knobs and caveats:
+
+- `COLI_DSA_CHAIN=0` / `COLI_DSA_TCGATHER=0` fall back to the slower
+  CPU-selection / scalar sel-absorb paths (debug/A-B only).
+- `COLI_DBG_DSACHAIN=1` prints engagement counters
+  (`[DSAC] engaged: ... fallback: ...`) — check `fb 0` after any change in this
+  area; the fallbacks are silent by design.
+- Current ceiling: the device KV/Ic shadows and absorb kernels cap at
+  **T<=8192**; past that the engine falls back to CPU paths (cap lift is the
+  next queue item).
+- MTP composes with DSA (84–88% acceptance at 2.8–6.7k) but adds only ~5%
+  end-to-end until small-S GPU forwards get cheaper.
 
 ## Profile B — unified-memory SoC (Grace-class, "Spark")
 
 CPU and GPU share LPDDR; the GPU reads weights zero-copy, no VRAM tier or
 upload path. RAM is smaller than the model, so experts stream from NVMe and the
-expert cache hit rate — not compute — decides throughput.
+expert cache hit rate — not compute — decides throughput. Two distinct regimes:
+
+**Short-context (CTX<=4096) benchmark/interactive profile** — no separate CUDA
+tier, big LRU:
 
 ```
 COLI_CUDA=1 COLI_CUDA_HOST_EXPERTS=1 COLI_CUDA_PIPE=2 \
 CUDA_EXPERT_GB=0 PIN=0 PIN_GB=0 DIRECT=1 AUTOPIN=0 \
-OMP_NUM_THREADS=<cores> ./glm 64 4 4
+PILOT_REAL=1 COUPLE_K=8 COUPLE_D=1 \
+OMP_NUM_THREADS=<cores> CTX=4096 ./glm 63 4 4
 ```
 
-- `DIRECT=1` (O_DIRECT): buffered readahead wastes NVMe bandwidth on this path.
-- Keep `CUDA_EXPERT_GB=0`: a separate CUDA tier consumes the same physical LPDDR
-  as the LRU on GB10. Combining a large cache with an inherited device-tier
-  setting can overcommit memory and swap catastrophically.
-- Cache size (first CLI arg) as large as RAM allows after the dense weights;
-  every extra slot is hit rate. Steady-state LRU hit rate on a fresh long
-  corpus is ~77% — quote that, not the flattering just-after-prefill number.
-- Speculation helps MORE here than on Profile A: drafted tokens share expert
-  loads in principle, but current strict-routing measurements lose overlap when
-  miss-containing host groups synchronize safely. Keep `DRAFT=0` for now.
+Strict top-8: **3.58 tok/s** (coupling prefetch raises hit 87.8→92.3%; without
+it 3.27). `CACHE_ROUTE` J2/M12 reaches 4.74 tok/s at 96.3% hit but substitutes
+12.9% of route slots — label results from it as a quality-changing mode.
+
+**131k production/service profile** — 30 GB CUDA tier + small LRU:
+
+```
+... CUDA_EXPERT_GB=30 COLI_ADAPTIVE_CAP=1 PILOT_K=6 CTX=131072 ./glm 17 4 4
+```
+
+- `COLI_ADAPTIVE_CAP=1` (deployed on the mux service): borrows the untouched
+  full-context KV reservation for extra cache slots at request boundaries —
+  **1.21 → 1.43 tok/s**, hit 76→84%, no swap. Requires `KV_SLOTS=1`,
+  `COLI_CUDA_PIPE=0`, non-mmap serve.
+- Keep coupling prefetch OFF here and `PILOT_K=6` — both boundaries are
+  measured knees (see PERF-QUEUE "measured dead ends" before re-sweeping).
+- Never combine the production CUDA tier with a large cache cap: same physical
+  LPDDR, forces swap.
+- Prefill: `COLI_CUDA_PREFILL=1` (pipe0 CUDA prefill, no full-context device
+  shadows) + W4A16: 86 → 64 s on a frozen 260-token prompt; with DSA past
+  index_topk the transient-Ic device path is 2.66× the CPU-DSA path and ~29%
+  faster than dense at 2.8k.
+- Speculation: keep `DRAFT=0` in strict mode — miss-containing host groups
+  synchronize before slab reuse and it measures a net loss (3.27 → 1.65).
 - The theoretical ceiling is NVMe bandwidth / (misses/token × expert size);
   prefetch/eviction policy work pays more than kernel work on this profile.
 
@@ -81,25 +124,29 @@ DIRECT=1 DRAFT=0 ./glm <cache-slots> 4 4
 
 ## Prefill (long prompts)
 
-Prefill is a separate performance regime from decode.  On GPU hosts always add
-`COLI_CUDA_TC_W4A16=1`: the tensor-core expert path (lossless weights, fp16
-activations, rows>=16) halves prefill expert time — measured 207 -> 167 s on a
-2.7k prompt, output identical.  Do NOT enable `COLI_CUDA_TC_INT4` (W4A4) — it
-is slower and lossy.  Add `COLI_PREFILL_GEMM=1` for the tensor-core prefill
-attention (five-GEMM rewrite of score-softmax-value): 161.7 -> 80.4 s on the
-same 2.7k prompt (attention core 93 -> 12 s).  It computes scores/values with
-fp16 tensor-core inputs (fp32 accumulate), so greedy continuations can differ
-from the fp32 absorb kernel within run-to-run variance; set it to 0 for
-bit-level kernel comparisons.
+Prefill is a separate performance regime from decode. On discrete-GPU hosts the
+tensor-core prefill paths are default-on (`COLI_PREFILL_GEMM`, `COLI_PIPE_TC`)
+except `COLI_CUDA_TC_W4A16=1` which you should add explicitly (lossless, halves
+expert prefill time). Measured on the 2.7k prompt, compounding:
+score-softmax-value GEMM rewrite 161.7 → 80.4 s, pipe_gemm TC 78.4 → 54.0 s,
+and with DSA selection active 51.7 s (inc.4 TC gather; was 267.8 before the
+DSA prefill work). At 6.7k: 392 s DSA vs 411 s dense. Do NOT enable
+`COLI_CUDA_TC_INT4` (W4A4) — slower and lossy. These paths use fp16 tensor-core
+inputs (fp32 accumulate), so greedy continuations can differ from the fp32
+kernels within run-to-run variance; set them to 0 for bit-level comparisons.
+On Spark use `COLI_CUDA_PREFILL=1` instead (see Profile B).
 
 ## Shared notes
 
 - **MTP head precision**: the speculative head must be converted at **int8**
   (`convert_fp8_to_int4.py --mtp`, which forces it). An int4 MTP head gives
   ~0% acceptance and the engine auto-disables drafts after 24 misses.
-- **Benchmarking**: use `TEMP=0` for determinism, and expect a few percent
-  run-to-run drift anyway — the expert pin-placement stats file updates each
-  run. Compare configs on the same run count and prompt.
+- **Benchmarking**: use `TEMP=0` for determinism. For config A/B comparisons,
+  freeze the expert-placement state: run 2 unfrozen warmups on the target
+  prompt class, snapshot `.coli_usage`, and restore it before every measured
+  run (the file evolves each run and moves results by a few percent — and a
+  degenerate run can poison it for long prompts). Identical frozen state is
+  bit-reproducible since the softmax-race fix.
 - **Prefill vs decode**: prefill is reported separately; judge configs on the
   decode tok/s line. Cold first runs are disk-bound and not representative.
 - **Hit-rate telemetry**: on discrete GPUs the headline number is the VRAM-served
