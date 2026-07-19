@@ -3729,8 +3729,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
         #undef MB_BUILD
 #endif
+#ifdef COLI_CUDA
+        int cuda_passes=!metal_done&&group_enabled&&g_cuda_prefill&&S>64?2:1;
+#else
+        int cuda_passes=1;
+#endif
+        for(int cuda_pass=0;cuda_pass<cuda_passes;cuda_pass++){
+#ifdef COLI_CUDA
+        ngroup=0;
+#endif
         if(!metal_done)
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+#ifdef COLI_CUDA
+            if(cuda_passes==2 && (qof[j]>=0)!=(cuda_pass==1)) continue;
+#endif
             /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
              * dispatched slot must be waited before the end-of-block LRU swap can reuse
              * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant.
@@ -3849,6 +3861,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_prof){double mx=0;for(int di=0;di<g_cuda_ndev;di++)if(dev_time[di]>mx)mx=dev_time[di];m->t_egpu+=mx;}
         m->t_emm+=now_s()-tg;
 #endif
+        }
         /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
          * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
          * for this block, so they are complete before the LRU swap — and the gen-tagged
