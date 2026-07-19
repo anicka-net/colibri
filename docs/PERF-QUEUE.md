@@ -138,10 +138,22 @@ wholesale after any first-token flip.  The Metal shader already had the
 barrier; only CUDA was affected.  Fix: one `__syncthreads()` per kernel
 between the max read and the sum store.  With the fix + a frozen
 `.coli_usage`, repeated greedy runs are bit-identical (logits and text).
-Note for benchmarking: `.coli_usage` still evolves between runs by
-design, so cross-run comparisons should freeze/restore it; tekton's
-poisoned copy from the degenerate-run feedback loop should be deleted
-(or rebuilt from a few clean runs).
+Benchmarking notes from the hunt:
+- `.coli_usage` evolves between runs by design — freeze/restore it for
+  cross-run comparisons.
+- The per-run "expert hit rate" scores the CURRENT run's routing against
+  the pinned set: a degenerate decode routes to unusual experts and
+  REPORTS a low hit rate (effect), but a sustained batch of degenerate
+  greedy runs also WRITES enough skewed selections to genuinely damage
+  the learned placement (~30 long benchmark runs took the discrete host
+  from 92% to ~65% on long prompts) — both directions are real.  A
+  fresh file costs ~25 points until history relearns; normal TEMP=0.7
+  service traffic rebuilds it organically.
+- Greedy (TEMP=0) raw continuation of repetitive or list-like text
+  (the 10x-repeated-paragraph test prompt, doc files) degenerates into
+  loops as a MODEL behavior — with the race fixed this is deterministic,
+  not flaky.  Long-context quality checks should use the chat template
+  and default temperature; keep TEMP=0 for numeric A/B only.
 
 ### 5. Expert-group remaining headroom
 Group kernel time is 761 ms/64 tok vs a ~100-150 ms bandwidth floor.  The
