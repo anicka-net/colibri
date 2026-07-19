@@ -55,9 +55,11 @@ the defaults do this. Knobs and caveats:
 - `COLI_DBG_DSACHAIN=1` prints engagement counters
   (`[DSAC] engaged: ... fallback: ...`) — check `fb 0` after any change in this
   area; the fallbacks are silent by design.
-- Current ceiling: the device KV/Ic shadows and absorb kernels cap at
-  **T<=8192**; past that the engine falls back to CPU paths (cap lift is the
-  next queue item).
+- Context ceiling (post inc.5): DSA/GEMM paths run to **T<=131072**; the dense
+  absorb kernels go to ~56k on Hopper via the dynamic-smem opt-in and fall back
+  to CPU beyond.  Measured at 13.4k: DSA 2.98 vs dense 1.83 tok/s (+63%) and
+  prefill 780 vs 872 s.  Device KV shadows cost ~1.4 GB/GPU at 16k — budget
+  `CUDA_EXPERT_GB` accordingly at 32k+.
 - MTP composes with DSA (84–88% acceptance at 2.8–6.7k) but adds only ~5%
   end-to-end until small-S GPU forwards get cheaper.
 

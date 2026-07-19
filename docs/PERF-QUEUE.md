@@ -17,7 +17,7 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN @6.7k (prefill -4.6%, decode +20%); open: T>8192 cap lift, index_topk_freq
+### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: index_topk_freq, IndexShare
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
 (`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
@@ -365,6 +365,27 @@ the deployed path.  Revisit only with a measured concurrent/ragged workload.
 Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
+
+#### DSA phase 2, increment 5 — T>8192 cap lift (landed)
+The absorb-batch kernel family's `T<=8192` checks were shared-memory limits
+in disguise ((2K+T+256) floats of dynamic smem vs the 48 KB default), not
+algorithmic ones: `absorb_smem_ok()` now computes the actual need and raises
+the kernel's dynamic-smem attribute to the device opt-in maximum when needed
+(227 KB on Hopper -> T up to ~56k for dense absorb; past that the functions
+refuse and the CPU fallback engages as before).  The memory-bound paths
+(`coli_cuda_prefill_attn_gemm`, the `attn_pipe_prefill` gate) lift straight
+to T<=131072; the DSA decode chain never had a T cap (sel-absorb is over
+topk); KV/Ic device shadows already size by CTX (~1.4 GB/GPU at 16k).
+MEASURED at 13.4k ctx (2x the 6.7k prompt, CTX=16384, frozen 2.7k-warmed
+usage, 64 tokens): DSA prefill **780.0 s** vs dense 871.9 (-10.5%); decode
+DSA **2.98 tok/s** vs dense 1.83 (**+63%**, was +20% at 6.7k — the flat-vs-
+linear divergence the cap was hiding), attention 16.4 vs 29.8 s/64 tok,
+fallbacks 0, prefill engagement 21/57.  Dense decode at 13.4k itself now
+runs on GPU via the smem opt-in (pre-lift: CPU path).  Both configs pay
+~65-69% expert hit (usage frozen on the short prompt), so cross-config
+ratios are the trustworthy numbers.  Remaining DSA decode growth in T is
+the FULL layers' indexer scoring (O(T) per token) plus the hit-rate
+penalty — index_topk_freq=4 refresh amortizes the former if it matters.
 
 #### DSA phase 2, increment 4 — prefill sel-absorb TC gather (landed)
 Phase-B rows now gather their selected Lc/Rc rows into contiguous buffers

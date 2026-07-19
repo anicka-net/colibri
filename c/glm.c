@@ -2687,7 +2687,7 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if(l->q_a.cuda_device!=dev||l->q_b.cuda_device!=dev||
        l->kv_a.cuda_device!=dev||l->o.cuda_device!=dev) return 0;
     int st0=m->kv_start[layer], T=pos_base+S-st0, old=pos_base-st0;
-    if(T<S||T>8192) return 0;
+    if(T<S||T>131072) return 0;   /* tetto di memoria (scratch T*kvl), non di smem */
     double t0=now_s();
     size_t xb=(size_t)S*D*4, qrb=(size_t)S*ql*4, qb=(size_t)S*H*qh*4;
     size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*4, rb=(size_t)T*R*4;

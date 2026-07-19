@@ -32,6 +32,8 @@ typedef struct {
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     float *pf_q,*pf_c,*pf_s; size_t pf_q_cap,pf_c_cap,pf_s_cap; /* prefill GEMM attention */
+    int smem_optin;                             /* smem opt-in per l'absorb a T lunghi */
+    int absorb_attr_set, ragged_attr_set;       /* attributo gia' alzato per kernel */
     float *pipe_buf[40]; size_t pipe_cap[40];   /* scratch persistenti del resident pipeline */
     float *accum; size_t accum_cap;             /* device-side routed-expert accumulate */
     float *wrow_d; size_t wrow_cap;
@@ -490,6 +492,8 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;ctx->integrated=prop.integrated;
+        if(cudaDeviceGetAttribute(&ctx->smem_optin,cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                  device)!=cudaSuccess) ctx->smem_optin=49152;
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             g_nctx=0;return 0;
         }
@@ -1021,11 +1025,29 @@ extern "C" int coli_cuda_attention_absorb(ColiCudaTensor *w,float *ctx,const flo
     return 1;
 }
 
+/* Il tetto T dell'absorb-batch e' la shared memory ((2K+T+256) float), non un
+ * limite algoritmico: sopra i 48KB di default si chiede l'opt-in del device
+ * (fino a 227KB su Hopper -> T fino a ~56k).  Ritorna 0 se nemmeno l'opt-in
+ * basta — il chiamante ripiega sul percorso CPU come prima. */
+static int absorb_smem_ok(DeviceContext *dc,int K,int T,size_t *shared,
+                          const void *kernel,int *attr_set){
+    size_t need=(size_t)(2*K+T+256)*sizeof(float);
+    *shared=need;
+    if(need<=49152) return 1;
+    if(need>(size_t)dc->smem_optin) return 0;
+    if(!*attr_set){
+        if(cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,dc->smem_optin)!=cudaSuccess)
+            return 0;
+        *attr_set=1;
+    }
+    return 1;
+}
 static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,float *out,
         const float *q,const float *latent,const float *rope,int S,int H,int Q,int R,int V,
         int K,int T,float scale){
     if(!w||!out||!q||!latent||!rope||S<1||H<1||Q<1||R<1||V<1||K<1||K>512||
-       T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
+       T<S||w->I!=K||w->O!=H*(Q+V))return 0;
     if(proj&&(proj->device!=w->device||proj->I!=H*V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)S*H*(Q+R)*sizeof(float),lb=(size_t)T*K*sizeof(float);
@@ -1035,7 +1057,9 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"attention batch q upload")||
        !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention batch latent upload")||
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope upload"))return 0;
-    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    size_t shared;
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
+                       &dc->absorb_attr_set))return 0;
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
         dc->ar,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"attention batch launch"))return 0;
@@ -1091,7 +1115,9 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
              cuda_ok(cudaMemcpyAsync(dc->ar,rh,rb,cudaMemcpyHostToDevice,dc->stream),"ragged rope upload")&&
              cuda_ok(cudaMemcpyAsync(dc->group_desc,lengths,(size_t)S*sizeof(int),cudaMemcpyHostToDevice,dc->stream),"ragged lengths upload");
     std::free(lh);std::free(rh);if(!ok)return 0;
-    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    size_t shared;
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_ragged_kernel,
+                       &dc->ragged_attr_set))return 0;
     attention_absorb_ragged_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,dc->ar,
         (const int*)dc->group_desc,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
@@ -1771,12 +1797,14 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!w||!proj||!out||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
-       K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
+       K<1||K>512||T<S||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t cb=(size_t)S*H*V*sizeof(float);
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
-    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    size_t shared;
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
+                       &dc->absorb_attr_set))return 0;
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch"))return 0;
@@ -1843,12 +1871,14 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!w||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
-       K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
+       K<1||K>512||T<S||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t cb=(size_t)S*H*V*sizeof(float);
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
-    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    size_t shared;
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
+                       &dc->absorb_attr_set))return 0;
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch (dev out)"))return 0;
@@ -1864,9 +1894,11 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!w||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
-       K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V))return 0;
+       K<1||K>512||T<S||w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
-    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    size_t shared;
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
+                       &dc->absorb_attr_set))return 0;
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx_dev,q_dev,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
@@ -1955,13 +1987,15 @@ extern "C" int coli_cuda_attention_project_sel(ColiCudaTensor *w,ColiCudaTensor 
 extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,const float *q,
         const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
         float scale){
-    if(!w||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||T>8192||
+    if(!w||!ctx||!q||!latent_dev||!rope_dev||H<1||Q<1||R<1||V<1||K<1||K>512||T<1||
        w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
-    size_t shared=(size_t)(2*K+T+256)*sizeof(float);
+    size_t shared;
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
+                       &dc->absorb_attr_set))return 0;
     attention_absorb_batch_kernel<<<dim3(H,1),256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
         rope_dev,w->weights,w->scales,w->fmt,1,H,Q,R,V,K,T,scale);
     if(!cuda_ok(cudaGetLastError(),"kvdev absorb launch")||
@@ -2214,7 +2248,7 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
         int S,int H,int Q,int R,int V,int K,int T,float scale,
         const int *sel_host,int sB0,int sel_topk){
     if(!w||!proj||!out_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
-       K<1||K>512||T<S||T>8192||w->I!=K||w->O!=H*(Q+V)||
+       K<1||K>512||T<S||T>131072||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V||w->fmt!=2||proj->fmt!=2||
        (Q&15)||(K&15)||(R&15)||(V&15)||(proj->I&15))return 0;
     /* fase B (selezione DSA): righe [sB0,S) assorbono sulla PROPRIA lista sel
