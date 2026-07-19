@@ -245,6 +245,14 @@ tier and cap 17.  There, no coupling and K1/D1 both measure 1.35 tok/s
 service; it currently pays only when the short-context profile can devote
 roughly 92 GB to its LRU.
 
+Admission/budget sweep after the determinism fix confirms the boundary.  On
+the 131k cap-17 profile, coupling K2/K4/K8 gives 1.34/1.32/1.25 tok/s versus
+the 1.37 baseline, with fetched bytes rising monotonically.  Inserting
+prefetches at the LRU end also loses in offline replay, because useful
+predictions are evicted before demand reaches them.  The existing stale-state
+pilot budget is already at its measured knee: PILOT_K 2/4/6 gives
+1.21/1.29/1.37 tok/s.  Keep `PILOT_K=6` and coupling off for this profile.
+
 ## Measured dead ends (do not revisit without new evidence)
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).
