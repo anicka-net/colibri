@@ -70,6 +70,7 @@ typedef int (*fn_attention_project_ragged)(ColiCudaTensor *kv_b,ColiCudaTensor *
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
 typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
+typedef int (*fn_prefill_attn_gemm)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_pipe_add)(int device,float *x_dev,const float *t_dev,size_t n);
 typedef void * (*fn_pipe_alloc)(int device,size_t bytes);
 typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src, int spitch,int width,int height);
@@ -134,6 +135,7 @@ static struct {
     fn_attention_project_ragged attention_project_ragged;
     fn_attention_project_batch_dev attention_project_batch_dev;
     fn_attention_project_batch_dev_out attention_project_batch_dev_out;
+    fn_prefill_attn_gemm prefill_attn_gemm;
     fn_pipe_add pipe_add;
     fn_pipe_alloc pipe_alloc;
     fn_pipe_copy2d pipe_copy2d;
@@ -231,6 +233,7 @@ static int coli_cuda_load(void){
     RESOLVE(attention_project_ragged, fn_attention_project_ragged)
     RESOLVE(attention_project_batch_dev, fn_attention_project_batch_dev)
     RESOLVE(attention_project_batch_dev_out, fn_attention_project_batch_dev_out)
+    RESOLVE(prefill_attn_gemm, fn_prefill_attn_gemm)
     RESOLVE(pipe_add, fn_pipe_add)
     RESOLVE(pipe_alloc, fn_pipe_alloc)
     RESOLVE(pipe_copy2d, fn_pipe_copy2d)
@@ -400,6 +403,11 @@ int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o
 int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!g_cuda.available){ return 0; }
     return g_cuda.attention_project_batch_dev_out(kv_b, o_proj, out_dev, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
+}
+
+int coli_cuda_prefill_attn_gemm(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.prefill_attn_gemm(kv_b, o_proj, out_dev, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
 }
 
 int coli_cuda_pipe_add(int device,float *x_dev,const float *t_dev,size_t n){
