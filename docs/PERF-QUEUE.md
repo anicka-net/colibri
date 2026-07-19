@@ -260,6 +260,11 @@ stale L+1 pilot recall is 69.7%, shared-expert two-step is 73.2%, and the
 same-layer pre-attention predictor reaches 78.0%.  Timing dominates, however:
 replacing the early pilot with same-layer K6 gives 1.33 tok/s, and combining
 early K4 with late K2 gives 1.22 tok/s.  Both lose to early K6 at 1.37 tok/s.
+Equal-budget K6 rank fusion also has no free win: mixing stale and two-step
+predictions never beats pure two-step recall (60.6% on the measured decode),
+while replacing two-step slots with previous-token routes degrades
+monotonically (57.9% at one previous slot).  The predictors are redundant
+where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
