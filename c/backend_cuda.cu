@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 
 struct ColiCudaTensor {
@@ -1522,6 +1523,19 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
         const float *latent,const float *rope,const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale);
+/* COLI_DBG_DSACHAIN=1: tempi cumulativi del punto di sync a metà catena
+ * (drenaggio pipeline + download punteggi) e del top-k host.  Esposti con una
+ * funzione, non con dati extern: il loader Windows risolve solo simboli-funzione. */
+static double coli_dsac_t_sync=0.0, coli_dsac_t_topk=0.0;
+extern "C" void coli_cuda_dsac_times(double *sync_s, double *topk_s){
+    if(sync_s) *sync_s=coli_dsac_t_sync;
+    if(topk_s) *topk_s=coli_dsac_t_topk;
+}
+static double dsac_now(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9;
+}
+
 extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
@@ -1547,20 +1561,28 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
      * so a shifted window is out of contract.  FULL layers additionally score
      * the shadow and refresh sel/nsel through the host top-k callback. */
     int selm = dsa && dsa->sel && dsa->nsel && dsa->topk>0;
-    int dsa_full = selm && dsa->ix_wq && dsa->ix_wk && dsa->ix_wp &&
-                   dsa->knw_dev && dsa->knb_dev && dsa->d_Ic &&
-                   dsa->nh>0 && dsa->hd>0 && dsa->topk_fn && dsa->iscore_host;
+    int dsa_kidx = selm && dsa->ix_wk && dsa->knw_dev && dsa->knb_dev &&
+                   dsa->d_Ic && dsa->nh>0 && dsa->hd>0;
+    int dsa_full = dsa_kidx && dsa->ix_wq && dsa->ix_wp &&
+                   dsa->topk_fn && dsa->iscore_host && !dsa->score_off;
+    int dsa_reuse = selm && dsa->score_off;   /* riuso temporale: k_idx sì, punteggi no */
     if(dsa && !selm) return 0;
     if(selm && kv_start!=0) return 0;
-    if(dsa && dsa->topk_fn && !dsa_full) return 0;  /* FULL inteso ma prerequisiti carenti:
+    if(dsa && dsa->topk_fn && !dsa_full && !dsa_reuse) return 0;
+                                                    /* FULL inteso ma prerequisiti carenti:
                                                      * mai degradare a riuso-selezione muto */
+    if(dsa_reuse && !dsa_kidx) return 0;  /* il riuso DEVE comunque accodare k_idx a Ic:
+                                           * saltarlo corromperebbe le selezioni future */
     /* l'estrazione scrive l'indexer a int8 (fmt 1, scale per riga): le sue tre
      * proiezioni passano dal quant_matmul generico, che accetta fmt 1 e 2 */
+    if((dsa_full||dsa_reuse) && !(dsa->ix_wk->fmt==1||dsa->ix_wk->fmt==2)){
+        fprintf(stderr,"[CUDA] attn_chain: ix_wk fmt %d\n",dsa->ix_wk->fmt);
+        return 0;
+    }
     if(dsa_full && !((dsa->ix_wq->fmt==1||dsa->ix_wq->fmt==2)&&
-                     (dsa->ix_wk->fmt==1||dsa->ix_wk->fmt==2)&&
                      (dsa->ix_wp->fmt==1||dsa->ix_wp->fmt==2))){
-        fprintf(stderr,"[CUDA] attn_chain: ix fmt %d/%d/%d\n",
-                dsa->ix_wq->fmt,dsa->ix_wk->fmt,dsa->ix_wp->fmt);
+        fprintf(stderr,"[CUDA] attn_chain: ix fmt %d/%d\n",
+                dsa->ix_wq->fmt,dsa->ix_wp->fmt);
         return 0;
     }
     size_t abs_smem=(size_t)(kv_lora+T)*sizeof(float)+8*sizeof(float);
@@ -1617,7 +1639,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         gemv_q4<<<((unsigned)(H*qh)+7)/8,256,smem_q>>>(qQs,qres,
             (const uint8_t*)qb->weights,qb->scales,q_lora,H*qh);
         pipe_rope_rows<<<H,128>>>(qQs,NULL,pos,qh,qk_nope,qk_rope,H,theta);
-        if(dsa_full){
+        if(dsa_full||dsa_reuse){
             int nh=dsa->nh, hd=dsa->hd, nk=pos+1;
             float *icrow=dsa->d_Ic+(size_t)pos*hd;
             quant_matmul<<<dim3(hd,1),256>>>(icrow,xns,dsa->ix_wk->weights,
@@ -1625,6 +1647,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
                 row_bytes(dsa->ix_wk->fmt,D));
             layernorm_kernel<<<1,128>>>(icrow,dsa->knw_dev,dsa->knb_dev,hd,1e-6f);
             pipe_rope_rows<<<1,128>>>(icrow,NULL,pos,hd,0,qk_rope,1,theta);
+            if(!dsa_full) continue;   /* riuso: niente punteggi, sel arriva dal chiamante */
             quant_matmul<<<dim3(nh*hd,1),256>>>(qi_d,qres,dsa->ix_wq->weights,
                 dsa->ix_wq->scales,dsa->ix_wq->fmt,1,q_lora,nh*hd,
                 row_bytes(dsa->ix_wq->fmt,q_lora));
@@ -1639,13 +1662,18 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         }
     }
     if(dsa_full){
-        /* one mid-chain sync: score rows to host, exact CPU top-k, sel back up */
+        /* one mid-chain sync: score rows to host, exact CPU top-k, sel back up.
+         * t_sync include il drenaggio implicito della pipeline (tutto il lavoro
+         * accodato prima della cudaMemcpy sincrona), non solo il download. */
+        double t0=dsac_now();
         for(int s=0;s<S;s++)
             if(!cuda_ok(cudaMemcpy(dsa->iscore_host+(size_t)s*T,sc_d+(size_t)s*T,
                 (size_t)(pos_base+s+1)*4,cudaMemcpyDeviceToHost),"chain score dl")) return 0;
+        double t1=dsac_now();
         if(!dsa->topk_fn(dsa->topk_user,dsa->iscore_host,S,pos_base,dsa->topk,
                          dsa->sel,dsa->nsel)){
             fprintf(stderr,"[CUDA] attn_chain: topk_fn\n"); return 0; }
+        coli_dsac_t_sync+=t1-t0; coli_dsac_t_topk+=dsac_now()-t1;
     }
     if(selm){
         for(int s=0;s<S;s++) if(dsa->nsel[s]<1||dsa->nsel[s]>dsa->topk){
@@ -1707,7 +1735,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
     if(d_router&&scores_host&&E>0&&!sc) scores_host[0]=NAN;   /* signal: no scores, caller recomputes */
     if(cudaMemcpy(kv_host_L,d_Lc+(size_t)pos_base*kv_lora,(size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(cudaMemcpy(kv_host_R,d_Rc+(size_t)pos_base*qk_rope,(size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
-    if(dsa_full&&dsa->ic_host&&
+    if((dsa_full||dsa_reuse)&&dsa->ic_host&&
        cudaMemcpy(dsa->ic_host,dsa->d_Ic+(size_t)pos_base*dsa->hd,
                   (size_t)S*dsa->hd*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     { cudaError_t ce=cudaGetLastError();

@@ -2585,9 +2585,12 @@ static int ic_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
  * s*(pos_base+S), nk=pos_base+s+1 valori.  Chiamato dal backend a meta' catena. */
 static int chain_dsa_topk(void *u, const float *scores, int S, int pos_base,
                           int dtopk, int *sel, int *nsel){
-    (void)u; int T=pos_base+S;
+    int T=pos_base+S;
+    /* dtopk è la CAPACITÀ delle righe sel (index_topk + coda di riuso); la
+     * selezione resta sempre di index_topk elementi, semantica nativa */
+    int want=((Model*)u)->c.index_topk; if(want<1||want>dtopk) want=dtopk;
     for(int s=0;s<S;s++){
-        int nk=pos_base+s+1, keep=nk<dtopk?nk:dtopk;
+        int nk=pos_base+s+1, keep=nk<want?nk:want;
         const float *isc=scores+(size_t)s*T;
         float *tmp=falloc(nk); memcpy(tmp,isc,(size_t)nk*sizeof(float));
         partial_select_desc(tmp,nk,keep);
@@ -2618,12 +2621,17 @@ static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln
 /* COLI_DBG_DSACHAIN: engagement counters for the in-chain DSA selection */
 static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain;
 static long g_dsc_pfull,g_dsc_pshared,g_dsc_pfb;      /* prefill selection */
+static long g_dsc_reuse;                              /* COLI_DSA_REFRESH riusi */
 static int g_dsc_on=-1;
 static void dsc_report(void){
-    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld | fallback: pre %ld chain %ld"
+    double ts=0,tk=0; coli_cuda_dsac_times(&ts,&tk);
+    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld reuse %ld | fallback: pre %ld chain %ld"
             " | prefill: full %ld shared %ld fb %ld\n",
-            g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain,
+            g_dsc_full,g_dsc_shared,g_dsc_reuse,g_dsc_fb_pre,g_dsc_fb_chain,
             g_dsc_pfull,g_dsc_pshared,g_dsc_pfb);
+    if(ts>0||tk>0)
+        fprintf(stderr,"[DSAC] chain mid-sync %.3fs (pipeline drain + score dl)"
+                " | host top-k %.3fs\n",ts,tk);
 }
 static int dsc_enabled(void){
     if(g_dsc_on<0){ g_dsc_on=getenv("COLI_DBG_DSACHAIN")?atoi(getenv("COLI_DBG_DSACHAIN")):0;
@@ -2636,6 +2644,25 @@ static int dsa_chain_on(void){
     if(g_dsa_chain<0){ const char *e=getenv("COLI_DSA_CHAIN"); g_dsa_chain=e?atoi(e):1; }
     return g_dsa_chain;
 }
+/* COLI_DSA_REFRESH=N (default 1): in decode i layer FULL ricalcolano la selezione
+ * solo ogni N token; nei token intermedi riusano l'ultima selezione del layer,
+ * estesa con la coda delle posizioni nuove (mai perdere i token più recenti).
+ * ATTENZIONE: N>1 è un'APPROSSIMAZIONE — la semantica nativa (HF reference)
+ * seleziona a ogni token; index_topk_freq nel config è il PATTERN DI LAYER
+ * full/shared, non una frequenza temporale.  k_idx viene comunque accodato a
+ * Ic a ogni token (obbligatorio per i refresh futuri). */
+static int g_dsa_refresh=-1;
+static int dsa_refresh_n(void){
+    if(g_dsa_refresh<0){ const char *e=getenv("COLI_DSA_REFRESH");
+        g_dsa_refresh=e?atoi(e):1;
+        if(g_dsa_refresh<1) g_dsa_refresh=1;
+        if(g_dsa_refresh>64) g_dsa_refresh=64; }
+    return g_dsa_refresh;
+}
+/* cache per-layer dell'ultima selezione (solo refresh>1): posizione del refresh,
+ * numero di elementi, contesto kv di validità (slot diversi non si mischiano) */
+static int *g_dsa_rc_sel[128]; static int g_dsa_rc_n[128];
+static int g_dsa_rc_pos[128];  static void *g_dsa_rc_kv[128];
 /* Top-k esatto per la selezione di PREFILL sui punteggi device: righe di fase A
  * (nk<=topk) -> nsel 0 (attenzione densa causale), righe di fase B -> stessa
  * semantica del percorso CPU (partial select + scan in ordine di posizione).
@@ -4327,17 +4354,20 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     #define DSC_FB(tag) do{ if(g_dsc_on){ g_dsc_fb_pre++; if(g_dsc_fb_pre<=20) \
         fprintf(stderr,"[DSAC] pre-fb %s li=%d\n",tag,li);} return 0; }while(0)
     ColiCudaDsaChain dsac, *pdsa=NULL;
-    int chain_did_sel=0;
+    int chain_did_sel=0, dsa_reused=0;
+    int rfr=dsa_refresh_n();
+    /* dcap: capacità delle righe sel = index_topk + coda di riuso (refresh>1) */
+    int dcap=c->index_topk+(rfr-1);
     if(sel_active){
-        if((int64_t)S*c->index_topk > m->dsa_scap){
+        if((int64_t)S*dcap > m->dsa_scap){
             free(m->dsa_sel); free(m->dsa_nsel);
-            m->dsa_scap=(int64_t)S*c->index_topk;
+            m->dsa_scap=(int64_t)S*dcap;
             m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
             m->dsa_nsel=calloc((size_t)S,sizeof(int));
             if(!m->dsa_sel||!m->dsa_nsel) DSC_FB("alloc");
         }
         memset(&dsac,0,sizeof dsac);
-        dsac.topk=c->index_topk; dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel;
+        dsac.topk=dcap; dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel;
         if(dsa_idx_layer){
             QT *wq=&m->ix_wq[li],*wk=&m->ix_wk[li],*wp=&m->ix_wp[li];
             if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
@@ -4348,24 +4378,40 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
             float *knb=li<256?pipe_ln_cache(dev,li,6,m->ix_knb[li],(size_t)c->index_hd):NULL;
             if(!knw||!knb) DSC_FB("kn");
             if(!ic_dev_sync(m,l,m->kv,li,pos_base)) DSC_FB("icsync");
-            static float *chain_iscore=NULL; static size_t chain_iscore_cap=0;
-            size_t need=(size_t)S*(pos_base+S);
-            if(need>chain_iscore_cap){
-                float *p=realloc(chain_iscore,need*sizeof(float));
-                if(!p) DSC_FB("iscore");
-                chain_iscore=p; chain_iscore_cap=need;
-            }
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
             dsac.knw_dev=knw; dsac.knb_dev=knb;
             dsac.d_Ic=m->kv->cuda_Ic[li];
             dsac.nh=c->index_nh; dsac.hd=c->index_hd;
-            dsac.iscore_host=chain_iscore;
-            dsac.topk_fn=chain_dsa_topk; dsac.topk_user=m;
             dsac.ic_host=m->Ic[li]+(int64_t)pos_base*c->index_hd;
+            /* riuso temporale (COLI_DSA_REFRESH>1): dentro la finestra, ultima
+             * selezione del layer + coda delle posizioni nuove; fuori, refresh. */
+            int cp=g_dsa_rc_pos[li];
+            if(rfr>1 && g_dsa_rc_n[li]>0 && g_dsa_rc_kv[li]==(void*)m->kv &&
+               cp<pos_base && (pos_base+S-1)-cp<rfr){
+                int n0=g_dsa_rc_n[li];
+                for(int s=0;s<S;s++){
+                    int pos=pos_base+s, *dst=m->dsa_sel+(int64_t)s*dcap, nd=n0;
+                    memcpy(dst,g_dsa_rc_sel[li],(size_t)n0*sizeof(int));
+                    /* la finestra garantisce pos-cp <= rfr-1, quindi nd <= dcap */
+                    for(int t=cp+1;t<=pos;t++) dst[nd++]=t;
+                    m->dsa_nsel[s]=nd;
+                }
+                dsac.score_off=1; dsa_reused=1;
+            }else{
+                static float *chain_iscore=NULL; static size_t chain_iscore_cap=0;
+                size_t need=(size_t)S*(pos_base+S);
+                if(need>chain_iscore_cap){
+                    float *p=realloc(chain_iscore,need*sizeof(float));
+                    if(!p) DSC_FB("iscore");
+                    chain_iscore=p; chain_iscore_cap=need;
+                }
+                dsac.iscore_host=chain_iscore;
+                dsac.topk_fn=chain_dsa_topk; dsac.topk_user=m;
+            }
         }else{
             /* SHARED: la selezione dell'ultimo layer FULL deve valere per QUESTE righe */
             for(int s=0;s<S;s++)
-                if(m->dsa_nsel[s]<1||m->dsa_nsel[s]>c->index_topk) DSC_FB("nsel");
+                if(m->dsa_nsel[s]<1||m->dsa_nsel[s]>dcap) DSC_FB("nsel");
         }
         pdsa=&dsac;
     }
@@ -4405,11 +4451,23 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                g_fuse_shared?l->sh_down.cuda:NULL,sI,
                dsa_idx_layer?chain_xn:NULL,pdsa)){
             m->kv->cuda_valid[li]=pos_base+S;
-            if(g_dsc_on&&sel_active){ if(dsa_idx_layer)g_dsc_full++; else g_dsc_shared++; }
+            if(g_dsc_on&&sel_active){ if(!dsa_idx_layer)g_dsc_shared++;
+                                      else if(dsa_reused)g_dsc_reuse++; else g_dsc_full++; }
             if(sel_active&&dsa_idx_layer){
                 /* k_idx calcolato sul device: righe host arrivate via ic_host */
                 chain_did_sel=1;
                 m->kv->cuda_ic_valid[li]=pos_base+S;
+                if(rfr>1&&!dsa_reused){
+                    /* refresh riuscito: memorizza la selezione dell'ultima riga */
+                    if(!g_dsa_rc_sel[li]) g_dsa_rc_sel[li]=malloc((size_t)c->index_topk*sizeof(int));
+                    int nlast=m->dsa_nsel[S-1];
+                    if(g_dsa_rc_sel[li]&&nlast>=1&&nlast<=c->index_topk){
+                        memcpy(g_dsa_rc_sel[li],m->dsa_sel+(int64_t)(S-1)*dcap,
+                               (size_t)nlast*sizeof(int));
+                        g_dsa_rc_n[li]=nlast; g_dsa_rc_pos[li]=pos_base+S-1;
+                        g_dsa_rc_kv[li]=(void*)m->kv;
+                    }else g_dsa_rc_n[li]=0;
+                }
             }
             if(!isnan(chain_scores[0])) chain_pre_logits=1;
             if(g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda) chain_did_shared=1;

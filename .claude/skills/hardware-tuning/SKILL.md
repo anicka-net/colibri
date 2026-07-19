@@ -52,6 +52,9 @@ the defaults do this. Knobs and caveats:
 
 - `COLI_DSA_CHAIN=0` / `COLI_DSA_TCGATHER=0` fall back to the slower
   CPU-selection / scalar sel-absorb paths (debug/A-B only).
+- `COLI_DSA_REFRESH=N` (default 1) recomputes decode selection only every Nth
+  token.  Keep the default: N>1 changes greedy output for ~1% at 13.4k
+  (selection is only 3% of decode) — quality-changing, measured near-dead-end.
 - `COLI_DBG_DSACHAIN=1` prints engagement counters
   (`[DSAC] engaged: ... fallback: ...`) — check `fb 0` after any change in this
   area; the fallbacks are silent by design.

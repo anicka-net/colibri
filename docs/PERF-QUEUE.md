@@ -17,7 +17,7 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: index_topk_freq, IndexShare
+### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: IndexShare, decode-attention attribution (inc.6 ruled out selection cost)
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
 (`index_topk`), recomputed every token, and `index_share_for_mtp_iteration=True`
@@ -404,6 +404,33 @@ Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
 
+#### DSA phase 2, increment 6 — COLI_DSA_REFRESH knob + selection-cost attribution (landed, default off)
+Motivated by the (now corrected, see item 1) belief that native semantics
+refresh selection every 4 steps.  `COLI_DSA_REFRESH=N` (default 1 = native
+per-token selection, zero change): FULL layers recompute top-k every Nth
+decode token; between refreshes they reuse the layer's cached selection
+extended with the new tail positions (recent tokens are never dropped), with
+per-layer caches, rewind/slot invalidation, and k_idx still appended to the
+Ic shadow every token.  Chain gains a `score_off` mode (k_idx append without
+scoring/sync/top-k); new exported accessor `coli_cuda_dsac_times` went
+through the 4-entry Windows loader ritual.
+MEASURED at 13.4k (frozen usage, 64 greedy tokens): REFRESH=4 reuses 846 of
+1134 FULL engagements, decode **2.94 -> 2.98 tok/s (~1%, within drift)** —
+and the greedy continuation DIVERGES.  Verdict: quality-affecting for a
+noise-level gain at this T — near-dead-end, keep default 1.  The knob's real
+product is the attribution (`COLI_DBG_DSACHAIN=1` now prints cumulative
+mid-sync and host-top-k time): sync **0.54 s** + top-k **0.13 s** of 21.5 s
+decode = **3%**.  The selection machinery is NOT the DSA decode T-growth
+term at 13.4k, which also de-prioritizes device-side top-k for DECODE
+(prefill still needs it: the S_b×T score download grows ~20x by 256k, and
+host top-k is O(T) per token so revisit past ~64k).  Where decode attention
+(16.4 s/64 tok) actually goes, per the profile: projection/RoPE 8.3 s +
+~7.8 s absorb-side — both nominally T-independent, yet short-context
+attention is 1.5 s/64 tok.  NEXT PROBE: attribute the chain's per-phase
+time at long T (suspects: `attention_absorb_sel_kernel`'s H=64-block launch
+shape serializing 2048 rows per block, and what the projection timer
+actually covers in the chain path).
+
 #### DSA phase 2, increment 5 — T>8192 cap lift (landed)
 The absorb-batch kernel family's `T<=8192` checks were shared-memory limits
 in disguise ((2K+T+256) floats of dynamic smem vs the 48 KB default), not
@@ -421,9 +448,9 @@ linear divergence the cap was hiding), attention 16.4 vs 29.8 s/64 tok,
 fallbacks 0, prefill engagement 21/57.  Dense decode at 13.4k itself now
 runs on GPU via the smem opt-in (pre-lift: CPU path).  Both configs pay
 ~65-69% expert hit (usage frozen on the short prompt), so cross-config
-ratios are the trustworthy numbers.  Remaining DSA decode growth in T is
-the FULL layers' indexer scoring (O(T) per token) plus the hit-rate
-penalty — index_topk_freq=4 refresh amortizes the former if it matters.
+ratios are the trustworthy numbers.  (Increment 6 then measured the
+selection machinery at 3% of decode — the growth lives elsewhere; see
+its entry above.)
 
 #### DSA phase 2, increment 4 — prefill sel-absorb TC gather (landed)
 Phase-B rows now gather their selected Lc/Rc rows into contiguous buffers

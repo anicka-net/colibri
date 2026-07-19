@@ -135,7 +135,13 @@ typedef struct {
                    int *sel, int *nsel);
     void *topk_user;
     float *ic_host;                   /* out: the S new k_idx rows (host Ic canonical) */
+    int score_off;                    /* COLI_DSA_REFRESH reuse token: append k_idx to the
+                                       * Ic shadow but skip scoring/top-k; sel/nsel arrive
+                                       * prefilled by the caller (topk_fn stays NULL) */
 } ColiCudaDsaChain;
+/* Cumulative wall-time of the chain's mid-sync score download (includes the
+ * implicit pipeline drain) and of the host top-k callback, for COLI_DBG_DSACHAIN. */
+COLI_CUDA_DLLEXPORT void coli_cuda_dsac_times(double *sync_s, double *topk_s);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
