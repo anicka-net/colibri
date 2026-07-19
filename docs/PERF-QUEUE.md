@@ -404,6 +404,31 @@ Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
 
+#### Increment 7 — fp16 KV/Ic device shadows (landed, default ON)
+`COLI_KV_F16=1` (default; `=0` restores fp32) stores the device KV shadows
+(`cuda_Lc`/`cuda_Rc`) and the DSA indexer shadow (`cuda_Ic`) as `__half`:
+half the shadow VRAM and half the read bandwidth in every consumer.  This is
+the 256k enabler — fp32 shadows would cost ~48 GB total at 256k (a third of
+the expert budget); fp16 makes it ~24 GB.  The HOST canonical caches stay
+EXACT fp32: chain and prefill writers compute rows in fp32 staging (scratch
+slots 37-39), download the exact fp32 to host, and convert only the device
+copy; uploads go through `coli_cuda_pipe_upload_kv`/`copy2d_kv` (new
+exports, Windows loader entries done).  Readers are templated on the storage
+type — absorption/sel/batch kernels, `dsa_score`, `dsa_gather_sel`, and the
+`gemm_f16_tc` family, which now feeds the tensor cores DIRECTLY from fp16
+(the fp32→fp16 smem staging conversion disappears; `LcSel`/`RcSel` gather
+buffers are fp16 too).  Host-KV staging paths (`absorb_batch`,
+`project_batch`, ragged) stay fp32; `pfg_test` pins `COLI_KV_F16=0`.
+MEASURED at 13.4k (frozen usage, 64 greedy tokens, fb 0 both modes):
+decode 2.95 (f32) vs 2.91 (f16) tok/s and prefill 781.6 vs 778.0 s — parity
+within drift; prefill score-softmax-value 87.7 → 84.5 s; VRAM −0.6 GB/GPU
+(the whole shadow is only ~1.2 GB/GPU at this T — the win is capacity at
+32k+).  Numerics: same first-decode winner and top-8 set, logit shifts
+≤0.6 = the accepted fp16 class (as W4A16/TC); greedy text flips a near-tie
+on the degenerate repetitive longprompt, as every fp16-class change does.
+Follow-up idea: int8 shadows would halve again but need per-row scales in
+every reader — only worth it if 256k VRAM pressure demands it.
+
 #### DSA phase 2, increment 6 — COLI_DSA_REFRESH knob + selection-cost attribution (landed, default off)
 Motivated by the (now corrected, see item 1) belief that native semantics
 refresh selection every 4 steps.  `COLI_DSA_REFRESH=N` (default 1 = native

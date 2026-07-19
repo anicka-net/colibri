@@ -32,9 +32,11 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
+    float *cvt; size_t cvt_cap;                 /* staging fp32 per upload_kv f16 */
     float *pf_q,*pf_c,*pf_s; size_t pf_q_cap,pf_c_cap,pf_s_cap; /* prefill GEMM attention */
     int smem_optin;                             /* smem opt-in per l'absorb a T lunghi */
     int absorb_attr_set, ragged_attr_set;       /* attributo gia' alzato per kernel */
+    int absorb_attr_set_h;                      /* idem, istanza __half (COLI_KV_F16) */
     float *pipe_buf[40]; size_t pipe_cap[40];   /* scratch persistenti del resident pipeline */
     float *accum; size_t accum_cap;             /* device-side routed-expert accumulate */
     float *wrow_d; size_t wrow_cap;
@@ -115,6 +117,36 @@ __device__ static float decode_group_s4(int n,int offset_s4){
 
 __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]^=0x88;
+}
+
+/* ---- COLI_KV_F16 (default 1): ombre device fp16 -----------------------------
+ * Le ombre device della cache KV (Lc/Rc) e della cache indexer (Ic) vivono in
+ * __half: metà VRAM (~24 vs ~48 GB a 256k) e metà banda nei kernel che le
+ * leggono; nei percorsi tensor-core lo staging fp32→fp16 sparisce del tutto.
+ * L'HOST resta fp32 canonico ed ESATTO: i writer calcolano in fp32 (staging),
+ * scaricano l'fp32 all'host e convertono solo la copia device.  =0 ripristina
+ * le ombre fp32 (A/B, pfg_test).  I kernel lettori sono template sul tipo di
+ * storage; shf/shh sono le load convertite. */
+static int kv_f16_mode(void){
+    static int m=-1;
+    if(m<0){ const char *e=getenv("COLI_KV_F16"); m=e?(atoi(e)!=0):1; }
+    return m;
+}
+extern "C" int coli_cuda_kv_f16(void){ return kv_f16_mode(); }
+__device__ static inline float  shf(const float *p){ return *p; }
+__device__ static inline float  shf(const __half *p){ return __half2float(*p); }
+__device__ static inline __half shh(const float *p){ return __float2half(*p); }
+__device__ static inline __half shh(const __half *p){ return *p; }
+__global__ static void cvt_f32_f16(__half *__restrict__ dst,
+                                   const float *__restrict__ src, size_t n){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n) dst[i]=__float2half(src[i]);
+}
+/* righe strided: dst riga y (pitch dpitch, half) <- src riga y (pitch spitch, fp32) */
+__global__ static void cvt2d_f32_f16(__half *__restrict__ dst,int dpitch,
+                                     const float *__restrict__ src,int spitch,int w){
+    int y=blockIdx.y, x=blockIdx.x*blockDim.x+threadIdx.x;
+    if(x<w) dst[(size_t)y*dpitch+x]=__float2half(src[(size_t)y*spitch+x]);
 }
 
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
@@ -336,8 +368,9 @@ __global__ static void attention_absorb_kernel(float *ctx,const float *q,const f
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
 }
 
+template<typename KT>
 __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
-        const float *latent,const float *rope,const void *weights,const float *wscale,
+        const KT *latent,const KT *rope,const void *weights,const float *wscale,
         int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
     int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
     if(s>=S||nt<1)return;
@@ -347,9 +380,9 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
           (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
-    for(int t=tid;t<nt;t+=blockDim.x){float a=0;const float *lt=latent+(size_t)t*K;
-        const float *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*lt[k];
-        for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[t]=a*scale;}
+    for(int t=tid;t<nt;t+=blockDim.x){float a=0;const KT *lt=latent+(size_t)t*K;
+        const KT *rt=rope+(size_t)t*R;for(int k=0;k<K;k++)a+=qa[k]*shf(lt+k);
+        for(int d=0;d<R;d++)a+=qs[Q+d]*shf(rt+d);scores[t]=a*scale;}
     __syncthreads();
     float local=-3.402823466e+38F;for(int t=tid;t<nt;t+=blockDim.x)local=fmaxf(local,scores[t]);
     red[tid]=local;__syncthreads();
@@ -365,7 +398,7 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
     __syncthreads();
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int t=0;t<nt;t++)
-        a+=scores[t]*latent[(size_t)t*K+k];cl[k]=a;}
+        a+=scores[t]*shf(latent+(size_t)t*K+k);cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
@@ -527,6 +560,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
+        ctx->cvt=nullptr; ctx->cvt_cap=0;
         ctx->pf_q=ctx->pf_c=ctx->pf_s=nullptr;
         ctx->accum=ctx->wrow_d=nullptr;
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
@@ -1059,7 +1093,7 @@ static int attention_absorb_batch_run(ColiCudaTensor *w,ColiCudaTensor *proj,flo
        !cuda_ok(cudaMemcpyAsync(dc->al,latent,lb,cudaMemcpyHostToDevice,dc->stream),"attention batch latent upload")||
        !cuda_ok(cudaMemcpyAsync(dc->ar,rope,rb,cudaMemcpyHostToDevice,dc->stream),"attention batch rope upload"))return 0;
     size_t shared;
-    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
+    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel<float>,
                        &dc->absorb_attr_set))return 0;
     attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,dc->aq,dc->al,
         dc->ar,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
@@ -1279,14 +1313,15 @@ __global__ static void memcpy_f32_kernel(float *__restrict__ dst,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
 }
+template<typename KT>
 __device__ static void absorption_body(
     float *__restrict__ ctx_out,
     const float *__restrict__ Q,
     const uint8_t *__restrict__ kv_b_w,
     const float *__restrict__ kv_b_s,
     int kv_b_I,
-    const float *__restrict__ Lc,
-    const float *__restrict__ Rc,
+    const KT *__restrict__ Lc,
+    const KT *__restrict__ Rc,
     int H, int qk_nope, int qk_rope, int vh,
     int kv_start, int pos, float attn_scale)
 {
@@ -1332,11 +1367,11 @@ __device__ static void absorption_body(
     /* We store scores temporarily in s_buf. For nt up to ~2000, this fits in smem. */
     for (int j = tid; j < nt; j += blockDim.x) {
         int t = kv_start + j;
-        const float *Lt = Lc + (size_t)t * kvl;
-        const float *kr = Rc + (size_t)t * qk_rope;
+        const KT *Lt = Lc + (size_t)t * kvl;
+        const KT *kr = Rc + (size_t)t * qk_rope;
         float a = 0.0f;
-        for (int i = 0; i < kvl; i++) a += s_qabs[i] * Lt[i];
-        for (int d = 0; d < qk_rope; d++) a += qr[d] * kr[d];
+        for (int i = 0; i < kvl; i++) a += s_qabs[i] * shf(Lt + i);
+        for (int d = 0; d < qk_rope; d++) a += qr[d] * shf(kr + d);
         s_buf[j] = a * attn_scale;
     }
     __syncthreads();
@@ -1402,7 +1437,7 @@ __device__ static void absorption_body(
         float sum = 0.0f;
         for (int j = 0; j < nt; j++) {
             int t = kv_start + j;
-            sum += s_buf[j] * Lc[(size_t)t * kvl + i];
+            sum += s_buf[j] * shf(Lc + (size_t)t * kvl + i);
         }
         s_clat[i] = sum;
     }
@@ -1423,10 +1458,11 @@ __device__ static void absorption_body(
         ctx_out[(size_t)h * vh + row] = sum * kv_b_s[krow];
     }
 }
+template<typename KT>
 __global__ static void absorption_kernel(
     float *__restrict__ ctx_out, const float *__restrict__ Q,
     const uint8_t *__restrict__ kv_b_w, const float *__restrict__ kv_b_s,
-    int kv_b_I, const float *__restrict__ Lc, const float *__restrict__ Rc,
+    int kv_b_I, const KT *__restrict__ Lc, const KT *__restrict__ Rc,
     int H, int qk_nope, int qk_rope, int vh,
     int kv_start, int pos, float attn_scale)
 {
@@ -1469,9 +1505,10 @@ __global__ static void layernorm_kernel(float *xrows, const float *__restrict__ 
  * One query row per blockIdx.y (row y has nk0+y causal keys), qi [nh,hd]
  * (roped) and w32 [nh] of that row in smem, one thread per token.  The
  * decode chain uses grid.y==1 with nk0 = the single row's key count. */
+template<typename KT>
 __global__ static void dsa_score_kernel(float *__restrict__ isc,
         const float *__restrict__ qi, const float *__restrict__ w32,
-        const float *__restrict__ Ic, int nk0, int nh, int hd,
+        const KT *__restrict__ Ic, int nk0, int nh, int hd,
         float wsc, float rs, int Tstride) {
     extern __shared__ float sm[];
     int y = blockIdx.y, nk = nk0 + y;
@@ -1482,12 +1519,12 @@ __global__ static void dsa_score_kernel(float *__restrict__ isc,
     __syncthreads();
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nk) return;
-    const float *kt = Ic + (size_t)t * hd;
+    const KT *kt = Ic + (size_t)t * hd;
     float a = 0;
     for (int h = 0; h < nh; h++) {
         const float *qh = sq + (size_t)h * hd;
         float d = 0;
-        for (int i = 0; i < hd; i++) d += qh[i] * kt[i];
+        for (int i = 0; i < hd; i++) d += qh[i] * shf(kt + i);
         d *= rs;
         if (d > 0) a += sw[h] * d;
     }
@@ -1519,8 +1556,9 @@ __global__ static void gemv_f32_kernel(float *__restrict__ y, const float *__res
     if (threadIdx.x == 0) y[o] = red[0];
 }
 
+template<typename KT>
 __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
-        const float *latent,const float *rope,const int *sel,int ns,
+        const KT *latent,const KT *rope,const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale);
 /* COLI_DBG_DSACHAIN=1: tempi cumulativi del punto di sync a metà catena
@@ -1605,6 +1643,20 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         dsel_d=(int*)coli_cuda_pipe_scratch(device,21,(size_t)S*dsa->topk*sizeof(int));
         if(!dsel_d){ fprintf(stderr,"[CUDA] attn_chain: sel scratch\n"); return 0; }
     }
+    /* COLI_KV_F16: le righe nuove si calcolano in fp32 (staging 37-39), l'host
+     * scarica l'fp32 ESATTO, l'ombra riceve la conversione __half */
+    int f16=kv_f16_mode();
+    __half *hLc=(__half*)d_Lc, *hRc=(__half*)d_Rc;
+    float *lrow=NULL,*rrow=NULL,*irow=NULL;
+    if(f16){
+        lrow=coli_cuda_pipe_scratch(device,37,(size_t)S*kv_lora*4);
+        rrow=coli_cuda_pipe_scratch(device,38,(size_t)S*qk_rope*4);
+        if(!lrow||!rrow) return 0;
+        if(dsa_full||dsa_reuse){
+            irow=coli_cuda_pipe_scratch(device,39,(size_t)S*dsa->hd*4);
+            if(!irow) return 0;
+        }
+    }
     size_t smem_D=(size_t)D*sizeof(__half);
     size_t smem_q=(size_t)q_lora*sizeof(__half);
     size_t smem_o=(size_t)(H*vh)*sizeof(__half);
@@ -1613,7 +1665,8 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
        cudaFuncSetAttribute((const void*)gemv_q4,
            cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem_max)!=cudaSuccess) return 0;
     if(!selm && abs_smem>48u*1024u &&
-       cudaFuncSetAttribute((const void*)absorption_kernel,
+       cudaFuncSetAttribute(f16?(const void*)absorption_kernel<__half>
+                               :(const void*)absorption_kernel<float>,
            cudaFuncAttributeMaxDynamicSharedMemorySize,(int)abs_smem)!=cudaSuccess) return 0;
     /* loop 1: projections + KV/Ic writes + (FULL layers) selection scoring.
      * Rows>pos in d_Lc/d_Rc are written before the absorb reads them, but the
@@ -1630,23 +1683,31 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
             (const uint8_t*)kva->weights,kva->scales,D,kva_O);
         { int th=q_lora<256?q_lora:256;
           rmsnorm_kernel<<<1,th,(size_t)th*sizeof(float)>>>(qres,qres,w_qa,q_lora,eps); }
+        float *ltgt=f16?lrow+(size_t)s*kv_lora:d_Lc+(size_t)pos*kv_lora;
+        float *rtgt=f16?rrow+(size_t)s*qk_rope:d_Rc+(size_t)pos*qk_rope;
         { int th=kv_lora<256?kv_lora:256;
-          rmsnorm_kernel<<<1,th,(size_t)th*sizeof(float)>>>(d_Lc+(size_t)pos*kv_lora,comp,w_kva,kv_lora,eps); }
+          rmsnorm_kernel<<<1,th,(size_t)th*sizeof(float)>>>(ltgt,comp,w_kva,kv_lora,eps); }
         { int th=qk_rope<256?qk_rope:256;
-          memcpy_f32_kernel<<<(qk_rope+th-1)/th,th>>>(d_Rc+(size_t)pos*qk_rope,comp+kv_lora,qk_rope); }
-        pipe_rope_rows<<<1,128>>>(d_Rc+(size_t)pos*qk_rope,NULL,pos,
+          memcpy_f32_kernel<<<(qk_rope+th-1)/th,th>>>(rtgt,comp+kv_lora,qk_rope); }
+        pipe_rope_rows<<<1,128>>>(rtgt,NULL,pos,
             qk_rope,0,qk_rope,1,theta);
+        if(f16){
+            cvt_f32_f16<<<((unsigned)kv_lora+255)/256,256>>>(hLc+(size_t)pos*kv_lora,ltgt,kv_lora);
+            cvt_f32_f16<<<((unsigned)qk_rope+255)/256,256>>>(hRc+(size_t)pos*qk_rope,rtgt,qk_rope);
+        }
         gemv_q4<<<((unsigned)(H*qh)+7)/8,256,smem_q>>>(qQs,qres,
             (const uint8_t*)qb->weights,qb->scales,q_lora,H*qh);
         pipe_rope_rows<<<H,128>>>(qQs,NULL,pos,qh,qk_nope,qk_rope,H,theta);
         if(dsa_full||dsa_reuse){
             int nh=dsa->nh, hd=dsa->hd, nk=pos+1;
-            float *icrow=dsa->d_Ic+(size_t)pos*hd;
+            float *icrow=f16?irow+(size_t)s*hd:dsa->d_Ic+(size_t)pos*hd;
             quant_matmul<<<dim3(hd,1),256>>>(icrow,xns,dsa->ix_wk->weights,
                 dsa->ix_wk->scales,dsa->ix_wk->fmt,1,D,hd,
                 row_bytes(dsa->ix_wk->fmt,D));
             layernorm_kernel<<<1,128>>>(icrow,dsa->knw_dev,dsa->knb_dev,hd,1e-6f);
             pipe_rope_rows<<<1,128>>>(icrow,NULL,pos,hd,0,qk_rope,1,theta);
+            if(f16) cvt_f32_f16<<<((unsigned)hd+255)/256,256>>>(
+                (__half*)dsa->d_Ic+(size_t)pos*hd,icrow,hd);
             if(!dsa_full) continue;   /* riuso: niente punteggi, sel arriva dal chiamante */
             quant_matmul<<<dim3(nh*hd,1),256>>>(qi_d,qres,dsa->ix_wq->weights,
                 dsa->ix_wq->scales,dsa->ix_wq->fmt,1,q_lora,nh*hd,
@@ -1656,7 +1717,10 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
                 dsa->ix_wp->scales,dsa->ix_wp->fmt,1,D,nh,
                 row_bytes(dsa->ix_wp->fmt,D));
             size_t smem_sc=(size_t)(nh*hd+nh)*sizeof(float);
-            dsa_score_kernel<<<dim3(((unsigned)nk+127)/128,1),128,smem_sc>>>(
+            if(f16) dsa_score_kernel<<<dim3(((unsigned)nk+127)/128,1),128,smem_sc>>>(
+                sc_d+(size_t)s*T,qi_d,w32_d,(const __half*)dsa->d_Ic,nk,nh,hd,
+                1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
+            else dsa_score_kernel<<<dim3(((unsigned)nk+127)/128,1),128,smem_sc>>>(
                 sc_d+(size_t)s*T,qi_d,w32_d,dsa->d_Ic,nk,nh,hd,
                 1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
         }
@@ -1688,11 +1752,19 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         if(selm){
             int ns=dsa->nsel[s];
             size_t smem_sel=(size_t)(2*kv_lora+ns+256)*sizeof(float);
-            attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cx,qQs,
+            if(f16) attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cx,qQs,
+                hLc,hRc,dsel_d+(size_t)s*dsa->topk,ns,
+                kvb->weights,kvb->scales,kvb->fmt,
+                H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
+            else attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cx,qQs,
                 d_Lc,d_Rc,dsel_d+(size_t)s*dsa->topk,ns,
                 kvb->weights,kvb->scales,kvb->fmt,
                 H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
-        }else
+        }else if(f16)
+            absorption_kernel<<<H,256,abs_smem>>>(cx,qQs,
+                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                hLc,hRc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
+        else
             absorption_kernel<<<H,256,abs_smem>>>(cx,qQs,
                 (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
                 d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
@@ -1733,10 +1805,13 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
     if(cudaMemcpy(nrm_host,nrm_dev,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if(sc&&cudaMemcpy(scores_host,sc,(size_t)S*E*4,cudaMemcpyDeviceToHost)!=cudaSuccess) sc=NULL;
     if(d_router&&scores_host&&E>0&&!sc) scores_host[0]=NAN;   /* signal: no scores, caller recomputes */
-    if(cudaMemcpy(kv_host_L,d_Lc+(size_t)pos_base*kv_lora,(size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
-    if(cudaMemcpy(kv_host_R,d_Rc+(size_t)pos_base*qk_rope,(size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+    /* con f16 l'host scarica lo STAGING fp32 (esatto), non l'ombra lossy */
+    if(cudaMemcpy(kv_host_L,f16?lrow:d_Lc+(size_t)pos_base*kv_lora,
+                  (size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+    if(cudaMemcpy(kv_host_R,f16?rrow:d_Rc+(size_t)pos_base*qk_rope,
+                  (size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     if((dsa_full||dsa_reuse)&&dsa->ic_host&&
-       cudaMemcpy(dsa->ic_host,dsa->d_Ic+(size_t)pos_base*dsa->hd,
+       cudaMemcpy(dsa->ic_host,f16?irow:dsa->d_Ic+(size_t)pos_base*dsa->hd,
                   (size_t)S*dsa->hd*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
     { cudaError_t ce=cudaGetLastError();
       if(ce!=cudaSuccess){ fprintf(stderr,"[CUDA] attn_chain: %s\n",cudaGetErrorString(ce));
@@ -1818,9 +1893,65 @@ extern "C" int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const floa
     return cuda_ok(cudaMemcpy2D(dst,(size_t)dpitch*4,src,(size_t)spitch*4,
         (size_t)width*4,height,cudaMemcpyDeviceToDevice),"pipe copy2d");
 }
+/* ---- scritture nelle ombre KV/Ic nel formato COLI_KV_F16 -------------------
+ * dst è il puntatore BASE dell'ombra (opaco per l'host); elem_off/elems sono
+ * in ELEMENTI.  Con f16 l'upload host passa da uno staging fp32 e converte;
+ * senza, degrada alle memcpy esistenti.  copy2d_kv converte righe strided
+ * device->ombra (il writer di prefill). */
+extern "C" int coli_cuda_pipe_upload_kv(int device,void *dst,const float *src,
+                                        size_t elems,size_t elem_off){
+    DeviceContext *ctx=find_ctx(device); if(!elems||!select_ctx(ctx)) return 0;
+    if(!kv_f16_mode())
+        return cuda_ok(cudaMemcpy((float*)dst+elem_off,src,elems*4,
+            cudaMemcpyHostToDevice),"kv upload");
+    const size_t CH=4u<<20;                       /* 4M elementi = 16 MB staging */
+    size_t done=0;
+    while(done<elems){
+        size_t n=elems-done; if(n>CH) n=CH;
+        if(!reserve(&ctx->cvt,&ctx->cvt_cap,n*4)) return 0;
+        if(!cuda_ok(cudaMemcpy(ctx->cvt,src+done,n*4,cudaMemcpyHostToDevice),
+            "kv upload stage")) return 0;
+        cvt_f32_f16<<<(unsigned)((n+255)/256),256>>>((__half*)dst+elem_off+done,
+            ctx->cvt,n);
+        if(!cuda_ok(cudaGetLastError(),"kv upload cvt")) return 0;
+        done+=n;
+    }
+    return 1;
+}
+extern "C" int coli_cuda_pipe_copy2d_kv(int device,void *dst,int dpitch,
+        const float *src,int spitch,int width,int height,size_t elem_off){
+    DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
+    if(!kv_f16_mode())
+        return cuda_ok(cudaMemcpy2D((float*)dst+elem_off,(size_t)dpitch*4,
+            src,(size_t)spitch*4,(size_t)width*4,height,
+            cudaMemcpyDeviceToDevice),"kv copy2d");
+    cvt2d_f32_f16<<<dim3((unsigned)((width+255)/256),(unsigned)height),256>>>(
+        (__half*)dst+elem_off,dpitch,src,spitch,width);
+    return cuda_ok(cudaGetLastError(),"kv copy2d cvt");
+}
 /* attention batch + fused o_proj with DEVICE-resident q/latent/rope: the whole
  * upstream projection chain stayed on this device, so nothing is uploaded here.
  * Only the final [S,O] projection is downloaded to host. */
+/* lancio dell'absorb batch su ombre device: sceglie l'istanza (fp32/__half)
+ * secondo COLI_KV_F16 — latent_dev/rope_dev sono SEMPRE puntatori ombra qui */
+static int absorb_batch_shadow_launch(DeviceContext *dc,float *ctx,const float *q_dev,
+        const float *latent_dev,const float *rope_dev,const ColiCudaTensor *w,
+        int S,int H,int Q,int R,int V,int K,int T,float scale){
+    size_t shared;
+    if(kv_f16_mode()){
+        if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel<__half>,
+                           &dc->absorb_attr_set_h))return 0;
+        attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx,q_dev,
+            (const __half*)latent_dev,(const __half*)rope_dev,
+            w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    }else{
+        if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel<float>,
+                           &dc->absorb_attr_set))return 0;
+        attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx,q_dev,
+            latent_dev,rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    }
+    return 1;
+}
 extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaTensor *proj,
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
@@ -1830,11 +1961,8 @@ extern "C" int coli_cuda_attention_project_batch_dev(ColiCudaTensor *w,ColiCudaT
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t cb=(size_t)S*H*V*sizeof(float);
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
-    size_t shared;
-    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
-                       &dc->absorb_attr_set))return 0;
-    attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!absorb_batch_shadow_launch(dc,dc->ac,q_dev,latent_dev,rope_dev,
+        w,S,H,Q,R,V,K,T,scale))return 0;
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch"))return 0;
     size_t ob=(size_t)S*proj->O*sizeof(float);
     if(!reserve(&dc->y,&dc->y_cap,ob))return 0;
@@ -1904,11 +2032,8 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
     size_t cb=(size_t)S*H*V*sizeof(float);
     if(!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
-    size_t shared;
-    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
-                       &dc->absorb_attr_set))return 0;
-    attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(dc->ac,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!absorb_batch_shadow_launch(dc,dc->ac,q_dev,latent_dev,rope_dev,
+        w,S,H,Q,R,V,K,T,scale))return 0;
     if(!cuda_ok(cudaGetLastError(),"pipe attention launch (dev out)"))return 0;
     quant_matmul<<<dim3(proj->O,S),256,0,dc->stream>>>(out_dev,dc->ac,proj->weights,
         proj->scales,proj->fmt,S,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
@@ -1924,11 +2049,8 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
     if(!w||!ctx_dev||!q_dev||!latent_dev||!rope_dev||S<1||H<1||Q<1||R<1||V<1||
        K<1||K>512||T<S||w->I!=K||w->O!=H*(Q+V))return 0;
     DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
-    size_t shared;
-    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
-                       &dc->absorb_attr_set))return 0;
-    attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx_dev,q_dev,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+    if(!absorb_batch_shadow_launch(dc,ctx_dev,q_dev,latent_dev,rope_dev,
+        w,S,H,Q,R,V,K,T,scale))return 0;
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
@@ -1936,8 +2058,9 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
  * sel[] contiene posizioni ASSOLUTE nella shadow KV del device — latent/rope
  * sono i puntatori base cuda_Lc/cuda_Rc, nessuna finestra st0. Stessa
  * matematica del percorso CPU (score sui selezionati, softmax, gather). */
+template<typename KT>
 __device__ static void absorb_sel_body(float *ctx,const float *q,
-        const float *latent,const float *rope,const int *sel,int ns,
+        const KT *latent,const KT *rope,const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale){
     int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);
@@ -1948,9 +2071,9 @@ __device__ static void absorb_sel_body(float *ctx,const float *q,
           (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
     __syncthreads();
     for(int j=tid;j<ns;j+=blockDim.x){int t=sel[j];float a=0;
-        const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
-        for(int k=0;k<K;k++)a+=qa[k]*lt[k];
-        for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[j]=a*scale;}
+        const KT *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        for(int k=0;k<K;k++)a+=qa[k]*shf(lt+k);
+        for(int d=0;d<R;d++)a+=qs[Q+d]*shf(rt+d);scores[j]=a*scale;}
     __syncthreads();
     float local=-3.402823466e+38F;for(int j=tid;j<ns;j+=blockDim.x)local=fmaxf(local,scores[j]);
     red[tid]=local;__syncthreads();
@@ -1962,14 +2085,15 @@ __device__ static void absorb_sel_body(float *ctx,const float *q,
     float inv=1.f/red[0];for(int j=tid;j<ns;j+=blockDim.x)scores[j]*=inv;
     __syncthreads();
     for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int j=0;j<ns;j++)
-        a+=scores[j]*latent[(size_t)sel[j]*K+k];cl[k]=a;}
+        a+=scores[j]*shf(latent+(size_t)sel[j]*K+k);cl[k]=a;}
     __syncthreads();
     for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
         for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
         ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
 }
+template<typename KT>
 __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
-        const float *latent,const float *rope,const int *sel,int ns,
+        const KT *latent,const KT *rope,const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale){
     absorb_sel_body(ctx,q,latent,rope,sel,ns,weights,wscale,fmt,H,Q,R,V,K,scale);
@@ -1977,8 +2101,9 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
 /* Batch di righe query, una per blockIdx.y: riga y usa la SUA lista sel
  * (ns fisso = topk, invariante del top-k di prefill).  q [rows,H*(Q+R)],
  * ctx [rows,H*V], sel [rows,topk] posizioni assolute. */
+template<typename KT>
 __global__ static void attention_absorb_sel_rows_kernel(float *ctx,const float *q,
-        const float *latent,const float *rope,const int *sel,int topk,
+        const KT *latent,const KT *rope,const int *sel,int topk,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale){
     int y=blockIdx.y;
@@ -2000,8 +2125,13 @@ extern "C" int coli_cuda_attention_project_sel(ColiCudaTensor *w,ColiCudaTensor 
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"sel q upload")||
        !cuda_ok(cudaMemcpyAsync(dc->qx,sel,sb,cudaMemcpyHostToDevice,dc->stream),"sel list upload"))return 0;
     size_t shared=(size_t)(2*K+ns+256)*sizeof(float);
-    attention_absorb_sel_kernel<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
-        rope_dev,(const int*)dc->qx,ns,w->weights,w->scales,w->fmt,H,Q,R,V,K,scale);
+    if(kv_f16_mode())
+        attention_absorb_sel_kernel<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,
+            (const __half*)latent_dev,(const __half*)rope_dev,
+            (const int*)dc->qx,ns,w->weights,w->scales,w->fmt,H,Q,R,V,K,scale);
+    else
+        attention_absorb_sel_kernel<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
+            rope_dev,(const int*)dc->qx,ns,w->weights,w->scales,w->fmt,H,Q,R,V,K,scale);
     if(!cuda_ok(cudaGetLastError(),"sel absorb launch"))return 0;
     quant_matmul<<<dim3(proj->O,1),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
         proj->scales,proj->fmt,1,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
@@ -2021,11 +2151,8 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
     size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);
     if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb))return 0;
     if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"kvdev q upload"))return 0;
-    size_t shared;
-    if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel,
-                       &dc->absorb_attr_set))return 0;
-    attention_absorb_batch_kernel<<<dim3(H,1),256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
-        rope_dev,w->weights,w->scales,w->fmt,1,H,Q,R,V,K,T,scale);
+    if(!absorb_batch_shadow_launch(dc,dc->ac,dc->aq,latent_dev,rope_dev,
+        w,1,H,Q,R,V,K,T,scale))return 0;
     if(!cuda_ok(cudaGetLastError(),"kvdev absorb launch")||
        !cuda_ok(cudaMemcpyAsync(ctx,dc->ac,cb,cudaMemcpyDeviceToHost,dc->stream),"kvdev ctx download")||
        !cuda_ok(cudaStreamSynchronize(dc->stream),"kvdev absorb sync"))return 0;
@@ -2042,7 +2169,8 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
  *   4. ctxL[S,K]   = P[S,T] @ Lc[T,K]                      fp16 TC, NN
  *   5. ctx[:,hV:]  = ctxL @ Wv^T ;  out = ctx @ Wo^T       int4 weights, NT
  * Weight nibbles are SIGNED (upload converts); decode matches w4a16_matmul. */
-__device__ static void gemm_f16_tc_body(float *C,const float *A,const float *B,
+template<typename AT,typename BT>
+__device__ static void gemm_f16_tc_body(float *C,const AT *A,const BT *B,
         int M,int N,int K,int lda,int ldb,int ldc,int transB,int beta){
 #if __CUDA_ARCH__ >= 700
     using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
@@ -2052,14 +2180,14 @@ __device__ static void gemm_f16_tc_body(float *C,const float *A,const float *B,
     for(int k0=0;k0<K;k0+=16){
         for(int z=threadIdx.x;z<256;z+=blockDim.x){
             int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
-            ah[z]=(gm<M&&gk<K)?__float2half(A[(size_t)gm*lda+gk]):__float2half(0.f);
+            ah[z]=(gm<M&&gk<K)?shh(A+(size_t)gm*lda+gk):__float2half(0.f);
         }
         if(transB){                                    /* B[N,K] righe: C=A@B^T */
             for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;
-                bh[warp][z]=(gn<N&&gk<K)?__float2half(B[(size_t)gn*ldb+gk]):__float2half(0.f);}
+                bh[warp][z]=(gn<N&&gk<K)?shh(B+(size_t)gn*ldb+gk):__float2half(0.f);}
         }else{                                         /* B[K,N] righe: C=A@B */
             for(int z=lane;z<256;z+=32){int k=z/16,gn=n0+(z%16),gk=k0+k;
-                bh[warp][z]=(gn<N&&gk<K)?__float2half(B[(size_t)gk*ldb+gn]):__float2half(0.f);}
+                bh[warp][z]=(gn<N&&gk<K)?shh(B+(size_t)gk*ldb+gn):__float2half(0.f);}
         }
         __syncthreads();
         wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
@@ -2078,13 +2206,15 @@ __device__ static void gemm_f16_tc_body(float *C,const float *A,const float *B,
         if(m0+m<M&&n0+n<N){size_t i=(size_t)(m0+m)*ldc+n0+n;C[i]=beta?C[i]+out[warp][z]:out[warp][z];}}
 #endif
 }
-__global__ static void gemm_f16_tc(float *C,const float *A,const float *B,
+template<typename BT>
+__global__ static void gemm_f16_tc(float *C,const float *A,const BT *B,
         int M,int N,int K,int lda,int ldb,int ldc,int transB,int beta){
     gemm_f16_tc_body(C,A,B,M,N,K,lda,ldb,ldc,transB,beta);
 }
 /* batch su blockIdx.z: problema z usa A/B/C spostati di z*stride (elementi).
  * Serve alla fase B DSA: una GEMM per riga query (teste = dimensione M). */
-__global__ static void gemm_f16_tc_zb(float *C,const float *A,const float *B,
+template<typename BT>
+__global__ static void gemm_f16_tc_zb(float *C,const float *A,const BT *B,
         int M,int N,int K,int lda,int ldb,int ldc,int transB,int beta,
         size_t sA,size_t sB,size_t sC){
     size_t z=blockIdx.z;
@@ -2196,14 +2326,15 @@ __global__ static void causal_softmax_rows(float *scores,int S,int T,float scale
 /* Fase B DSA in GEMM: raccoglie le righe Lc/Rc selezionate dalla riga query
  * z in buffer contigui — pagata UNA volta per riga invece dei load sparsi
  * ripetuti per ognuna delle 64 teste. */
-__global__ static void dsa_gather_sel(float *LcSel,float *RcSel,
-        const float *latent,const float *rope,const int *sel,int topk,int K,int R,
+template<typename KT>
+__global__ static void dsa_gather_sel(KT *LcSel,KT *RcSel,
+        const KT *latent,const KT *rope,const int *sel,int topk,int K,int R,
         int T){
     size_t z=blockIdx.y,j=blockIdx.x;
     int t=sel[z*topk+j];
     if(t<0)t=0; if(t>=T)t=T-1;   /* un indice corrotto non deve toccare VA selvaggia */
-    const float *ls=latent+(size_t)t*K,*rs=rope+(size_t)t*R;
-    float *ld=LcSel+(z*topk+j)*K,*rd=RcSel+(z*topk+j)*R;
+    const KT *ls=latent+(size_t)t*K,*rs=rope+(size_t)t*R;
+    KT *ld=LcSel+(z*topk+j)*K,*rd=RcSel+(z*topk+j)*R;
     for(int k=threadIdx.x;k<K;k+=blockDim.x)ld[k]=ls[k];
     for(int r=threadIdx.x;r<R;r+=blockDim.x)rd[r]=rs[r];
 }
@@ -2242,11 +2373,21 @@ extern "C" int coli_cuda_prefill_dsa_select(int device,ColiCudaDsaChain *dsa,
        (dsa->ix_wp->fmt!=1&&dsa->ix_wp->fmt!=2)) return 0;
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!select_ctx(ctx)) return 0;
-    float *icrows=dsa->d_Ic+(size_t)pos_base*hd;
+    /* COLI_KV_F16: k_idx in staging fp32 (slot 39), ombra riceve la conversione
+     * PRIMA dei punteggi (che leggono d_Ic fino a T incluse le righe nuove);
+     * ic_host scarica lo staging esatto. */
+    int f16=kv_f16_mode();
+    float *icrows;
+    if(f16){
+        icrows=coli_cuda_pipe_scratch(device,39,(size_t)S*hd*4);
+        if(!icrows){ fprintf(stderr,"[CUDA] prefill dsa: ic stage\n"); return 0; }
+    }else icrows=dsa->d_Ic+(size_t)pos_base*hd;
     quant_matmul<<<dim3(hd,S),256>>>(icrows,xn_dev,dsa->ix_wk->weights,
         dsa->ix_wk->scales,dsa->ix_wk->fmt,S,D,hd,row_bytes(dsa->ix_wk->fmt,D));
     layernorm_kernel<<<S,128>>>(icrows,dsa->knw_dev,dsa->knb_dev,hd,1e-6f);
     pipe_rope_rows<<<S,128>>>(icrows,NULL,pos_base,hd,0,qk_rope,1,theta);
+    if(f16) cvt_f32_f16<<<(unsigned)(((size_t)S*hd+255)/256),256>>>(
+        (__half*)dsa->d_Ic+(size_t)pos_base*hd,icrows,(size_t)S*hd);
     if(S_b>0){
         float *isc =coli_cuda_pipe_scratch(device,18,(size_t)S_b*T*4);
         float *qi_d=coli_cuda_pipe_scratch(device,19,(size_t)S_b*nh*hd*4);
@@ -2260,7 +2401,10 @@ extern "C" int coli_cuda_prefill_dsa_select(int device,ColiCudaDsaChain *dsa,
             dsa->ix_wp->weights,dsa->ix_wp->scales,dsa->ix_wp->fmt,S_b,D,nh,
             row_bytes(dsa->ix_wp->fmt,D));
         size_t smem_sc=(size_t)(nh*hd+nh)*sizeof(float);
-        dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)S_b),128,smem_sc>>>(
+        if(f16) dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)S_b),128,smem_sc>>>(
+            isc,qi_d,w32d,(const __half*)dsa->d_Ic,pos_base+sB0+1,nh,hd,
+            1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
+        else dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)S_b),128,smem_sc>>>(
             isc,qi_d,w32d,dsa->d_Ic,pos_base+sB0+1,nh,hd,
             1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
         if(!cuda_ok(cudaGetLastError(),"prefill dsa launch")) return 0;
@@ -2309,6 +2453,8 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
     size_t rb=row_bytes(2,K);
     const uint8_t *wb=(const uint8_t*)w->weights;
     const float *wsc=w->scales;
+    int f16=kv_f16_mode();
+    const __half *hL=(const __half*)latent_dev,*hR=(const __half*)rope_dev;
     if(S_a>0){
         dim3 gq((unsigned)((K+63)/64),(unsigned)((S_a+15)/16));
         dim3 gs((unsigned)((T_a+63)/64),(unsigned)((S_a+15)/16));
@@ -2318,12 +2464,21 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
             const float *qh=q_dev+(size_t)h*(Q+R);
             w4a16_nn_scaled<<<gq,128,0,st>>>(dc->pf_q,qh,wb+rbase*rb,
                 wsc+rbase,S_a,K,Q,H*(Q+R),rb,K);
-            gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,dc->pf_q,latent_dev,
-                S_a,T_a,K,K,K,T_a,1,0);
-            gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,qh+Q,rope_dev,
-                S_a,T_a,R,H*(Q+R),R,T_a,1,1);
+            if(f16){
+                gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,dc->pf_q,hL,
+                    S_a,T_a,K,K,K,T_a,1,0);
+                gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,qh+Q,hR,
+                    S_a,T_a,R,H*(Q+R),R,T_a,1,1);
+            }else{
+                gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,dc->pf_q,latent_dev,
+                    S_a,T_a,K,K,K,T_a,1,0);
+                gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,qh+Q,rope_dev,
+                    S_a,T_a,R,H*(Q+R),R,T_a,1,1);
+            }
             causal_softmax_rows<<<S_a,256,0,st>>>(dc->pf_s,S_a,T_a,scale);
-            gemm_f16_tc<<<gq,128,0,st>>>(dc->pf_c,dc->pf_s,latent_dev,
+            if(f16) gemm_f16_tc<<<gq,128,0,st>>>(dc->pf_c,dc->pf_s,hL,
+                S_a,K,T_a,T_a,K,K,0,0);
+            else gemm_f16_tc<<<gq,128,0,st>>>(dc->pf_c,dc->pf_s,latent_dev,
                 S_a,K,T_a,T_a,K,K,0,0);
             w4a16_nt_ld<<<gv,128,0,st>>>(dc->ac+(size_t)h*V,dc->pf_c,
                 wb+(rbase+Q)*rb,wsc+rbase+Q,S_a,K,V,H*V);
@@ -2337,9 +2492,10 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
         int tcg=(!tg||atoi(tg))&&dc->compute_major>=7;
         float *LcSel=NULL,*RcSel=NULL,*qabs=NULL,*scb=NULL,*ctxL=NULL;
         int RB=32; if(RB>S_b)RB=S_b;
+        size_t esz=f16?sizeof(__half):sizeof(float);   /* LcSel/RcSel nel formato ombra */
         if(tcg){
-            LcSel=coli_cuda_pipe_scratch(w->device,32,(size_t)RB*sel_topk*K*sizeof(float));
-            RcSel=coli_cuda_pipe_scratch(w->device,33,(size_t)RB*sel_topk*R*sizeof(float));
+            LcSel=coli_cuda_pipe_scratch(w->device,32,(size_t)RB*sel_topk*K*esz);
+            RcSel=coli_cuda_pipe_scratch(w->device,33,(size_t)RB*sel_topk*R*esz);
             qabs =coli_cuda_pipe_scratch(w->device,34,(size_t)RB*H*K*sizeof(float));
             scb  =coli_cuda_pipe_scratch(w->device,35,(size_t)RB*H*sel_topk*sizeof(float));
             ctxL =coli_cuda_pipe_scratch(w->device,36,(size_t)RB*H*K*sizeof(float));
@@ -2348,22 +2504,36 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
         if(tcg)for(int c0=0;c0<S_b;c0+=RB){
             int rn=S_b-c0; if(rn>RB)rn=RB;
             int row0=sB0+c0;
-            dsa_gather_sel<<<dim3((unsigned)sel_topk,(unsigned)rn),128,0,st>>>(
+            if(f16) dsa_gather_sel<<<dim3((unsigned)sel_topk,(unsigned)rn),128,0,st>>>(
+                (__half*)LcSel,(__half*)RcSel,hL,hR,dsel+(size_t)c0*sel_topk,sel_topk,K,R,T);
+            else dsa_gather_sel<<<dim3((unsigned)sel_topk,(unsigned)rn),128,0,st>>>(
                 LcSel,RcSel,latent_dev,rope_dev,dsel+(size_t)c0*sel_topk,sel_topk,K,R,T);
             /* qabs[r,h,:] = q_nope[r,h,:] @ (ws*Wk_h) */
             w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
                 qabs,q_dev+(size_t)row0*H*(Q+R),wb,wsc,rn,K,Q,H*(Q+R),rb,H*K,
                 Q+R,Q+V,0,K);
             /* scores[r,h,:] = qabs[r,h,:] @ LcSel[r]^T + q_rope[r,h,:] @ RcSel[r]^T */
-            gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
-                scb,qabs,LcSel,H,sel_topk,K,K,K,sel_topk,1,0,
-                (size_t)H*K,(size_t)sel_topk*K,(size_t)H*sel_topk);
-            gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
-                scb,q_dev+(size_t)row0*H*(Q+R)+Q,RcSel,H,sel_topk,R,Q+R,R,sel_topk,1,1,
-                (size_t)H*(Q+R),(size_t)sel_topk*R,(size_t)H*sel_topk);
+            if(f16){
+                gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
+                    scb,qabs,(const __half*)LcSel,H,sel_topk,K,K,K,sel_topk,1,0,
+                    (size_t)H*K,(size_t)sel_topk*K,(size_t)H*sel_topk);
+                gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
+                    scb,q_dev+(size_t)row0*H*(Q+R)+Q,(const __half*)RcSel,H,sel_topk,R,Q+R,R,sel_topk,1,1,
+                    (size_t)H*(Q+R),(size_t)sel_topk*R,(size_t)H*sel_topk);
+            }else{
+                gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
+                    scb,qabs,LcSel,H,sel_topk,K,K,K,sel_topk,1,0,
+                    (size_t)H*K,(size_t)sel_topk*K,(size_t)H*sel_topk);
+                gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
+                    scb,q_dev+(size_t)row0*H*(Q+R)+Q,RcSel,H,sel_topk,R,Q+R,R,sel_topk,1,1,
+                    (size_t)H*(Q+R),(size_t)sel_topk*R,(size_t)H*sel_topk);
+            }
             softmax_rows_flat<<<rn*H,256,0,st>>>(scb,sel_topk,scale);
             /* ctxL[r,h,:] = P[r,h,:] @ LcSel[r] */
-            gemm_f16_tc_zb<<<dim3((unsigned)((K+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
+            if(f16) gemm_f16_tc_zb<<<dim3((unsigned)((K+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
+                ctxL,scb,(const __half*)LcSel,H,K,sel_topk,sel_topk,K,K,0,0,
+                (size_t)H*sel_topk,(size_t)sel_topk*K,(size_t)H*K);
+            else gemm_f16_tc_zb<<<dim3((unsigned)((K+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
                 ctxL,scb,LcSel,H,K,sel_topk,sel_topk,K,K,0,0,
                 (size_t)H*sel_topk,(size_t)sel_topk*K,(size_t)H*K);
             /* ctx[r,h*V..] = ctxL[r,h,:] @ (Wv_h)^T */
@@ -2373,7 +2543,10 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
         }
         if(!tcg){
             size_t smem_sel=(size_t)(2*K+sel_topk+256)*sizeof(float);
-            attention_absorb_sel_rows_kernel<<<dim3((unsigned)H,(unsigned)S_b),256,smem_sel,st>>>(
+            if(f16) attention_absorb_sel_rows_kernel<<<dim3((unsigned)H,(unsigned)S_b),256,smem_sel,st>>>(
+                dc->ac+(size_t)sB0*H*V,q_dev+(size_t)sB0*H*(Q+R),hL,hR,
+                dsel,sel_topk,w->weights,wsc,w->fmt,H,Q,R,V,K,scale);
+            else attention_absorb_sel_rows_kernel<<<dim3((unsigned)H,(unsigned)S_b),256,smem_sel,st>>>(
                 dc->ac+(size_t)sB0*H*V,q_dev+(size_t)sB0*H*(Q+R),latent_dev,rope_dev,
                 dsel,sel_topk,w->weights,wsc,w->fmt,H,Q,R,V,K,scale);
         }

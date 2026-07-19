@@ -2528,6 +2528,14 @@ static void seldump(int layer,int pos,int nsel,const int *sel){
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
 #ifdef COLI_CUDA
+/* COLI_KV_F16: le ombre vivono nel formato del backend (fp16 di default) —
+ * i puntatori cuda_* sono OPACHI e ogni offset in elementi va scalato per
+ * kv_esz() o passato per gli helper _kv. */
+static size_t kv_esz(void){
+    static size_t e=0;
+    if(!e) e=coli_cuda_kv_f16()?2:4;
+    return e;
+}
 /* Ombra KV per-KVState sul device: righe [0,upto) valide sulla scheda di kv_b.
  * L'host resta canonico; ogni slot si riallinea indipendentemente e una
  * riscrittura accorcia solo l'ombra di quello slot. */
@@ -2538,8 +2546,8 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
         if(ks->cuda_Lc[layer]) coli_cuda_pipe_free(dev,ks->cuda_Lc[layer]);
         if(ks->cuda_Rc[layer]) coli_cuda_pipe_free(dev,ks->cuda_Rc[layer]);
         ks->cuda_Lc[layer]=NULL;ks->cuda_Rc[layer]=NULL;
-        float *Lc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*kvl*4);
-        float *Rc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*R*4);
+        float *Lc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*kvl*kv_esz());
+        float *Rc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*R*kv_esz());
         if(!Lc||!Rc){
             if(Lc) coli_cuda_pipe_free(dev,Lc);
             if(Rc) coli_cuda_pipe_free(dev,Rc);
@@ -2550,10 +2558,10 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
     }
     int v=ks->cuda_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,ks->cuda_Lc[layer]+(size_t)v*kvl,
-            coli_kv_row(ks->Lc[layer],v,kvl),(size_t)(upto-v)*kvl*4)||
-           !coli_cuda_pipe_upload(dev,ks->cuda_Rc[layer]+(size_t)v*R,
-            coli_kv_row(ks->Rc[layer],v,R),(size_t)(upto-v)*R*4)) return 0;
+        if(!coli_cuda_pipe_upload_kv(dev,ks->cuda_Lc[layer],
+            coli_kv_row(ks->Lc[layer],v,kvl),(size_t)(upto-v)*kvl,(size_t)v*kvl)||
+           !coli_cuda_pipe_upload_kv(dev,ks->cuda_Rc[layer],
+            coli_kv_row(ks->Rc[layer],v,R),(size_t)(upto-v)*R,(size_t)v*R)) return 0;
         ks->cuda_valid[layer]=upto;
     }
     return 1;
@@ -2565,15 +2573,15 @@ static int ic_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
     Cfg *c=&m->c; int hd=c->index_hd, dev=l->kv_b.cuda_device;
     if(!ks||!ks->Ic||!ks->Ic[layer]||upto>ks->max_t) return 0;
     if(!ks->cuda_Ic[layer]){
-        float *Ic=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*hd*4);
+        float *Ic=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*hd*kv_esz());
         if(!Ic) return 0;
         ks->cuda_Ic[layer]=Ic;
         ks->cuda_ic_valid[layer]=0;
     }
     int v=ks->cuda_ic_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,ks->cuda_Ic[layer]+(size_t)v*hd,
-            coli_kv_row(ks->Ic[layer],v,hd),(size_t)(upto-v)*hd*4)) return 0;
+        if(!coli_cuda_pipe_upload_kv(dev,ks->cuda_Ic[layer],
+            coli_kv_row(ks->Ic[layer],v,hd),(size_t)(upto-v)*hd,(size_t)v*hd)) return 0;
         ks->cuda_ic_valid[layer]=upto;
     }
     return 1;
@@ -2717,7 +2725,8 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if(T<S||T>131072) return 0;   /* tetto di memoria (scratch T*kvl), non di smem */
     double t0=now_s();
     size_t xb=(size_t)S*D*4, qrb=(size_t)S*ql*4, qb=(size_t)S*H*qh*4;
-    size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*4, rb=(size_t)T*R*4;
+    /* gli scratch Lc/Rc di ripiego vivono nel formato ombra (kv_esz) */
+    size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*kv_esz(), rb=(size_t)T*R*kv_esz();
     float *chost=NULL; int ok=0;
     /* scratch persistenti (slot fissi per device): zero churn di cudaMalloc */
     float *xd =x_is_dev?(float*)x:coli_cuda_pipe_scratch(dev,0,xb);
@@ -2747,13 +2756,14 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
      * re-upload only as fallback.  Re-streaming the whole prefix every call cost
      * O(context) PCIe traffic per layer per token. */
     { int dev_kv = g_cuda_pipe && layer<c->n_layers && kv_dev_sync(m,l,m->kv,layer,pos_base);
-      if(dev_kv){ ld_=m->kv->cuda_Lc[layer]+(size_t)st0*kvl; rd=m->kv->cuda_Rc[layer]+(size_t)st0*R; }
+      if(dev_kv){ ld_=(float*)((char*)m->kv->cuda_Lc[layer]+(size_t)st0*kvl*kv_esz());
+                  rd =(float*)((char*)m->kv->cuda_Rc[layer]+(size_t)st0*R*kv_esz()); }
       else if(old>0){
-        if(!coli_cuda_pipe_upload(dev,ld_,coli_kv_row(m->Lc[layer],st0,kvl),(size_t)old*kvl*4)||
-           !coli_cuda_pipe_upload(dev,rd,coli_kv_row(m->Rc[layer],st0,R),(size_t)old*R*4)) goto done;
+        if(!coli_cuda_pipe_upload_kv(dev,ld_,coli_kv_row(m->Lc[layer],st0,kvl),(size_t)old*kvl,0)||
+           !coli_cuda_pipe_upload_kv(dev,rd,coli_kv_row(m->Rc[layer],st0,R),(size_t)old*R,0)) goto done;
       }
-      if(!coli_cuda_pipe_copy2d(dev,ld_+(size_t)old*kvl,kvl,cd,kvl+R,kvl,S)) goto done;
-      if(!coli_cuda_pipe_copy2d(dev,rd+(size_t)old*R,R,cd+kvl,kvl+R,R,S)) goto done;
+      if(!coli_cuda_pipe_copy2d_kv(dev,ld_,kvl,cd,kvl+R,kvl,S,(size_t)old*kvl)) goto done;
+      if(!coli_cuda_pipe_copy2d_kv(dev,rd,R,cd+kvl,kvl+R,R,S,(size_t)old*R)) goto done;
       /* KV host resta canonica: scarica i record nuovi (gia' normati+ropati) */
       if(!coli_cuda_pipe_download(dev,cd,chost,cb)) goto done;
       for(int s=0;s<S;s++){
@@ -2792,11 +2802,11 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
                 if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
                 d_ic=m->kv->cuda_Ic[layer];
             }else{
-                size_t icb=(size_t)(pos_base+S)*c->index_hd*4;
+                size_t icb=(size_t)(pos_base+S)*c->index_hd*kv_esz();
                 d_ic=coli_cuda_pipe_scratch(dev,22,icb);
                 if(!d_ic) goto sel_fail;
-                if(pos_base>0&&!coli_cuda_pipe_upload(dev,d_ic,m->Ic[layer],
-                    (size_t)pos_base*c->index_hd*4)) goto sel_fail;
+                if(pos_base>0&&!coli_cuda_pipe_upload_kv(dev,d_ic,m->Ic[layer],
+                    (size_t)pos_base*c->index_hd,0)) goto sel_fail;
             }
             static float *pisc=NULL; static size_t pisc_cap=0;
             size_t need=(size_t)(S-sB0)*(pos_base+S);
@@ -2853,15 +2863,15 @@ sel_fail:
                 float *st=stage+(size_t)d2*(stage_one/4);
                 size_t qsb=(size_t)S*hn*qh*4, csb=(size_t)S*hn*vh*4;
                 float *qs_r=coli_cuda_pipe_scratch(sdev,18,qsb);
-                float *ld_r=coli_cuda_pipe_scratch(sdev,19,(size_t)T*kvl*4);
-                float *rr_r=coli_cuda_pipe_scratch(sdev,20,(size_t)T*R*4);
+                float *ld_r=coli_cuda_pipe_scratch(sdev,19,(size_t)T*kvl*kv_esz());
+                float *rr_r=coli_cuda_pipe_scratch(sdev,20,(size_t)T*R*kv_esz());
                 float *cx_r=coli_cuda_pipe_scratch(sdev,21,csb);
                 int okd=qs_r&&ld_r&&rr_r&&cx_r;
                 /* slice di q: [S,H,qh] -> [S,hn,qh] contigua sul device di casa */
                 okd=okd&&coli_cuda_pipe_copy2d(dev,st,hn*qh,qd+(size_t)h0*qh,H*qh,hn*qh,S);
                 okd=okd&&coli_cuda_pipe_peer_copy(sdev,qs_r,dev,st,qsb);
-                okd=okd&&coli_cuda_pipe_peer_copy(sdev,ld_r,dev,ld_,(size_t)T*kvl*4);
-                okd=okd&&coli_cuda_pipe_peer_copy(sdev,rr_r,dev,rd,(size_t)T*R*4);
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,ld_r,dev,ld_,(size_t)T*kvl*kv_esz());
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,rr_r,dev,rd,(size_t)T*R*kv_esz());
                 okd=okd&&coli_cuda_attention_absorb_batch_dev(l->kv_b_shard[d2],cx_r,qs_r,ld_r,rr_r,
                         S,hn,c->qk_nope,R,vh,kvl,T,c->attn_scale);
                 okd=okd&&coli_cuda_pipe_peer_copy(dev,st,sdev,cx_r,csb);
@@ -3192,8 +3202,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 cuda_core=0;
                 if(g_cuda_pipe&&!kvs&&layer<c->n_layers&&kv_dev_sync(m,l,ks,layer,pos+1))
                     cuda_core=coli_cuda_attention_absorb_kvdev(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
-                        Q+(int64_t)s*H*qh,ks->cuda_Lc[layer]+(size_t)st0*kvl,
-                        ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
+                        Q+(int64_t)s*H*qh,
+                        (float*)((char*)ks->cuda_Lc[layer]+(size_t)st0*kvl*kv_esz()),
+                        (float*)((char*)ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope*kv_esz()),
+                        H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
                 if(!cuda_core)
                     cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
