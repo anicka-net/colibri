@@ -99,10 +99,9 @@ static void fill_plateau(float *isc, int nk){     /* tie blocks -> boundary path
  * can spike a single nk row (an observed ~75x at nk=8192 on a 9950X3D that was really a
  * ~13-40x algorithm). Two bugs compounded it: (1) the old bench drew ONE input per cell;
  * (2) brng was never reset, so each cell's input depended on every prior cell's draws --
- * reordering nks[] silently shifted all later inputs. Both fixed here: brng is reseeded
- * per (shape, nk, seed), and we take the MEDIAN of N_SEEDS independent inputs, each itself
- * a median over N_REPEAT timing reps. A lucky pivot now moves one of the N_SEEDS samples,
- * not the reported number. */
+ * reordering nks[] silently shifted all later inputs. Both fixed here: randomized shapes
+ * are reseeded per (shape, nk, seed), and report the MEDIAN of N_SEEDS independent inputs,
+ * each itself a median over N_REPEAT timing reps. Plateau remains one fixed tie-stress input. */
 
 int main(void){
     int keep = 2048;   /* GLM-5.2 index_topk */
@@ -113,22 +112,21 @@ int main(void){
     double *old_seeds = malloc((size_t)N_SEEDS*sizeof(double));
     double *new_seeds = malloc((size_t)N_SEEDS*sizeof(double));
 
-    struct { const char *name; void (*fill)(float*,int); } shapes[] = {
-        { "realistic", fill_realistic },
-        { "uniform",   fill_uniform   },
-        { "plateau",   fill_plateau   },
+    struct { const char *name; void (*fill)(float*,int); int seeded; } shapes[] = {
+        { "realistic", fill_realistic, 1 },
+        { "uniform",   fill_uniform,   1 },
+        { "plateau",   fill_plateau,   0 },
     };
 
-    printf("bench_dsa_select: DSA top-keep, old (qsort) vs new (partial-select)  keep=%d  (median of %d seeds x %d reps)\n",
+    printf("bench_dsa_select: DSA top-keep, old (qsort) vs new (partial-select)  keep=%d  (up to %d seeds x %d reps)\n",
            keep, N_SEEDS, N_REPEAT);
     printf("%-12s %7s %14s %14s %9s\n", "shape", "nk", "old ns/call", "new ns/call", "speedup");
     printf("------------------------------------------------------------------------\n");
 
     for(size_t sh=0; sh<sizeof(shapes)/sizeof(shapes[0]); sh++){
         for(size_t ni=0; ni<sizeof(nks)/sizeof(nks[0]); ni++){
-            int nk=nks[ni];
-            int bad = 0;
-            for(int sd=0; sd<N_SEEDS; sd++){
+            int nk=nks[ni], seeds=shapes[sh].seeded?N_SEEDS:1, valid=0;
+            for(int sd=0; sd<seeds; sd++){
                 /* reseed per (shape,nk,seed) so each cell's input is reproducible and
                  * independent of cell ordering, and so lucky pivots are sampled, not fixed. */
                 brng_seed(0xA5A5A5A5u + (uint32_t)(sd*0x9E3779B9u));
@@ -139,20 +137,21 @@ int main(void){
                  * job, but a count divergence here would make the timing meaningless) */
                 keep_old(isc,nk,keep,dst,&nd); int na=nd;
                 keep_new(isc,nk,keep,dst,&nd); int nb=nd;
-                if(na!=keep || nb!=keep){ bad++; continue; }
-                old_seeds[sd] = bench_ns(keep_old,isc,nk,keep);
-                new_seeds[sd] = bench_ns(keep_new,isc,nk,keep);
+                if(na!=keep || nb!=keep) continue;
+                old_seeds[valid] = bench_ns(keep_old,isc,nk,keep);
+                new_seeds[valid] = bench_ns(keep_new,isc,nk,keep);
+                valid++;
             }
-            if(bad == N_SEEDS){
-                printf("%-12s %7d   (BAD COUNTS on all %d seeds, skipped)\n",
-                       shapes[sh].name, nk, bad);
+            if(!valid){
+                printf("%-12s %7d   (BAD COUNTS on all %d inputs, skipped)\n",
+                       shapes[sh].name, nk, seeds);
                 continue;
             }
             /* report median-of-seed-medians: robust to a single lucky/unlucky pivot */
-            dsort(old_seeds, N_SEEDS);
-            dsort(new_seeds, N_SEEDS);
-            double t_old = old_seeds[N_SEEDS/2];
-            double t_new = new_seeds[N_SEEDS/2];
+            dsort(old_seeds, valid);
+            dsort(new_seeds, valid);
+            double t_old = old_seeds[valid/2];
+            double t_new = new_seeds[valid/2];
             printf("%-12s %7d %14.0f %14.0f %8.2fx\n",
                    shapes[sh].name, nk, t_old, t_new, t_old/t_new);
         }
