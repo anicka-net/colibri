@@ -78,6 +78,15 @@ Format: `VAR` — default — effect.
 
 ---
 
+## Dual-SSD streaming
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_MODEL_MIRROR` | unset | Path to a second, byte-identical (read-only) copy of the model on another drive; expert reads are split across both. Partial mirrors work (only the shards present are used). |
+| `COLI_DISK_WEIGHTS` | unset (startup bandwidth probe) | Split ratio `<primary>,<mirror>` (e.g. `1,1` for 50/50, `9,3` for a fast+slow pair). Unset = probe both drives with the engine's own access pattern at startup. |
+
+Per-drive byte counts are reported in a `MIRROR:` stats line. Combine with `DIRECT=1` so the two copies never compete for page cache.
+
 ## CUDA (NVIDIA)
 
 | Variable | Default | Effect |
