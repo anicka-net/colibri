@@ -511,18 +511,25 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->qx) cudaFree(ctx->qx);
         if (ctx->qscale) cudaFree(ctx->qscale);
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
+        if(ctx->pf_q)cudaFree(ctx->pf_q);if(ctx->pf_c)cudaFree(ctx->pf_c);if(ctx->pf_s)cudaFree(ctx->pf_s);
+        if(ctx->accum)cudaFree(ctx->accum);if(ctx->wrow_d)cudaFree(ctx->wrow_d);
         for(int b=0;b<32;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
+        if (ctx->group_ev_init) cudaEventDestroy(ctx->group_ev);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
         ctx->x = ctx->y = ctx->gate = ctx->up = nullptr;
         ctx->qx=nullptr; ctx->qscale=nullptr;
         ctx->aq=ctx->al=ctx->ar=ctx->ac=nullptr;
+        ctx->pf_q=ctx->pf_c=ctx->pf_s=nullptr;
+        ctx->accum=ctx->wrow_d=nullptr;
         ctx->host_x=ctx->host_y=nullptr;ctx->stream=nullptr;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
+        ctx->pf_q_cap=ctx->pf_c_cap=ctx->pf_s_cap=0;
+        ctx->accum_cap=ctx->wrow_cap=0;ctx->group_ev=nullptr;ctx->group_ev_init=ctx->accum_pending=0;
         ctx->host_x_cap=ctx->host_y_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
     }
