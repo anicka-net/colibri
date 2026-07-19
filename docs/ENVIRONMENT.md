@@ -59,6 +59,7 @@ Format: `VAR` — default — effect.
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
 | `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
 | `PILOT_TWO` | `0` (off) | Two-step shared-expert-corrected router prediction for the pilot. |
+| `PILOT_BIAS` | unset | Binary per-layer additive correction for stale-router scores (`BIAS` v1 header followed by `layers * experts` little-endian float32 values). Implies `PILOT=1`; requires `PILOT_TWO=0`. |
 | `COUPLE` | unset | Path to a coupling-score file driving cross-layer expert prefetch (#176). When set, `couple_load` reads it. |
 | `COUPLE_K` | `8` | Top-K coupled experts per layer when `COUPLE` is set. |
 | `COUPLE_D` | `1` | Coupling lookahead depth (`1` or `2`) when `COUPLE` is set. |

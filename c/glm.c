@@ -1283,6 +1283,7 @@ static int g_pilot_real=0;/* PILOT_REAL=1: il pilota fa LOAD VERI cross-layer de
 static int g_pilot_two=0; /* PILOT_TWO=1: two-step prefetch — before running L+1's router,
                           * approximate MoE(L) using only the shared expert (resident, no disk)
                           * and add it to the state. Trades 3 small matmuls for +2.3% recall. */
+static float *g_pilot_bias=NULL; /* PILOT_BIAS=file: per-layer additive calibration of stale router scores */
 /* Handshake main<->pilota per il load-vero cross-layer. Invariante di sicurezza in DUE parti:
  *  1) Percorso MATMUL (moe): il pilota scrive SOLO ecache[layer] con layer > g_cur_moe_layer;
  *     il matmul in moe() legge SOLO ecache[layer]==g_cur_moe_layer, e la barriera a inizio moe()
@@ -4207,6 +4208,35 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
         }
     }
 }
+static int read_le32(FILE *f,uint32_t *v){
+    unsigned char b[4];
+    if(fread(b,1,4,f)!=4) return 0;
+    *v=(uint32_t)b[0]|(uint32_t)b[1]<<8|(uint32_t)b[2]<<16|(uint32_t)b[3]<<24;
+    return 1;
+}
+static void pilot_bias_load(Model *m,const char *path){
+    FILE *f=fopen(path,"rb");
+    if(!f){ fprintf(stderr,"[PILOT_BIAS] cannot open %s\n",path); exit(2); }
+    uint32_t h[4];
+    if(!read_le32(f,&h[0])||!read_le32(f,&h[1])||!read_le32(f,&h[2])||!read_le32(f,&h[3])||
+       h[0]!=0x53414942u || h[1]!=1 ||
+       h[2]!=(uint32_t)m->c.n_experts || h[3]!=(uint32_t)m->c.n_layers){
+        fprintf(stderr,"[PILOT_BIAS] %s: expected BIAS v1 for %d experts, %d layers\n",
+                path,m->c.n_experts,m->c.n_layers);
+        fclose(f); exit(2);
+    }
+    size_t n=(size_t)m->c.n_layers*m->c.n_experts;
+    g_pilot_bias=malloc(n*sizeof(float));
+    if(!g_pilot_bias){ fprintf(stderr,"OOM pilot bias\n"); fclose(f); exit(1); }
+    int ok=1;
+    for(size_t i=0;i<n;i++){ uint32_t u; if(!read_le32(f,&u)){ok=0;break;} memcpy(&g_pilot_bias[i],&u,4); }
+    if(!ok || fgetc(f)!=EOF){
+        fprintf(stderr,"[PILOT_BIAS] %s: truncated or trailing data\n",path);
+        fclose(f); exit(2);
+    }
+    fclose(f);
+    fprintf(stderr,"[PILOT_BIAS] loaded %s (%zu floats)\n",path,n);
+}
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
     int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
@@ -4240,6 +4270,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
         }
         matmul(ch, nrm, l->router, 1, D, E);
         for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        if(g_pilot_bias) for(int e=0;e<E;e++) ch[e]+=g_pilot_bias[(size_t)lnext*E+e];
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
@@ -7304,6 +7335,10 @@ int main(int argc, char **argv){
     if(g_pilot_real) g_pilot=1;                           /* PILOT_REAL implica il pilota attivo */
     g_pilot_two = getenv("PILOT_TWO")?atoi(getenv("PILOT_TWO")):0; /* 1 = two-step: shared-expert-corrected router prediction (+2.3% recall, 3 extra matmuls) */
     if(g_pilot_two) g_pilot=1;                            /* PILOT_TWO implies PILOT active */
+    if(getenv("PILOT_BIAS")&&*getenv("PILOT_BIAS")){
+        if(g_pilot_two){ fprintf(stderr,"PILOT_BIAS requires PILOT_TWO=0 (calibration is for stale scores)\n"); return 2; }
+        g_pilot=1;
+    }
     /* Default K: hint-only PILOT keeps 8 (WILLNEED hints are free, no eviction).
      * Under PILOT_REAL the speculative loads are REAL and create LRU eviction
      * pressure, so at ~28% mispredict a large K thrashes the cache — default to 6
@@ -7425,6 +7460,7 @@ int main(int argc, char **argv){
     printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    if(getenv("PILOT_BIAS")&&*getenv("PILOT_BIAS")) pilot_bias_load(&m,getenv("PILOT_BIAS"));
     if(g_draft<0){
 #ifdef COLI_CUDA
         /* MTP is disabled under CUDA by default: cold (streaming) experts still
