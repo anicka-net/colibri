@@ -3,9 +3,12 @@
  * Build (next to a CUDA=1 build of the engine, for backend_cuda.o):
  *   gcc -O2 -I../c -o pfg_test pfg_test.c ../c/backend_cuda.o \
  *       -lm -L/usr/local/cuda/lib64 -lcudart -lstdc++
- * Usage: ./pfg_test S T [zero_rope] [zero_nope] [magnitude]
+ * Usage: ./pfg_test S T [zero_rope] [zero_nope] [magnitude] [sel_topk]
  * Prints per-row max rel error vs the fp32 absorb kernel; expect ~1e-3
- * (fp16 input rounding), flags rows >5e-2.  */
+ * (fp16 input rounding), flags rows >5e-2.
+ * With sel_topk>0: DSA phase-B A/B instead — rows [S/2,S) get a random
+ * selection list and the scalar sel-absorb (COLI_DSA_TCGATHER=0) is the
+ * reference against the TC gather path (=1), same inputs, same lists. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,10 +54,33 @@ int main(int argc,char**argv){
     coli_cuda_pipe_upload(dev,ld,lh,ln*4);
     coli_cuda_pipe_upload(dev,rd,rh,rn*4);
     float scale=1.0f/sqrtf((float)(Q+R));
+    int sel_topk=argc>6?atoi(argv[6]):0, sB0=S/2;
+    int *sel=NULL;
+    if(sel_topk>0){
+        if(sel_topk>T){ fprintf(stderr,"sel_topk>T\n"); return 1; }
+        /* la funzione legge sel_host+sB0*topk: il buffer copre TUTTE le S
+         * righe (come m->dsa_sel nel modello), non solo quelle di fase B */
+        sel=malloc((size_t)S*sel_topk*sizeof(int));
+        for(int s=sB0;s<S;s++)for(int j=0;j<sel_topk;j++){
+            /* posizioni ~uniche in [0,T): passo fisso + jitter deterministico */
+            long p=((long)j*T)/sel_topk+(int)(frand()*((float)T/sel_topk));
+            if(p<0)p=0; if(p>=T)p=T-1; sel[(size_t)s*sel_topk+j]=(int)p;
+        }
+        fprintf(stderr,"sel A/B: scalar...\n");
+        setenv("COLI_DSA_TCGATHER","0",1);
+        if(!coli_cuda_prefill_attn_gemm(kvt,ot,o1,qd,ld,rd,S,H,Q,R,V,K,T,scale,sel,sB0,sel_topk)){
+            fprintf(stderr,"scalar sel path failed\n"); return 1; }
+        fprintf(stderr,"sel A/B: tc gather...\n");
+        setenv("COLI_DSA_TCGATHER","1",1);
+        if(!coli_cuda_prefill_attn_gemm(kvt,ot,o2,qd,ld,rd,S,H,Q,R,V,K,T,scale,sel,sB0,sel_topk)){
+            fprintf(stderr,"tc gather sel path failed\n"); return 1; }
+        fprintf(stderr,"sel A/B: done\n");
+    } else {
     if(!coli_cuda_attention_project_batch_dev_out(kvt,ot,o1,qd,ld,rd,S,H,Q,R,V,K,T,scale)){
         fprintf(stderr,"reference path failed\n"); return 1; }
     if(!coli_cuda_prefill_attn_gemm(kvt,ot,o2,qd,ld,rd,S,H,Q,R,V,K,T,scale,NULL,0,0)){
         fprintf(stderr,"gemm path failed\n"); return 1; }
+    }
     float *h1=malloc((size_t)S*O*4), *h2=malloc((size_t)S*O*4);
     coli_cuda_pipe_download(dev,o1,h1,(size_t)S*O*4);
     coli_cuda_pipe_download(dev,o2,h2,(size_t)S*O*4);

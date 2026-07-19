@@ -17,7 +17,7 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context) — decode WINS past ~4k (+20% @6.7k); open: prefill sel-absorb TC gather, then T>8192 cap lift
+### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN @6.7k (prefill -4.6%, decode +20%); open: T>8192 cap lift, index_topk_freq
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
 (`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
@@ -365,6 +365,36 @@ the deployed path.  Revisit only with a measured concurrent/ragged workload.
 Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
+
+#### DSA phase 2, increment 4 — prefill sel-absorb TC gather (landed)
+Phase-B rows now gather their selected Lc/Rc rows into contiguous buffers
+(`dsa_gather_sel`, one block per (row,key), amortized across all 64 heads —
+the scalar kernel re-read the scattered latent per head) and absorb via
+z-batched fp16 TC GEMMs with heads as the M dimension: per chunk of 32 rows,
+scores[H,topk] = qabs @ LcSel^T + q_rope @ RcSel^T (`gemm_f16_tc_zb`), flat
+softmax, ctxL = P @ LcSel, with the per-head int4 projections as
+block-diagonal wmma variants (`w4a16_nn_scaled_bd`/`w4a16_nt_bd`,
+blockIdx.z=head).  Scratch slots 32-36 (table widened to 40); no new
+exports, so no Windows loader entries.  `COLI_DSA_TCGATHER=0` keeps the
+scalar kernel.  MEASURED: 2.7k prefill 70.1 -> **51.7 s** (attention 29.6 ->
+11.0); 6.7k prefill 523.2 -> **392.2 s** vs dense 411.1 — DSA at 6.7k is now
+a strict win (prefill -4.6%, decode +20%, fb 0), attention core 164.5 ->
+32.8 s (5x).  VALIDATION: pfg_test grew a sel-path A/B (scalar sel-absorb as
+reference, same inputs, same lists): worst per-row rel err 2.8e-3 @topk=128
+/ 2.6e-3 @topk=2048 (mag 1x), 6.3e-2 @mag 30x — the same fp16-rounding class
+as the landed prefill GEMM.  In-model 16-token greedy continuation
+bit-identical to the scalar path at 2.7k.
+WAR STORY (cost: one wedged H100 + a tekton reboot): the first harness
+version under-allocated the sel buffer — `coli_cuda_prefill_attn_gemm`
+reads `sel_host+sB0*topk`, i.e. the array covers ALL S rows like
+`m->dsa_sel`, not just phase-B rows.  The host OOB shipped garbage indices
+to the GPU; wild latent reads wedged the kernel unrecoverably (unkillable
+R-state process, nvidia-smi hung, no watchdog on datacenter GPUs).
+`dsa_gather_sel` now clamps indices to [0,T) — a corrupt selection can
+produce wrong output but never touch wild VA.  Post-reboot, CUDA refused to
+init (error 3, zero diagnostics anywhere) until `nvidia_uvm` was reloaded
+with `uvm_disable_hmm=1` — tekton's modprobe.d had that option for a
+reason (open-gpu-kernel-modules #780/#797).
 
 #### DSA phase 2 — 6.7k benchmark + DRAFT=1 composition (measured 2026-07-19)
 Four runs on tekton, 6711-token prompt (2701 for the short DRAFT point),
