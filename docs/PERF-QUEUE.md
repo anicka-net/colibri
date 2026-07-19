@@ -253,6 +253,16 @@ predictions are evicted before demand reaches them.  The existing stale-state
 pilot budget is already at its measured knee: PILOT_K 2/4/6 gives
 1.21/1.29/1.37 tok/s.  Keep `PILOT_K=6` and coupling off for this profile.
 
+Prediction accuracy still has a large theoretical prize.  At equal K6 budget,
+offline exact-next-layer replay raises cap-17 demand hit rate 65.6% -> 84.5%,
+while coupling reaches only 68.2%.  Live LOOKA telemetry explains the gap:
+stale L+1 pilot recall is 69.7%, shared-expert two-step is 73.2%, and the
+same-layer pre-attention predictor reaches 78.0%.  Timing dominates, however:
+replacing the early pilot with same-layer K6 gives 1.33 tok/s, and combining
+early K4 with late K2 gives 1.22 tok/s.  Both lose to early K6 at 1.37 tok/s.
+Any next predictor must improve accuracy while retaining a full-layer I/O
+horizon; late correction alone cannot hide the NVMe read.
+
 ## Measured dead ends (do not revisit without new evidence)
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
 - `COLI_NUMA=1` weight interleave on decode: neutral (GPU-bound).
