@@ -404,6 +404,30 @@ Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
 
+#### Increment 8 — device-side top-k for prefill selection (landed, default ON)
+`COLI_DSA_DEVTOPK=1` (default; `=0` restores the host top-k) moves the
+prefill selection top-k onto the device: `dsa_topk_rows` (one block per
+query row) finds the exact keep-th-largest threshold with a 4-pass byte
+radix select on a monotonic fp32 key, then emits indices with a stable
+block-scan compaction — strictly-greater in position order, ties in
+position order until keep — i.e. the host `partial_select` semantics
+BIT-EXACTLY.  Scoring is chunked (512 rows), so the S_b×T score matrix
+never exists anywhere: not as the device scratch (which stops allocating
+past ~64k), not as the host staging buffer (611 MB at 13.4k, 67 GB at
+131k — the silent CPU-fallback trigger), and not as the S_b×T×21-layer
+PCIe download (260 GB at 256k).  Only the selection itself moves
+(S_b×topk ints, independent of T).  nsel is host-computed (min(nk,topk)).
+Scratch slot 40 (table widened to 44); no new exports.
+MEASURED at 13.4k (frozen usage): greedy output TOKEN-IDENTICAL to the
+host path (same device scores -> same selection), prefill 780.1 vs
+780.7 s (parity — the downloads were already overlapped at this T), RSS
+−0.6 GB (the host score buffer), fb 0.  The payoff is that 64k-256k
+prefill selection now runs on GPU at all.
+Follow-up (deferred): keep the selection device-resident across the
+FULL->SHARED layers of one batch to skip the per-layer re-upload
+(needs per-device stamping + a lazy host download for mixed CPU
+fallbacks; the upload is topk-bounded, so it can wait).
+
 #### Increment 7 — fp16 KV/Ic device shadows (landed, default ON)
 `COLI_KV_F16=1` (default; `=0` restores fp32) stores the device KV shadows
 (`cuda_Lc`/`cuda_Rc`) and the DSA indexer shadow (`cuda_Ic`) as `__half`:

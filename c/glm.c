@@ -2652,6 +2652,14 @@ static int dsa_chain_on(void){
     if(g_dsa_chain<0){ const char *e=getenv("COLI_DSA_CHAIN"); g_dsa_chain=e?atoi(e):1; }
     return g_dsa_chain;
 }
+/* COLI_DSA_DEVTOPK (default 1): top-k della selezione di PREFILL sul device
+ * (bit-identico all'host, vedi dsa_topk_rows nel backend) — niente download
+ * S_b*T dei punteggi ne' buffer host gigante.  =0 ripristina il top-k host. */
+static int dsa_devtopk_on(void){
+    static int v=-1;
+    if(v<0){ const char *e=getenv("COLI_DSA_DEVTOPK"); v=e?(atoi(e)!=0):1; }
+    return v;
+}
 /* COLI_DSA_REFRESH=N (default 1): in decode i layer FULL ricalcolano la selezione
  * solo ogni N token; nei token intermedi riusano l'ultima selezione del layer,
  * estesa con la coda delle posizioni nuove (mai perdere i token più recenti).
@@ -2808,23 +2816,39 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
                 if(pos_base>0&&!coli_cuda_pipe_upload_kv(dev,d_ic,m->Ic[layer],
                     (size_t)pos_base*c->index_hd,0)) goto sel_fail;
             }
-            static float *pisc=NULL; static size_t pisc_cap=0;
-            size_t need=(size_t)(S-sB0)*(pos_base+S);
-            if(need>pisc_cap){
-                float *p=realloc(pisc,need*sizeof(float));
-                if(!p) goto sel_fail;
-                pisc=p; pisc_cap=need;
-            }
             ColiCudaDsaChain dsac; memset(&dsac,0,sizeof dsac);
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
             dsac.knw_dev=knw; dsac.knb_dev=knb; dsac.d_Ic=d_ic;
             dsac.nh=c->index_nh; dsac.hd=c->index_hd;
             dsac.ic_host=m->Ic[layer]+(int64_t)pos_base*c->index_hd;
-            dsac.iscore_host=pisc;
-            if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
-                goto sel_fail;
+            if(dsa_devtopk_on()){
+                /* selezione sul device: sel/nsel arrivano gia' pronti */
+                int dtopk=c->index_topk;
+                if((int64_t)S*dtopk > m->dsa_scap){
+                    free(m->dsa_sel); free(m->dsa_nsel);
+                    m->dsa_scap=(int64_t)S*dtopk;
+                    m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+                    m->dsa_nsel=malloc((size_t)S*sizeof(int));
+                    if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; goto sel_fail; }
+                }
+                dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel; dsac.topk=dtopk;
+                if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
+                    goto sel_fail;
+                for(int s2=0;s2<sB0;s2++) m->dsa_nsel[s2]=0;
+            }else{
+                static float *pisc=NULL; static size_t pisc_cap=0;
+                size_t need=(size_t)(S-sB0)*(pos_base+S);
+                if(need>pisc_cap){
+                    float *p=realloc(pisc,need*sizeof(float));
+                    if(!p) goto sel_fail;
+                    pisc=p; pisc_cap=need;
+                }
+                dsac.iscore_host=pisc;
+                if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
+                    goto sel_fail;
+                if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
+            }
             if(g_cuda_pipe) m->kv->cuda_ic_valid[layer]=pos_base+S;
-            if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
             if(g_dsc_on) g_dsc_pfull++;
         }else{
             if(!m->dsa_nsel) goto sel_fail;

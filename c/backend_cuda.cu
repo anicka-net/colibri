@@ -37,7 +37,7 @@ typedef struct {
     int smem_optin;                             /* smem opt-in per l'absorb a T lunghi */
     int absorb_attr_set, ragged_attr_set;       /* attributo gia' alzato per kernel */
     int absorb_attr_set_h;                      /* idem, istanza __half (COLI_KV_F16) */
-    float *pipe_buf[40]; size_t pipe_cap[40];   /* scratch persistenti del resident pipeline */
+    float *pipe_buf[44]; size_t pipe_cap[44];   /* scratch persistenti del resident pipeline */
     float *accum; size_t accum_cap;             /* device-side routed-expert accumulate */
     float *wrow_d; size_t wrow_cap;
     cudaEvent_t group_ev; int group_ev_init, accum_pending;
@@ -551,7 +551,7 @@ extern "C" void coli_cuda_shutdown(void) {
         if(ctx->aq)cudaFree(ctx->aq);if(ctx->al)cudaFree(ctx->al);if(ctx->ar)cudaFree(ctx->ar);if(ctx->ac)cudaFree(ctx->ac);
         if(ctx->pf_q)cudaFree(ctx->pf_q);if(ctx->pf_c)cudaFree(ctx->pf_c);if(ctx->pf_s)cudaFree(ctx->pf_s);
         if(ctx->accum)cudaFree(ctx->accum);if(ctx->wrow_d)cudaFree(ctx->wrow_d);
-        for(int b=0;b<40;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
+        for(int b=0;b<44;b++) if(ctx->pipe_buf[b]) cudaFree(ctx->pipe_buf[b]);
         if (ctx->host_x) cudaFreeHost(ctx->host_x);
         if (ctx->host_y) cudaFreeHost(ctx->host_y);
         if (ctx->group_ev_init) cudaEventDestroy(ctx->group_ev);
@@ -1238,7 +1238,7 @@ __global__ static void pipe_rows_add(float *x,const float *partial,const int *ro
  * per layer (78 x ~10 alloc/richiesta erano puro churn). */
 extern "C" float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes){
     DeviceContext *ctx=find_ctx(device);
-    if(slot<0||slot>=40||!select_ctx(ctx)) return NULL;
+    if(slot<0||slot>=44||!select_ctx(ctx)) return NULL;
     if(!reserve(&ctx->pipe_buf[slot],&ctx->pipe_cap[slot],bytes)) return NULL;
     return ctx->pipe_buf[slot];
 }
@@ -1505,6 +1505,75 @@ __global__ static void layernorm_kernel(float *xrows, const float *__restrict__ 
  * One query row per blockIdx.y (row y has nk0+y causal keys), qi [nh,hd]
  * (roped) and w32 [nh] of that row in smem, one thread per token.  The
  * decode chain uses grid.y==1 with nk0 = the single row's key count. */
+/* Top-k ESATTO per riga sui punteggi DSA, stessa semantica del top-k host
+ * (partial_select threshold; poi scan in ordine di POSIZIONE: > prima, == dopo
+ * fino a keep).  Radix select a 4 passate sui byte della chiave fp32 monotona,
+ * poi compattazione stabile.  Un blocco per riga (blockIdx.x), 256 thread;
+ * la riga y ha nk0+y chiavi causali.  sel righe a stride topk.
+ * Nota: ±0.0 hanno chiavi diverse ma confronto float uguale — con punteggi
+ * ReLU-sommati un -0.0 non si presenta; nel caso, cambierebbe solo l'ordine
+ * interno di un pareggio a punteggio nullo. */
+__device__ static inline unsigned dsa_key(float x){
+    unsigned u=__float_as_uint(x);
+    return (u&0x80000000u)?~u:(u|0x80000000u);   /* mappa monotona crescente */
+}
+__global__ static void dsa_topk_rows(int *__restrict__ sel,
+        const float *__restrict__ scores,int Tstride,int nk0,int topk){
+    int y=blockIdx.x, tid=threadIdx.x, nk=nk0+y;
+    int keep=nk<topk?nk:topk;
+    const float *row=scores+(size_t)y*Tstride;
+    int *out=sel+(size_t)y*topk;
+    __shared__ int hist[256], scan[256];
+    __shared__ unsigned s_prefix; __shared__ int s_rem,s_g;
+    if(!tid){ s_prefix=0; s_rem=keep; s_g=0; }
+    __syncthreads();
+    for(int p=3;p>=0;p--){
+        int shift=8*p;
+        unsigned prefix=s_prefix;
+        for(int i=tid;i<256;i+=blockDim.x) hist[i]=0;
+        __syncthreads();
+        for(int t=tid;t<nk;t+=blockDim.x){
+            unsigned k=dsa_key(row[t]);
+            if(p==3||(k>>(shift+8))==prefix)
+                atomicAdd(&hist[(k>>shift)&255],1);
+        }
+        __syncthreads();
+        if(!tid){
+            int cum=0,rem=s_rem;
+            for(int b=255;b>=0;b--){
+                if(cum+hist[b]>=rem){ s_prefix=(prefix<<8)|(unsigned)b;
+                    s_g+=cum; s_rem=rem-cum; break; }
+                cum+=hist[b];
+            }
+        }
+        __syncthreads();
+    }
+    unsigned thr=s_prefix;
+    int g=s_g;                 /* count(key>thr); i pareggi da prendere: s_rem */
+    int e=s_rem;
+    __shared__ int s_goff,s_eoff;
+    if(!tid){ s_goff=0; s_eoff=0; }
+    __syncthreads();
+    for(int c0=0;c0<nk;c0+=blockDim.x){
+        int t=c0+tid, valid=t<nk;
+        unsigned k=valid?dsa_key(row[t]):0u;
+        int fg=valid&&k>thr, fe=valid&&k==thr;
+        /* scan esclusivo di blocco (256): fg in scan[], fe in hist[] */
+        scan[tid]=fg; hist[tid]=fe; __syncthreads();
+        for(int off=1;off<256;off<<=1){
+            int a=tid>=off?scan[tid-off]:0, b=tid>=off?hist[tid-off]:0;
+            __syncthreads();
+            scan[tid]+=a; hist[tid]+=b;
+            __syncthreads();
+        }
+        int idxg=scan[tid]-fg, idxe=hist[tid]-fe;   /* inclusivo -> esclusivo */
+        if(fg) out[s_goff+idxg]=t;
+        if(fe&&s_eoff+idxe<e) out[g+s_eoff+idxe]=t;
+        __syncthreads();
+        if(!tid){ s_goff+=scan[255]; s_eoff+=hist[255]; }
+        __syncthreads();
+    }
+}
 template<typename KT>
 __global__ static void dsa_score_kernel(float *__restrict__ isc,
         const float *__restrict__ qi, const float *__restrict__ w32,
@@ -2364,9 +2433,18 @@ __global__ static void softmax_rows_flat(float *rows,int width,float scale){
 extern "C" int coli_cuda_prefill_dsa_select(int device,ColiCudaDsaChain *dsa,
         const float *xn_dev,const float *qres_dev,
         int S,int pos_base,int sB0,int D,int q_lora,int qk_rope,float theta){
+    /* COLI_DSA_DEVTOPK (default 1): il top-k della selezione gira sul device
+     * (dsa_topk_rows, semantica bit-identica all'host) a CHUNK di righe —
+     * spariscono il download S_b*T dei punteggi, il buffer host gigante e lo
+     * scratch device S_b*T che oltre ~64k non allocherebbe.  Scende solo la
+     * selezione (S_b*topk int, indipendente da T).  Con =0 resta il percorso
+     * host esatto (iscore_host + top-k del chiamante). */
+    static int devtopk=-1;
+    if(devtopk<0){ const char *e=getenv("COLI_DSA_DEVTOPK"); devtopk=e?(atoi(e)!=0):1; }
     if(!dsa||!dsa->ix_wq||!dsa->ix_wk||!dsa->ix_wp||!dsa->knw_dev||!dsa->knb_dev||
-       !dsa->d_Ic||!dsa->ic_host||!dsa->iscore_host||!xn_dev||!qres_dev||
+       !dsa->d_Ic||!dsa->ic_host||!xn_dev||!qres_dev||
        S<1||pos_base<0||sB0<0||sB0>S||dsa->nh<1||dsa->hd<1) return 0;
+    if(devtopk ? !(dsa->sel&&dsa->nsel&&dsa->topk>0) : !dsa->iscore_host) return 0;
     int nh=dsa->nh,hd=dsa->hd,T=pos_base+S,S_b=S-sB0;
     if((dsa->ix_wq->fmt!=1&&dsa->ix_wq->fmt!=2)||
        (dsa->ix_wk->fmt!=1&&dsa->ix_wk->fmt!=2)||
@@ -2389,10 +2467,14 @@ extern "C" int coli_cuda_prefill_dsa_select(int device,ColiCudaDsaChain *dsa,
     if(f16) cvt_f32_f16<<<(unsigned)(((size_t)S*hd+255)/256),256>>>(
         (__half*)dsa->d_Ic+(size_t)pos_base*hd,icrows,(size_t)S*hd);
     if(S_b>0){
-        float *isc =coli_cuda_pipe_scratch(device,18,(size_t)S_b*T*4);
+        int RB=devtopk?(S_b<512?S_b:512):S_b;      /* chunk di righe in modalita' device */
+        float *isc =coli_cuda_pipe_scratch(device,18,(size_t)RB*T*4);
         float *qi_d=coli_cuda_pipe_scratch(device,19,(size_t)S_b*nh*hd*4);
         float *w32d=coli_cuda_pipe_scratch(device,20,(size_t)S_b*nh*4);
-        if(!isc||!qi_d||!w32d){ fprintf(stderr,"[CUDA] prefill dsa: scratch\n"); return 0; }
+        int *dsel=devtopk?(int*)coli_cuda_pipe_scratch(device,40,
+            (size_t)RB*dsa->topk*sizeof(int)):NULL;
+        if(!isc||!qi_d||!w32d||(devtopk&&!dsel)){
+            fprintf(stderr,"[CUDA] prefill dsa: scratch\n"); return 0; }
         quant_matmul<<<dim3(nh*hd,S_b),256>>>(qi_d,qres_dev+(size_t)sB0*q_lora,
             dsa->ix_wq->weights,dsa->ix_wq->scales,dsa->ix_wq->fmt,S_b,q_lora,nh*hd,
             row_bytes(dsa->ix_wq->fmt,q_lora));
@@ -2401,15 +2483,33 @@ extern "C" int coli_cuda_prefill_dsa_select(int device,ColiCudaDsaChain *dsa,
             dsa->ix_wp->weights,dsa->ix_wp->scales,dsa->ix_wp->fmt,S_b,D,nh,
             row_bytes(dsa->ix_wp->fmt,D));
         size_t smem_sc=(size_t)(nh*hd+nh)*sizeof(float);
-        if(f16) dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)S_b),128,smem_sc>>>(
-            isc,qi_d,w32d,(const __half*)dsa->d_Ic,pos_base+sB0+1,nh,hd,
-            1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
-        else dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)S_b),128,smem_sc>>>(
-            isc,qi_d,w32d,dsa->d_Ic,pos_base+sB0+1,nh,hd,
-            1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
-        if(!cuda_ok(cudaGetLastError(),"prefill dsa launch")) return 0;
-        if(!cuda_ok(cudaMemcpy(dsa->iscore_host,isc,(size_t)S_b*T*4,
-            cudaMemcpyDeviceToHost),"prefill dsa score dl")) return 0;
+        for(int c0=0;c0<S_b;c0+=RB){
+            int rn=S_b-c0; if(rn>RB)rn=RB;
+            int nk0=pos_base+sB0+c0+1;
+            if(f16) dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)rn),128,smem_sc>>>(
+                isc,qi_d+(size_t)c0*nh*hd,w32d+(size_t)c0*nh,
+                (const __half*)dsa->d_Ic,nk0,nh,hd,
+                1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
+            else dsa_score_kernel<<<dim3(((unsigned)T+127)/128,(unsigned)rn),128,smem_sc>>>(
+                isc,qi_d+(size_t)c0*nh*hd,w32d+(size_t)c0*nh,
+                dsa->d_Ic,nk0,nh,hd,
+                1.f/sqrtf((float)nh),1.f/sqrtf((float)hd),T);
+            if(devtopk){
+                dsa_topk_rows<<<(unsigned)rn,256>>>(dsel,isc,T,nk0,dsa->topk);
+                if(!cuda_ok(cudaGetLastError(),"prefill dsa topk launch")) return 0;
+                if(!cuda_ok(cudaMemcpy(dsa->sel+(size_t)(sB0+c0)*dsa->topk,dsel,
+                    (size_t)rn*dsa->topk*sizeof(int),cudaMemcpyDeviceToHost),
+                    "prefill dsa sel dl")) return 0;
+            }else{
+                if(!cuda_ok(cudaGetLastError(),"prefill dsa launch")) return 0;
+                if(!cuda_ok(cudaMemcpy(dsa->iscore_host+(size_t)c0*T,isc,
+                    (size_t)rn*T*4,cudaMemcpyDeviceToHost),"prefill dsa score dl")) return 0;
+            }
+        }
+        if(devtopk) for(int r=0;r<S_b;r++){
+            int nk=pos_base+sB0+r+1;
+            dsa->nsel[sB0+r]=nk<dsa->topk?nk:dsa->topk;
+        }
     }
     if(!cuda_ok(cudaGetLastError(),"prefill dsa kidx launch")) return 0;
     return cuda_ok(cudaMemcpy(dsa->ic_host,icrows,(size_t)S*hd*4,
