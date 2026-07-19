@@ -2462,6 +2462,7 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
 static int g_absorb=-1;
 #ifdef COLI_CUDA
 static int g_cuda_pipe=0;   /* COLI_CUDA_PIPE=1: prefill attention chain resident on the layer home device */
+static int g_cuda_prefill=0;/* COLI_CUDA_PREFILL=1: large-batch CUDA path without persistent device KV */
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
 static int cmp_fdesc(const void *a,const void *b){
@@ -2718,7 +2719,7 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
      * available (incremental sync — steady-state decode uploads nothing), scratch
      * re-upload only as fallback.  Re-streaming the whole prefix every call cost
      * O(context) PCIe traffic per layer per token. */
-    { int dev_kv = layer<c->n_layers && kv_dev_sync(m,l,m->kv,layer,pos_base);
+    { int dev_kv = g_cuda_pipe && layer<c->n_layers && kv_dev_sync(m,l,m->kv,layer,pos_base);
       if(dev_kv){ ld_=m->kv->cuda_Lc[layer]+(size_t)st0*kvl; rd=m->kv->cuda_Rc[layer]+(size_t)st0*R; }
       else if(old>0){
         if(!coli_cuda_pipe_upload(dev,ld_,coli_kv_row(m->Lc[layer],st0,kvl),(size_t)old*kvl*4)||
@@ -2935,7 +2936,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * bit-identical to upstream; the kernel switch is not. */
     int pipe_done=0;
 #ifdef COLI_CUDA
-    if(g_cuda_pipe&&!kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
+    if((g_cuda_pipe||(g_cuda_prefill&&!(m->has_dsa&&pos_base+S>c->index_topk)))&&
+       !kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
        (!(m->has_dsa&&pos_base+S>c->index_topk) ||
         (dsa_chain_on()&&!g_dsa_force&&S>=16&&m->kv_start[layer]==0))&&
        l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
@@ -3592,7 +3594,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
      * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
-    int group_enabled = S<=64 || (g_cuda_pipe && S<=4096);
+    int group_enabled = S<=64 || ((g_cuda_pipe||g_cuda_prefill) && S<=4096);
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
     int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;
@@ -6033,7 +6035,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
-    if(g_prof) prof_report(m,&r->pb,dt,r->emitted,stderr);
+    if(g_prof) prof_report(m,&r->pb,dt,r->prompt_tokens+r->emitted,stderr);
     r->active=0;
 }
 
@@ -7354,6 +7356,7 @@ int main(int argc, char **argv){
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
     g_cuda_host_experts=getenv("COLI_CUDA_HOST_EXPERTS")?atoi(getenv("COLI_CUDA_HOST_EXPERTS")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
+    g_cuda_prefill=getenv("COLI_CUDA_PREFILL")?atoi(getenv("COLI_CUDA_PREFILL")):0;
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
@@ -7363,6 +7366,7 @@ int main(int argc, char **argv){
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_host_experts&&!g_cuda_enabled){ fprintf(stderr,"COLI_CUDA_HOST_EXPERTS requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_prefill&&!g_cuda_enabled){ fprintf(stderr,"COLI_CUDA_PREFILL requires COLI_CUDA=1\n"); return 2; }
     if((g_cuda_expert_gb>0||g_cuda_expert_auto) && !g_cuda_enabled){ fprintf(stderr,"CUDA_EXPERT_GB requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_enabled) fprintf(stderr,"[CUDA] mode: routed experts%s%s\n",
         g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
@@ -7372,6 +7376,7 @@ int main(int argc, char **argv){
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
+       (getenv("COLI_CUDA_PREFILL") && atoi(getenv("COLI_CUDA_PREFILL"))) ||
        (getenv("COLI_CUDA_HOST_EXPERTS") && atoi(getenv("COLI_CUDA_HOST_EXPERTS"))) ||
         (getenv("CUDA_EXPERT_GB") &&
         (!strcmp(getenv("CUDA_EXPERT_GB"),"auto")||atof(getenv("CUDA_EXPERT_GB"))>0))){
