@@ -2829,6 +2829,29 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         float *sc_all = falloc((int64_t)omp_get_max_threads()*sc_cap);
         int cuda_core=0,cuda_projected=0;
 #ifdef COLI_CUDA
+        /* DSA fase 2, incremento 1: assorbimento + o_proj sui top-k
+         * dell'indexer in GPU (selezione ancora su CPU, bit-identica).
+         * Solo batch dove OGNI riga ha una selezione (decode oltre
+         * index_topk); righe miste restano sui percorsi esistenti. */
+        if(!kvs&&S<=4&&g_cuda_enabled&&g_cuda_pipe&&dnsel&&layer<c->n_layers&&
+           l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+           qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
+            int all_sel=1; for(int s=0;s<S;s++) if(dnsel[s]<1) all_sel=0;
+            if(all_sel){
+                cuda_core=cuda_projected=1;
+                for(int s=0;s<S&&cuda_core;s++){
+                    int pos=positions?positions[s]:pos_base+s;
+                    if(!kv_dev_sync(m,l,m->kv,layer,pos+1)){cuda_core=cuda_projected=0;break;}
+                    if(!coli_cuda_attention_project_sel(l->kv_b.cuda,l->o.cuda,
+                            out+(int64_t)s*D,Q+(int64_t)s*H*qh,
+                            m->kv->cuda_Lc[layer],m->kv->cuda_Rc[layer],
+                            dsel+(int64_t)s*dtopk,dnsel[s],
+                            H,c->qk_nope,c->qk_rope,vh,kvl,c->attn_scale))
+                        {cuda_core=cuda_projected=0;break;}
+                }
+            }
+        }
+        if(!cuda_core)
         if(kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){

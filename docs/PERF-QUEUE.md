@@ -261,3 +261,21 @@ pilot budget is already at its measured knee: PILOT_K 2/4/6 gives
 - CPU-expert NUMA affinity: ~6% of expert calls are CPU, <1% ceiling.
 - Fusing the shared expert into the chain: loses to overlap (17.0 vs 16.5) on
   strong-CPU hosts; knob `COLI_FUSE_SHARED=1` exists for weak-CPU machines.
+
+#### DSA phase 2, increment 1 — GPU absorb+o_proj over the selection (landed)
+`coli_cuda_attention_project_sel` (absorb over the indexer's top-k list +
+fused o_proj, device KV shadow, selection still CPU/bit-identical) now
+serves decode rows where every row has a selection.  Validated: DSA_FORCE
+top-32 short-context text identical to dense through the new path.
+MEASURED at 2.8k: decode 2.34 -> 2.48 tok/s only — the pie shifted, not
+shrank: attention/128tok = 26.5 s CPU (projections + k_idx + selection
+scoring + top-k) + 15.2 s GPU (78 sequential upload->kernel->sync round
+trips, latency-bound; CPU o_proj timer now 0).  CONCLUSION for the next
+increment: per-stage offload cannot beat the latency wall — the win is
+keeping the PIPE2 CHAIN resident past index_topk with (a) selection
+scoring in-chain on the device Ic shadow, (b) CPU top-k on a downloaded
+score row (32 KB, keeps bit-identical selection), (c) the new sel-absorb
+kernel called with device-resident q (no per-layer host round trip),
+(d) the pipe2 gate lifted.  The kernel/entry/loader plumbing from this
+increment is the building block; est. decode at 2.8k -> ~5.5+ tok/s flat
+in T (selection caps attended keys at 2048).

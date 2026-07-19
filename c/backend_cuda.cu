@@ -1716,6 +1716,67 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
+/* DSA: absorb su una LISTA di posizioni selezionate (top-k dell'indexer).
+ * sel[] contiene posizioni ASSOLUTE nella shadow KV del device — latent/rope
+ * sono i puntatori base cuda_Lc/cuda_Rc, nessuna finestra st0. Stessa
+ * matematica del percorso CPU (score sui selezionati, softmax, gather). */
+__global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
+        const float *latent,const float *rope,const int *sel,int ns,
+        const void *weights,const float *wscale,int fmt,
+        int H,int Q,int R,int V,int K,float scale){
+    int h=blockIdx.x,tid=threadIdx.x,rbase=h*(Q+V);
+    extern __shared__ float sm[];float *qa=sm,*cl=qa+K,*scores=cl+K,*red=scores+ns;
+    const float *qs=q+(size_t)h*(Q+R);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          (fmt?wscale[rbase+d]:1.f);qa[k]=a;}
+    __syncthreads();
+    for(int j=tid;j<ns;j+=blockDim.x){int t=sel[j];float a=0;
+        const float *lt=latent+(size_t)t*K,*rt=rope+(size_t)t*R;
+        for(int k=0;k<K;k++)a+=qa[k]*lt[k];
+        for(int d=0;d<R;d++)a+=qs[Q+d]*rt[d];scores[j]=a*scale;}
+    __syncthreads();
+    float local=-3.402823466e+38F;for(int j=tid;j<ns;j+=blockDim.x)local=fmaxf(local,scores[j]);
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
+    float mx=red[0];__syncthreads();          /* barriera anti-race (vedi absorb batch) */
+    local=0;for(int j=tid;j<ns;j+=blockDim.x){float e=expf(scores[j]-mx);scores[j]=e;local+=e;}
+    red[tid]=local;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float inv=1.f/red[0];for(int j=tid;j<ns;j+=blockDim.x)scores[j]*=inv;
+    __syncthreads();
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int j=0;j<ns;j++)
+        a+=scores[j]*latent[(size_t)sel[j]*K+k];cl[k]=a;}
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[(size_t)h*V+v]=a*(fmt?wscale[row]:1.f);}
+}
+extern "C" int coli_cuda_attention_project_sel(ColiCudaTensor *w,ColiCudaTensor *proj,
+        float *out,const float *q,const float *latent_dev,const float *rope_dev,
+        const int *sel,int ns,int H,int Q,int R,int V,int K,float scale){
+    if(!w||!proj||!out||!q||!latent_dev||!rope_dev||!sel||ns<1||ns>8192||H<1||Q<1||R<1||
+       V<1||K<1||K>512||w->I!=K||w->O!=H*(Q+V)||
+       proj->device!=w->device||proj->I!=H*V)return 0;
+    DeviceContext *dc=find_ctx(w->device);if(!select_ctx(dc))return 0;
+    size_t qb=(size_t)H*(Q+R)*sizeof(float),cb=(size_t)H*V*sizeof(float);
+    size_t ob=(size_t)proj->O*sizeof(float),sb=(size_t)ns*sizeof(int);
+    if(!reserve(&dc->aq,&dc->aq_cap,qb)||!reserve(&dc->ac,&dc->ac_cap,cb)||
+       !reserve(&dc->y,&dc->y_cap,ob)||
+       !reserve_bytes((void**)&dc->qx,&dc->qx_cap,sb))return 0;  /* qx libero in decode (solo W4A4 lo usa) */
+    if(!cuda_ok(cudaMemcpyAsync(dc->aq,q,qb,cudaMemcpyHostToDevice,dc->stream),"sel q upload")||
+       !cuda_ok(cudaMemcpyAsync(dc->qx,sel,sb,cudaMemcpyHostToDevice,dc->stream),"sel list upload"))return 0;
+    size_t shared=(size_t)(2*K+ns+256)*sizeof(float);
+    attention_absorb_sel_kernel<<<H,256,shared,dc->stream>>>(dc->ac,dc->aq,latent_dev,
+        rope_dev,(const int*)dc->qx,ns,w->weights,w->scales,w->fmt,H,Q,R,V,K,scale);
+    if(!cuda_ok(cudaGetLastError(),"sel absorb launch"))return 0;
+    quant_matmul<<<dim3(proj->O,1),256,0,dc->stream>>>(dc->y,dc->ac,proj->weights,
+        proj->scales,proj->fmt,1,proj->I,proj->O,row_bytes(proj->fmt,proj->I));
+    if(!cuda_ok(cudaGetLastError(),"sel o_proj launch")||
+       !cuda_ok(cudaMemcpyAsync(out,dc->y,ob,cudaMemcpyDeviceToHost,dc->stream),"sel out download")||
+       !cuda_ok(cudaStreamSynchronize(dc->stream),"sel absorb sync"))return 0;
+    return 1;
+}
 /* absorb per il DECODE con KV gia' residente: carica solo q (poche KB),
  * latent/rope arrivano dall'ombra device. ctx torna a host (S piccolo). */
 extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,const float *q,
