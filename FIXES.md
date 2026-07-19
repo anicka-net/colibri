@@ -277,3 +277,53 @@ OK
    tool syntax inside reasoning, Anthropic key auth, stop overflow,
    continuity overflow, CUDA output identity, and TAP under PIPE2. Their
    outputs appear in items 1-12 and the full-suite block.
+
+## Round 3 - DSA increment 2 safety
+
+### 1. CUDA DSA shadow memory budget
+
+**FIXED** - The RAM planner includes the per-slot device `Ic` shadow for every
+FULL DSA layer when PIPE2 assigns it to an integrated CUDA device. The
+arithmetic test covers one and three context slots at 131072 tokens, and the
+eligibility test excludes SHARED indexers, dense layers, unavailable resident
+paths, and discrete CUDA devices. The GB10 backend reports integrated storage.
+
+```text
+OK kv_alloc re-allocation
+[CUDA] device 0: NVIDIA GB10, 130.7 GB VRAM, sm_121
+cuda backend: q8/q4/q2/f32 correctness ok on 1 device(s), integrated=1
+```
+
+The complete C and Python suites also ran:
+
+```text
+test_dsa_select: 129 cases run, 0 failure(s)
+test_dsa_select: ok
+Ran 91 tests in 3.383s
+
+OK
+```
+
+### 2. Versioned CUDA attention-chain ABI
+
+**CHANGED-UNVERIFIED** - The changed export, declaration, loader resolution,
+wrapper, and caller now use `coli_cuda_pipe_attn_chain_v2`. The CUDA build and
+exported object symbol were checked on GB10:
+
+```text
+GB10 CUDA build: ok
+000000000000d890 T coli_cuda_pipe_attn_chain_v2
+```
+
+An old-host/new-DLL and new-host/old-DLL runtime matrix requires Windows with
+both DLL generations and was not available locally.
+
+### Self-check
+
+1. Item 2's Windows old/new DLL mismatch paths were not run because no
+   nvcc/MSVC Windows host with both DLL generations was available.
+2. Every claim above corresponds to the final diff or a pasted output block.
+3. The review smoke paths were DSA shadow-budget arithmetic, full regression
+   tests, GB10 CUDA compilation, exported-symbol inspection, and both Windows
+   DLL mismatch directions. The first four outputs are above; the mismatch
+   matrix is explicitly CHANGED-UNVERIFIED.

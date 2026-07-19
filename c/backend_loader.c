@@ -33,6 +33,7 @@ typedef void           (*fn_shutdown)(void);
 typedef int            (*fn_device_count)(void);
 typedef int            (*fn_device_at)(int index);
 typedef int            (*fn_mem_info)(int device, size_t *free_bytes, size_t *total_bytes);
+typedef int            (*fn_device_is_integrated)(int device);
 typedef void           (*fn_stats)(int device, size_t *tensor_count, size_t *tensor_bytes);
 typedef void           (*fn_group_stats)(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                          double *h2d_ms, double *kernel_ms, double *d2h_ms);
@@ -78,7 +79,7 @@ typedef int (*fn_pipe_copy2d)(int device,float *dst,int dpitch,const float *src,
 typedef int (*fn_pipe_download)(int device,const void *src,void *dst,size_t bytes);
 typedef void (*fn_pipe_free)(int device,void *p);
 typedef int (*fn_pipe_gemm)(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S);
-typedef int (*fn_pipe_attn_chain)(int device,
+typedef int (*fn_pipe_attn_chain_v2)(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
         const ColiCudaTensor *qa, const ColiCudaTensor *qb,
@@ -117,6 +118,7 @@ static struct {
     fn_device_count    device_count;
     fn_device_at       device_at;
     fn_mem_info        mem_info;
+    fn_device_is_integrated device_is_integrated;
     fn_stats           stats;
     fn_group_stats     group_stats;
     fn_expert_mlp      expert_mlp;
@@ -145,7 +147,7 @@ static struct {
     fn_pipe_download pipe_download;
     fn_pipe_free pipe_free;
     fn_pipe_gemm pipe_gemm;
-    fn_pipe_attn_chain pipe_attn_chain;
+    fn_pipe_attn_chain_v2 pipe_attn_chain_v2;
     fn_pipe_peer_copy pipe_peer_copy;
     fn_pipe_rmsnorm pipe_rmsnorm;
     fn_pipe_rmsnorm_s pipe_rmsnorm_s;
@@ -216,6 +218,7 @@ static int coli_cuda_load(void){
     RESOLVE(device_count,   fn_device_count)
     RESOLVE(device_at,      fn_device_at)
     RESOLVE(mem_info,       fn_mem_info)
+    RESOLVE(device_is_integrated, fn_device_is_integrated)
     RESOLVE(stats,          fn_stats)
     RESOLVE(group_stats,    fn_group_stats)
     RESOLVE(expert_mlp,     fn_expert_mlp)
@@ -244,7 +247,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_download, fn_pipe_download)
     RESOLVE(pipe_free, fn_pipe_free)
     RESOLVE(pipe_gemm, fn_pipe_gemm)
-    RESOLVE(pipe_attn_chain, fn_pipe_attn_chain)
+    RESOLVE(pipe_attn_chain_v2, fn_pipe_attn_chain_v2)
     RESOLVE(pipe_peer_copy, fn_pipe_peer_copy)
     RESOLVE(pipe_rmsnorm, fn_pipe_rmsnorm)
     RESOLVE(pipe_rmsnorm_s, fn_pipe_rmsnorm_s)
@@ -290,6 +293,11 @@ int coli_cuda_device_at(int index){
 int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes){
     if(!g_cuda.available){ if(free_bytes)*free_bytes=0; if(total_bytes)*total_bytes=0; return 0; }
     return g_cuda.mem_info(device, free_bytes, total_bytes);
+}
+
+int coli_cuda_device_is_integrated(int device){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.device_is_integrated(device);
 }
 
 void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes){
@@ -449,7 +457,7 @@ int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,int S)
     return g_cuda.pipe_gemm(t, y_dev, x_dev, S);
 }
 
-int coli_cuda_pipe_attn_chain(int device,
+int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
         const ColiCudaTensor *qa, const ColiCudaTensor *qb,
@@ -466,7 +474,7 @@ int coli_cuda_pipe_attn_chain(int device,
         const ColiCudaTensor *shd, int sI, float *xn_host,
         ColiCudaDsaChain *dsa){
     if(!g_cuda.available){ return 0; }
-    return g_cuda.pipe_attn_chain(device,x_dev,nrm_dev,nrm_host,kv_host_L,kv_host_R,
+    return g_cuda.pipe_attn_chain_v2(device,x_dev,nrm_dev,nrm_host,kv_host_L,kv_host_R,
         qa,qb,kva,kvb,o_proj,w_in,w_qa,w_kva,w_post,d_Lc,d_Rc,D,H,q_lora,kv_lora,
         qk_nope,qk_rope,vh,S,pos_base,kv_start,eps,theta,attn_scale,
         d_router,E,scores_host,shg,shu,shd,sI,xn_host,dsa);

@@ -4169,7 +4169,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
         int kvl=c->kv_lora, R=c->qk_rope;
         float *cw1=pipe_ln_cache(dev,li,0,l->q_a_ln,(size_t)c->q_lora);
         float *cw2=pipe_ln_cache(dev,li,1,l->kv_a_ln,(size_t)kvl);
-        if(cw1&&cw2&&coli_cuda_pipe_attn_chain(dev,x_dev,nrm_d,nrm_host,
+        if(cw1&&cw2&&coli_cuda_pipe_attn_chain_v2(dev,x_dev,nrm_d,nrm_host,
                coli_kv_row(m->Lc[li],pos_base,kvl),coli_kv_row(m->Rc[li],pos_base,R),
                l->q_a.cuda,l->q_b.cuda,l->kv_a.cuda,l->kv_b.cuda,l->o.cuda,
                w_in,cw1,cw2,w_post,
@@ -6610,6 +6610,45 @@ static double kv_pool_bytes(Model *m, int max_ctx){
     return one*slots;
 }
 
+static double cuda_ic_shadow_bytes_for(int full, int index_hd, int max_ctx, int slots){
+    return (double)slots*full*max_ctx*index_hd*4.0;
+}
+
+static int cuda_ic_shadow_layer_eligible(int full, int sparse, int resident_eligible,
+                                         int integrated){
+    return full && sparse && resident_eligible && integrated;
+}
+
+/* PIPE2 keeps a second Ic copy on the layer's CUDA device for FULL DSA layers.
+ * On coherent unified-memory hosts it consumes the same physical RAM as host Ic. */
+static double cuda_ic_shadow_bytes(Model *m, int max_ctx){
+#ifdef COLI_CUDA
+    const char *chain=getenv("COLI_DSA_CHAIN");
+    if(!g_cuda_enabled || !g_cuda_dense || g_cuda_pipe<2 || !m->has_dsa ||
+       g_dsa_force || (chain && !atoi(chain)) || max_ctx<=m->c.index_topk) return 0;
+    int full=0;
+    for(int i=0;i<m->c.n_layers;i++){
+        Layer *l=&m->L[i]; int dev=l->kv_b.cuda_device;
+        int attn=l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
+                 l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
+                 l->q_a.cuda_device==dev&&l->q_b.cuda_device==dev&&
+                 l->kv_a.cuda_device==dev&&l->o.cuda_device==dev;
+        int shared=l->sh_gate.cuda_eligible&&l->sh_up.cuda_eligible&&
+                   l->sh_down.cuda_eligible&&l->sh_gate.cuda_device==dev&&
+                   l->sh_up.cuda_device==dev&&l->sh_down.cuda_device==dev;
+        QT *wq=&m->ix_wq[i],*wk=&m->ix_wk[i],*wp=&m->ix_wp[i];
+        int index=wq->cuda_eligible&&wk->cuda_eligible&&wp->cuda_eligible&&
+                  wq->cuda_device==dev&&wk->cuda_device==dev&&wp->cuda_device==dev;
+        full+=cuda_ic_shadow_layer_eligible(m->c.idx_type[i],l->sparse,
+            attn&&shared&&index,coli_cuda_device_is_integrated(dev));
+    }
+    int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
+    return cuda_ic_shadow_bytes_for(full,m->c.index_hd,max_ctx,slots);
+#else
+    (void)m; (void)max_ctx; return 0;
+#endif
+}
+
 /* byte disponibili per gli expert (pin + LRU) nel budget — specchio del conto di cap_for_ram */
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
@@ -6617,6 +6656,7 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     double ws_b = (g_expert_budget>0 && g_expert_budget<64) ? (double)(g_expert_budget+4)*(double)eb : 64.0*(double)eb;
     double slack = 1.2e9 + 2.5e9 + ws_b
         + kv_pool_bytes(m,max_ctx)
+        + cuda_ic_shadow_bytes(m,max_ctx)
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
@@ -6643,7 +6683,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * Cap=4 matches budget=4, eliminating LRU thrashing that causes excessive disk
      * re-reads. Clamp ws_b to the actual budget (min 8 for non-budgeted / prefill). */
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
-    double kv_b  = kv_pool_bytes(m,max_ctx);
+    double kv_b  = kv_pool_bytes(m,max_ctx) + cuda_ic_shadow_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di

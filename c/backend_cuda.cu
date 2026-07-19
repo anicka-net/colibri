@@ -24,7 +24,7 @@ struct ColiCudaTensor {
 
 typedef struct {
     int device;
-    int compute_major,compute_minor;
+    int compute_major,compute_minor,integrated;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
     uint8_t *qx; float *qscale;
@@ -489,7 +489,7 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         if (!select_ctx(ctx)) { g_nctx = 0; return 0; }
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { g_nctx = 0; return 0; }
-        ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
+        ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;ctx->integrated=prop.integrated;
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             g_nctx=0;return 0;
         }
@@ -546,6 +546,11 @@ extern "C" int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_
     DeviceContext *ctx = find_ctx(device);
     if (!free_bytes || !total_bytes || !select_ctx(ctx)) return 0;
     return cuda_ok(cudaMemGetInfo(free_bytes, total_bytes), "memory info");
+}
+
+extern "C" int coli_cuda_device_is_integrated(int device) {
+    DeviceContext *ctx = find_ctx(device);
+    return ctx ? ctx->integrated : 0;
 }
 
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
@@ -1485,7 +1490,7 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
         const float *latent,const float *rope,const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale);
-extern "C" int coli_cuda_pipe_attn_chain(int device,
+extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
         const ColiCudaTensor *qa, const ColiCudaTensor *qb,
