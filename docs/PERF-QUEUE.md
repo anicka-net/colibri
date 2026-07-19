@@ -165,6 +165,25 @@ is now small enough that further work should be measured against item 3 first.
 At 70-token context MTP=0 wins (19.6 vs 17.9).  Attention grows with context,
 drafts don't: find the crossover length; also where the device-resident KV
 fix (O(context) upload removal) shows.
+DATA POINT (2026-07-19, post-determinism-fix, frozen warmed usage,
+2701-token prompt): DRAFT=1 **5.57 tok/s** (90% acceptance, 1.91
+tok/forward) vs MTP=0 **5.50 tok/s** — MTP is already (barely) ahead at
+2.8k, so the crossover sits below that; the gap should widen with T.
+
+#### Long-context rerun after the determinism fix (canonical numbers)
+2701-token prompt, tekton, `COLI_PREFILL_GEMM=1 COLI_CUDA_TC_W4A16=1`,
+frozen usage warmed on the workload (hit 82-93%):
+| config | prefill | decode @2.8k |
+|---|---|---|
+| MTP=0 DSA=0 | 78.4 s | **5.50 tok/s** |
+| MTP=0 DSA=0 (repeat, same state) | 79.2 s | 5.47 tok/s, TEXT IDENTICAL |
+| DSA-on (selection active) | 268.5 s | 2.34 tok/s |
+| DRAFT=1 DSA=0 | 83.5 s | **5.57 tok/s** @ 90% acc |
+The identical-text repeat is the determinism guarantee in action; ±1%
+timing drift remains (thermal/scheduling).  DSA-on is still gated OFF
+the pipe2/GEMM paths past index_topk (prefill 268 s = non-pipe2 absorb
+path) — item 1 phase 2 (selection in chain) stays the top long-context
+lever, now worth ~2.4x decode AND ~3.4x prefill at 2.7k.
 
 ### 7. Spark-side cache policy
 On the unified-memory host the oracle experiment bounds the prize: honest LRU
