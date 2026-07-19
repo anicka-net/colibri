@@ -187,9 +187,21 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
+/* sel_host!=NULL: DSA prefill phase split — rows [sB0,S) absorb over their own
+ * top-`sel_topk` list (absolute positions, kv_start must be 0), rows [0,sB0)
+ * keep the causal GEMM path.  sel_host=NULL: dense causal prefill (sB0/sel_topk
+ * ignored). */
 COLI_CUDA_DLLEXPORT int coli_cuda_prefill_attn_gemm(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
-        int S,int H,int Q,int R,int V,int K,int T,float scale);
+        int S,int H,int Q,int R,int V,int K,int T,float scale,
+        const int *sel_host,int sB0,int sel_topk);
+/* DSA prefill indexer pass: k_idx for the S new rows into the device Ic shadow
+ * (downloaded to dsa->ic_host, host canonical) + selection scores for rows
+ * [sB0,S) downloaded to dsa->iscore_host [S-sB0, pos_base+S] for the exact
+ * host top-k.  Uses dsa->{ix_*, knw/knb_dev, d_Ic, nh, hd}. */
+COLI_CUDA_DLLEXPORT int coli_cuda_prefill_dsa_select(int device,ColiCudaDsaChain *dsa,
+        const float *xn_dev,const float *qres_dev,
+        int S,int pos_base,int sB0,int D,int q_lora,int qk_rope,float theta);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_sync(int device);
 
 #ifdef __cplusplus

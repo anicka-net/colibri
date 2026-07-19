@@ -324,6 +324,34 @@ horizon; late correction alone cannot hide the NVMe read.
    K6 budget only after the above.  Coupling depth 2 already showed the failure
    mode: extra lead time is worthless when accuracy causes cache pollution.
 
+#### DSA phase 2, increment 3 — per-row PREFILL selection (landed)
+`attn_pipe_prefill` now handles batches crossing/past index_topk with a phase
+split: rows with nk<=topk keep the five-GEMM causal path (S_a rows, T_a keys),
+rows past it get per-row selection and a batched sel-absorb
+(`attention_absorb_sel_rows_kernel`, one block-row per query, fixed ns=topk —
+an invariant of the top-k).  FULL layers run the indexer on-device
+(`coli_cuda_prefill_dsa_select`: batched k_idx into the Ic shadow + qi/w32 +
+`dsa_score_kernel` over all rows, one score download ~7 MB @2.7k) with the
+exact host top-k (`prefill_dsa_topk`, OMP over rows); SHARED layers reuse
+`m->dsa_sel`.  Dense layers L0-2 ride the same path through the
+attention_rows hook (scratch out + download).  The pipe2 and hook gates are
+lifted for S>=16; 5..15-row batches and any missing prerequisite fall back to
+the whole-layer CPU path — never dense attention under selection.
+MEASURED (2701-token prompt, frozen usage): **prefill 267.8 -> 70.3 s
+(38 tok/s, 3.8x)**; decode unchanged-to-better at 4.79 tok/s; engagement
+prefill full 21/21 shared 57/57, fb 0.  vs DSA=0: prefill 54 s, decode 5.50 —
+DSA-on is now within ~30%/13% at the 2.8k crossover and flat in T beyond it.
+VALIDATION: text identity is not a usable bar here — top-32 of a 91-token
+prompt is genuinely lossy (even CPU-DSA != dense), and fp tie-flips diverge
+text between scorers.  Instead `COLI_DBG_SELDUMP` records per-row selection
+lists; GPU-vs-CPU runs at DSA_TOPK=32: layer-0 sets (bit-identical inputs)
+are **100% identical**; overall mean overlap 96.5%, degrading smoothly with
+depth = accumulated residual fp drift (same accepted class as
+COLI_PREFILL_GEMM), while a structural bug would read ~35% (random).
+Remaining prefill delta vs dense (~16 s): phase-B absorb gather + scoring +
+per-FULL-layer score sync.  Next DSA levers: index_topk_freq=4 refresh
+(decode), IndexShare for MTP.
+
 #### DSA phase 2, increment 2 — selection inside the resident chain (landed)
 The pipe2 gate is lifted for decode batches (S<=4) entirely past index_topk:
 `coli_cuda_pipe_attn_chain` gained a DSA mode (`ColiCudaDsaChain`).  FULL

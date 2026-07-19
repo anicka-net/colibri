@@ -53,7 +53,7 @@ int main(int argc,char**argv){
     float scale=1.0f/sqrtf((float)(Q+R));
     if(!coli_cuda_attention_project_batch_dev_out(kvt,ot,o1,qd,ld,rd,S,H,Q,R,V,K,T,scale)){
         fprintf(stderr,"reference path failed\n"); return 1; }
-    if(!coli_cuda_prefill_attn_gemm(kvt,ot,o2,qd,ld,rd,S,H,Q,R,V,K,T,scale)){
+    if(!coli_cuda_prefill_attn_gemm(kvt,ot,o2,qd,ld,rd,S,H,Q,R,V,K,T,scale,NULL,0,0)){
         fprintf(stderr,"gemm path failed\n"); return 1; }
     float *h1=malloc((size_t)S*O*4), *h2=malloc((size_t)S*O*4);
     coli_cuda_pipe_download(dev,o1,h1,(size_t)S*O*4);

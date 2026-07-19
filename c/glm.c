@@ -2456,6 +2456,25 @@ static void partial_select_desc(float *a, int n, int k){
     }
 }
 
+/* COLI_DBG_SELDUMP=file: registra le liste di selezione DSA (validazione GPU vs
+ * CPU — le selezioni di prefill dipendono solo dal prompt, quindi due run con
+ * lo stesso prompt sono confrontabili posizione per posizione). Record binario:
+ * int32 layer, pos, nsel, poi nsel int32. */
+static FILE *g_seldump_f; static int g_seldump_init;
+static void seldump(int layer,int pos,int nsel,const int *sel){
+    /* init DENTRO la critical: i chiamanti sono loop omp-parallel e il primo
+     * layer dumpava record persi nella corsa init/fopen */
+    #pragma omp critical(coli_seldump)
+    {
+        if(!g_seldump_init){ g_seldump_init=1;
+            const char *p=getenv("COLI_DBG_SELDUMP");
+            if(p) g_seldump_f=fopen(p,"wb");
+        }
+        if(g_seldump_f){ int32_t h[3]={layer,pos,nsel};
+            fwrite(h,4,3,g_seldump_f); fwrite(sel,4,(size_t)nsel,g_seldump_f); }
+    }
+}
+
 /* attenzione MLA con KV-cache compressa, su token nuovi x[S,hidden], pos_base = pos del primo */
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
@@ -2548,10 +2567,58 @@ static int g_group_accum_home=-1;  /* router logits computed on-device by the fu
 static float *chain_scores=NULL; size_t chain_scores_cap=0; /* fused-chain router logits [S,E] */
 static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln rows [S,D] for DSA k_idx */
 /* COLI_DBG_DSACHAIN: engagement counters for the in-chain DSA selection */
-static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain; static int g_dsc_on=-1;
+static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain;
+static long g_dsc_pfull,g_dsc_pshared,g_dsc_pfb;      /* prefill selection */
+static int g_dsc_on=-1;
 static void dsc_report(void){
-    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld | fallback: pre %ld chain %ld\n",
-            g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain);
+    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld | fallback: pre %ld chain %ld"
+            " | prefill: full %ld shared %ld fb %ld\n",
+            g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain,
+            g_dsc_pfull,g_dsc_pshared,g_dsc_pfb);
+}
+static int dsc_enabled(void){
+    if(g_dsc_on<0){ g_dsc_on=getenv("COLI_DBG_DSACHAIN")?atoi(getenv("COLI_DBG_DSACHAIN")):0;
+                    if(g_dsc_on) atexit(dsc_report); }
+    return g_dsc_on;
+}
+/* COLI_DSA_CHAIN=0: disattiva selezione in-chain (decode) e prefill device (torna al CPU path) */
+static int g_dsa_chain=-1;
+static int dsa_chain_on(void){
+    if(g_dsa_chain<0){ const char *e=getenv("COLI_DSA_CHAIN"); g_dsa_chain=e?atoi(e):1; }
+    return g_dsa_chain;
+}
+/* Top-k esatto per la selezione di PREFILL sui punteggi device: righe di fase A
+ * (nk<=topk) -> nsel 0 (attenzione densa causale), righe di fase B -> stessa
+ * semantica del percorso CPU (partial select + scan in ordine di posizione).
+ * Invariante: nd==topk per ogni riga di fase B (nk>topk garantisce almeno topk
+ * valori >= soglia) — il kernel batch usa ns=topk fisso. */
+static int prefill_dsa_topk(Model *m,const float *iscore,int S,int sB0,int pos_base,int layer){
+    Cfg *c=&m->c; int dtopk=c->index_topk, T=pos_base+S;
+    if((int64_t)S*dtopk > m->dsa_scap){
+        free(m->dsa_sel); free(m->dsa_nsel);
+        m->dsa_scap=(int64_t)S*dtopk;
+        m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+        m->dsa_nsel=malloc((size_t)S*sizeof(int));
+        if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; return 0; }
+    }
+    for(int s=0;s<sB0;s++) m->dsa_nsel[s]=0;
+    int bad=0;
+    #pragma omp parallel for schedule(dynamic,8)
+    for(int s=sB0;s<S;s++){
+        int nk=pos_base+s+1;
+        const float *isc=iscore+(size_t)(s-sB0)*T;
+        float *tmp=falloc(nk); memcpy(tmp,isc,(size_t)nk*sizeof(float));
+        partial_select_desc(tmp,nk,dtopk);
+        float thr=tmp[0]; for(int t=1;t<dtopk;t++) if(tmp[t]<thr) thr=tmp[t];
+        int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
+        for(int t=0;t<nk && nd<dtopk;t++) if(isc[t]>thr) dst[nd++]=t;
+        for(int t=0;t<nk && nd<dtopk;t++) if(isc[t]==thr) dst[nd++]=t;
+        m->dsa_nsel[s]=nd;
+        seldump(layer,pos_base+s,nd,dst);
+        free(tmp);
+        if(nd!=dtopk) bad=1;
+    }
+    return !bad;
 }
 static float *pipe_ln_cache(int dev,int layer,int slot,const float *host,size_t n){
     static float *cache[8][256]; static int cdev[8][256];
@@ -2620,10 +2687,67 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
       if(dev_kv) m->kv->cuda_valid[layer]=pos_base+S;   /* device rows written above */
       else if(m->kv->cuda_valid[layer]>pos_base) m->kv->cuda_valid[layer]=pos_base; }
     m->t_aproj+=now_s()-t0; t0=now_s();
+    /* ---- DSA selezione di PREFILL (fase 2 inc.3) ----
+     * Batch oltre index_topk: i layer FULL calcolano k_idx + punteggi sul
+     * device (ombra Ic) e il top-k esatto resta sull'host; i layer SHARED
+     * riusano m->dsa_sel dell'ultimo FULL.  L'attenzione fa lo split di fase:
+     * righe nk<=topk sul GEMM causale, righe oltre sull'assorbimento batch
+     * sulla propria lista.  Qualsiasi prerequisito mancante -> ok=0: il layer
+     * intero torna al percorso CPU (semantica completa) — MAI attenzione
+     * densa sotto selezione. */
+    const int *sel_arg=NULL; int sB0_arg=0, topk_arg=0;
+    int sel_need = m->has_dsa && layer<c->n_layers && st0==0 && !g_dsa_force &&
+                   pos_base+S>c->index_topk;
+    if(sel_need){
+        dsc_enabled();
+        int sB0=c->index_topk-pos_base; if(sB0<0) sB0=0;
+        if(!(dsa_chain_on() && S>=16)) goto sel_fail;
+        if(c->idx_type[layer]){
+            QT *wq=&m->ix_wq[layer],*wk=&m->ix_wk[layer],*wp=&m->ix_wp[layer];
+            if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
+               !qt_cuda_upload(wq)||!qt_cuda_upload(wk)||!qt_cuda_upload(wp)||
+               wq->cuda_device!=dev||wk->cuda_device!=dev||wp->cuda_device!=dev)
+                goto sel_fail;
+            float *knw=layer<256?pipe_ln_cache(dev,layer,5,m->ix_knw[layer],(size_t)c->index_hd):NULL;
+            float *knb=layer<256?pipe_ln_cache(dev,layer,6,m->ix_knb[layer],(size_t)c->index_hd):NULL;
+            if(!knw||!knb) goto sel_fail;
+            if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
+            static float *pisc=NULL; static size_t pisc_cap=0;
+            size_t need=(size_t)(S-sB0)*(pos_base+S);
+            if(need>pisc_cap){
+                float *p=realloc(pisc,need*sizeof(float));
+                if(!p) goto sel_fail;
+                pisc=p; pisc_cap=need;
+            }
+            ColiCudaDsaChain dsac; memset(&dsac,0,sizeof dsac);
+            dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
+            dsac.knw_dev=knw; dsac.knb_dev=knb; dsac.d_Ic=m->kv->cuda_Ic[layer];
+            dsac.nh=c->index_nh; dsac.hd=c->index_hd;
+            dsac.ic_host=m->Ic[layer]+(int64_t)pos_base*c->index_hd;
+            dsac.iscore_host=pisc;
+            if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
+                goto sel_fail;
+            m->kv->cuda_ic_valid[layer]=pos_base+S;
+            if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
+            if(g_dsc_on) g_dsc_pfull++;
+        }else{
+            if(!m->dsa_nsel) goto sel_fail;
+            for(int s2=sB0;s2<S;s2++)
+                if(m->dsa_nsel[s2]!=c->index_topk) goto sel_fail;
+            if(g_dsc_on) g_dsc_pshared++;
+        }
+        sel_arg=m->dsa_sel; sB0_arg=sB0; topk_arg=c->index_topk;
+        if(0){
+sel_fail:
+            if(g_dsc_on){ g_dsc_pfb++; if(g_dsc_pfb<=20)
+                fprintf(stderr,"[DSAC] prefill-fb li=%d\n",layer); }
+            ok=0; goto done;
+        }
+    }
 #ifdef COLI_CUDA
     /* Negativo (2026-07-13): P2P a stella dal device di casa serializza ~95MB/layer
      * sul suo link PCIe — attention 26->41-44s. Resta opt-in per topologie NVLink. */
-    if(out_dev && l->n_kv_b_shard>1 &&
+    if(out_dev && !sel_arg && l->n_kv_b_shard>1 &&
        getenv("COLI_CUDA_PIPE_SHARD") && atoi(getenv("COLI_CUDA_PIPE_SHARD"))){
         /* head-shard nel pipeline: q gia' sul device di casa. Per ogni scheda:
          * slice di q (repack strided->contiguo), broadcast latent+rope via P2P,
@@ -2674,14 +2798,29 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
         static int gemm_pref=-1;
         if(gemm_pref<0){ const char *e=getenv("COLI_PREFILL_GEMM"); gemm_pref=e?atoi(e):1; }
         ok=0;
-        if(out_dev&&gemm_pref&&S>=16)
-            ok=coli_cuda_prefill_attn_gemm(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
-                S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
-        if(!ok)
-            ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
-                    S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
-                      :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
-                    S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+        if(sel_arg){
+            /* selezione attiva: SOLO lo split di fase — niente ripiego denso */
+            float *outd=out_dev;
+            if(gemm_pref){
+                if(!outd) outd=coli_cuda_pipe_scratch(dev,21,xb);
+                if(outd)
+                    ok=coli_cuda_prefill_attn_gemm(l->kv_b.cuda,l->o.cuda,outd,qd,ld_,rd,
+                        S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale,
+                        sel_arg,sB0_arg,topk_arg);
+                if(ok&&!out_dev) ok=coli_cuda_pipe_download(dev,outd,out,xb);
+            }
+            if(!ok&&g_dsc_on){ g_dsc_pfb++; if(g_dsc_pfb<=20)
+                fprintf(stderr,"[DSAC] prefill-attn-fb li=%d\n",layer); }
+        }else{
+            if(out_dev&&gemm_pref&&S>=16)
+                ok=coli_cuda_prefill_attn_gemm(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                    S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale,NULL,0,0);
+            if(!ok)
+                ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                        S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
+                          :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
+                        S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
+        }
     }
     m->t_acore+=now_s()-t0;
 done:
@@ -2749,7 +2888,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     int pipe_done=0;
 #ifdef COLI_CUDA
     if(g_cuda_pipe&&!kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
-       !(m->has_dsa&&pos_base+S>c->index_topk)&&
+       (!(m->has_dsa&&pos_base+S>c->index_topk) ||
+        (dsa_chain_on()&&!g_dsa_force&&S>=16&&m->kv_start[layer]==0))&&
        l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
        l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
        qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
@@ -2785,7 +2925,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
      * (o DSA_FORCE=1 per il test: selezionare TUTTO deve dare l'output denso esatto). */
     const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
-    if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
+    /* pipe_done oltre index_topk: attn_pipe_prefill ha gia' fatto k_idx (device,
+     * scaricato nell'Ic host) e selezione+attenzione — qui non resta nulla. */
+    if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs) &&
+       !(pipe_done && pos_base+S>c->index_topk)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
             /* BATCH-ROWS, come le proiezioni di attenzione sopra: ix_wk (D x index_hd) veniva
@@ -2850,6 +2993,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
                 m->dsa_nsel[s]=nd;
+                seldump(layer,pos,nd,dst);
                 free(qi); free(w32); free(isc); free(tmp);
             }
         }
@@ -4096,17 +4240,22 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
      * riusano m->dsa_sel.  Qualsiasi prerequisito mancante -> return 0: il
      * layer va per intero sul percorso CPU, che ha la semantica completa
      * (MAI il fallback op-by-op denso, che ignorerebbe la selezione). */
-    int sel_active = m->has_dsa && li<c->n_layers && !g_dsa_force &&
+    int sel_active = m->has_dsa && li<c->n_layers && !g_dsa_force && S<=4 &&
                      pos_base>=c->index_topk && m->kv_start[li]==0;
+    /* prefill oltre la soglia: la selezione per riga vive in attn_pipe_prefill
+     * (split di fase).  Se il batch non puo' prenderla (5..15 righe, catena
+     * spenta, kv_start!=0) l'INTERO layer torna su CPU: l'op-by-op denso
+     * ignorerebbe la selezione. */
+    int sel_pref = m->has_dsa && li<c->n_layers && !g_dsa_force && S>4 &&
+                   pos_base+S>c->index_topk;
+    if(sel_pref && !(S>=16 && m->kv_start[li]==0 && dsa_chain_on())) return 0;
     /* COLI_DBG_DSACHAIN=1: contatori d'ingaggio (full/shared ok, fallback e dove) */
-    if(g_dsc_on<0){ g_dsc_on=getenv("COLI_DBG_DSACHAIN")?atoi(getenv("COLI_DBG_DSACHAIN")):0;
-                    if(g_dsc_on) atexit(dsc_report); }
+    dsc_enabled();
     #define DSC_FB(tag) do{ if(g_dsc_on){ g_dsc_fb_pre++; if(g_dsc_fb_pre<=20) \
         fprintf(stderr,"[DSAC] pre-fb %s li=%d\n",tag,li);} return 0; }while(0)
     ColiCudaDsaChain dsac, *pdsa=NULL;
     int chain_did_sel=0;
     if(sel_active){
-        if(S>4) DSC_FB("S");
         if((int64_t)S*c->index_topk > m->dsa_scap){
             free(m->dsa_sel); free(m->dsa_nsel);
             m->dsa_scap=(int64_t)S*c->index_topk;
@@ -4210,8 +4359,9 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
         return 0;
     }
     if(!coli_cuda_pipe_rmsnorm(dev,nrm_d,x_dev,w_in,S,D,c->eps)) return 0;
-    /* DSA: i layer con indexer FULL cachano k_idx dalla nrm pre-attention (CPU, piccolo) */
-    if(m->has_dsa && li<c->n_layers && m->kv_start[li]==0 && c->idx_type[li]){
+    /* DSA: i layer con indexer FULL cachano k_idx dalla nrm pre-attention (CPU, piccolo).
+     * Con sel_pref lo fa attn_pipe_prefill sul device (ombra Ic + download). */
+    if(!sel_pref && m->has_dsa && li<c->n_layers && m->kv_start[li]==0 && c->idx_type[li]){
         if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
         int nh=c->index_nh, hd=c->index_hd; (void)nh;
         for(int s=0;s<S;s++){
@@ -4378,15 +4528,16 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
     size_t xb=(size_t)S*(size_t)D*4;
     int pipe_s_min = getenv("COLI_CUDA_PIPE_S_MIN") ? atoi(getenv("COLI_CUDA_PIPE_S_MIN"))
                                                      : (g_cuda_ndev<=1 ? 1 : 8);
-    /* DSA oltre index_topk: la catena residente ora gestisce la selezione per i
-     * batch decode (S<=4) INTERAMENTE oltre la soglia (fase 2 inc.2); il prefill
-     * (S>=8) e i batch a cavallo della soglia restano sul percorso CPU.
-     * COLI_DSA_CHAIN=0 ripristina il comportamento precedente (tutto CPU). */
-    static int g_dsa_chain=-1;
-    if(g_dsa_chain<0){ const char *e=getenv("COLI_DSA_CHAIN"); g_dsa_chain=e?atoi(e):1; }
+    /* DSA oltre index_topk: la catena residente gestisce la selezione per i
+     * batch decode (S<=4) INTERAMENTE oltre la soglia (fase 2 inc.2); i batch
+     * prefill (S>=16) fanno la selezione per riga nel percorso GEMM (inc.3,
+     * split di fase in attn_pipe_prefill).  Batch 5..15 e batch decode a
+     * cavallo della soglia restano sul percorso CPU.  COLI_DSA_CHAIN=0
+     * ripristina il comportamento tutto-CPU. */
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 (!(m->has_dsa && pos_base+S>c->index_topk) ||
-                 (g_dsa_chain && !g_dsa_force && S<=4 && pos_base>=c->index_topk));
+                 (dsa_chain_on() && !g_dsa_force &&
+                  (S<=4 ? pos_base>=c->index_topk : S>=16)));
     /* TAP/INJECT leggono/scrivono il residuo HOST dopo ogni layer; sotto PIPE2 x resta
      * sul device (stale sul host) -> i hook vedrebbero dati morti. Niente fallback muti. */
     if(pipe2 && (g_tap_l>=0 || g_inj_l>=0)){
