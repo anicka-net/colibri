@@ -17,7 +17,7 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context) — short-context tax REMOVED, selection-in-chain open
+### 1. DSA sparse attention + IndexShare (long context) — decode WINS past ~4k (+20% @6.7k); open: prefill sel-absorb TC gather, then T>8192 cap lift
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
 (`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
@@ -358,6 +358,38 @@ the deployed path.  Revisit only with a measured concurrent/ragged workload.
 Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
+
+#### DSA phase 2 — 6.7k benchmark + DRAFT=1 composition (measured 2026-07-19)
+Four runs on tekton, 6711-token prompt (2701 for the short DRAFT point),
+frozen usage warmed on the 2.7k prompt, TEMP=0, NGEN=128:
+
+| config | prefill | decode | hit | notes |
+|---|---|---|---|---|
+| dense @6.7k | 411.1 s | 3.19 tok/s | 71.9% | attn 31.1 s/128 tok |
+| DSA @6.7k | 523.2 s | **3.82 tok/s** | 73.6% | attn 24.7 s; fb 0 |
+| DSA+DRAFT=1 @2.8k | 75.4 s | 4.85 tok/s | 90.6% | 88% acc, 1.88 tok/fwd |
+| DSA+DRAFT=1 @6.7k | 547.5 s | 4.02 tok/s | 69.9% | 84% acc, 1.86 tok/fwd |
+
+Findings: (1) **DSA decode advantage is real and grows with T**: +20% at
+6.7k (was −13% at 2.8k), attention 24.7 vs 31.1 s — the crossover is behind
+us and DSA stays ~flat while dense grows linearly.  Engagement clean, zero
+fallbacks in all runs.  Both configs pay the same ~72% hit-rate penalty
+(usage frozen on 2.7k), so the ratio is trustworthy.  (2) **DSA prefill
+REGRESSES at 6.7k**: +112 s vs dense, all of it attention (169.2 vs 58.4 s,
+score-softmax-value 164.5 vs 53.9 s).  Cause: phase-B rows use the batched
+sel-absorb kernel (plain fp loads over ns=2048/row) while dense rides the
+TC GEMM; at 6.7k mean causal length ~3.3k is only 1.6x the sel width, so
+the op saving cannot cover the per-op throughput gap.  Estimated crossover
+without a fix ~20k+.  Fix direction: gather the selected KV rows into a
+contiguous buffer and run the absorb as a TC GEMM per row-tile (or extend
+W4A16 TC path to the gathered case).  (3) **MTP composes with DSA
+correctly** — 88%/84% acceptance, selection reused across draft rows, fb 0
+— but end-to-end gain is only ~4-5% because an S=2 forward costs nearly
+2x an S=1 forward (the known small-S GPU-forward blocker; MTP payoff
+remains parked on it).  Decision from the numbers: prefill sel-absorb TC
+gather is now the top DSA lever (blocks recommending DSA-on as default);
+the T>8192 cap lift is what exploits the decode win at 16k+;
+index_topk_freq=4 demoted (decode already ahead of dense).
 
 #### DSA phase 2, increment 3 — per-row PREFILL selection (landed)
 `attn_pipe_prefill` now handles batches crossing/past index_topk with a phase
