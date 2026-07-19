@@ -860,12 +860,17 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             "self_attn.q_a_proj.weight","self_attn.q_b_proj.weight","self_attn.kv_a_proj_with_mqa.weight",
             "self_attn.kv_b_proj.weight","self_attn.o_proj.weight","mlp.gate.weight",
             "mlp.shared_experts.gate_proj.weight","mlp.shared_experts.down_proj.weight",
-            "mlp.experts.0.gate_proj.weight","mlp.experts.255.down_proj.weight"};
+            "mlp.experts.0.gate_proj.weight"};
         char mn[256]; m->has_mtp=1;
         for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
             snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
             if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
         }
+        /* probe the LAST expert by index, not a fixed 255: REAP-pruned
+         * checkpoints have n_routed_experts < 256 and the MTP set stays complete,
+         * so a hardcoded expert.255 would spuriously report has_mtp=0 on them. */
+        snprintf(mn,sizeof(mn),"model.layers.%d.mlp.experts.%d.down_proj.weight",c->n_layers,c->n_experts-1);
+        if(!st_has(&m->S,mn)) m->has_mtp=0;
         if(getenv("MTP") && atoi(getenv("MTP"))==0) m->has_mtp=0;
         if(m->has_mtp){
             int i=c->n_layers; Layer *l=&m->mtpL;
