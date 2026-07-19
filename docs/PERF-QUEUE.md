@@ -272,6 +272,32 @@ where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
+### 7b. Precomputed prefix KV caches (agentic time-to-first-token)
+Every new CLI/agent conversation re-prefills the same multi-thousand-token tool
+system prompt.  At the measured prefill rates that is ~2 min for a 5k prompt —
+paid per fresh session, and it dwarfs everything else in the interactive path.
+The persistence format is ALREADY sufficient: `kv_disk_append` writes, per
+token, the token id plus every layer's `Lc`/`Rc` **and the DSA `Ic` indexer
+rows**, and `kv_hdr` binds layers/kv_lora/qk_rope/index_hd/n_ic/vocab, so a
+restored prefix needs no re-scoring and a mismatched model is rejected.  Record
+size is `4 + n_layers*(kv_lora+qk_rope)*4 + n_ic*index_hd*4` = **~215 KB/token**
+here: 1.1 GB for 5k tokens, ~1 s to read from NVMe versus ~150 s to recompute —
+two orders of magnitude.
+What is missing is only the plumbing around it:
+- **A keyed library** instead of one live file per slot: content-hash the
+  leading token run, store `<cache>/<hash>.kv`, look up on request.  Today
+  `$SNAP/.coli_kv` IS the conversation, and it is overwritten as the turn
+  proceeds.
+- **Read-only prefixes with copy-on-write**: loading a shared prefix must not
+  let the continuing conversation append into it.
+- **Longest-prefix match at submit time**, replacing the current
+  compare-against-this-slot's-own-history (`mux_submit` / raw-API path).
+- **Storage location**: on a tmpfs-snapshot host `$SNAP/.coli_kv` costs RAM;
+  a prefix library belongs on real disk.
+- Note RoPE bakes ABSOLUTE positions in, so a cache is only valid at position 0
+  and two prefixes cannot be concatenated — fine for system prompts, which is
+  exactly the use case.
+
 ### 8. Multi-user serving (reliability first, pipelining later)
 Findings from the 2026-07-19 serve-path review.  What EXISTS: per-slot KV
 isolation + prefix reuse in both serve modes (requests diff against slot
