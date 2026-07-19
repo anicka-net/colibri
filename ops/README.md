@@ -23,7 +23,7 @@ loginctl enable-linger "$USER"
 ```
 
 Two example env files ship here: `service.env.example` (unified-memory /
-Spark-class hosts) and `service.env.tekton.example` (discrete multi-GPU,
+Spark-class hosts) and `service.env.multigpu.example` (discrete multi-GPU,
 "profile A").  **Start from the one that matches the machine** — they differ in
 settings that silently cost an order of magnitude, notably `AUTOPIN`, which must
 NOT be disabled where a VRAM expert tier is used.  The hardware-tuning skill

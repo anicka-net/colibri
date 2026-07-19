@@ -191,7 +191,7 @@ tok/forward) vs MTP=0 **5.50 tok/s** — MTP is already (barely) ahead at
 2.8k, so the crossover sits below that; the gap should widen with T.
 
 #### Long-context rerun after the determinism fix (canonical numbers)
-2701-token prompt, tekton, `COLI_PREFILL_GEMM=1 COLI_CUDA_TC_W4A16=1`,
+2701-token prompt, discrete multi-GPU host, `COLI_PREFILL_GEMM=1 COLI_CUDA_TC_W4A16=1`,
 frozen usage warmed on the workload (hit 82-93%):
 | config | prefill | decode @2.8k |
 |---|---|---|
@@ -583,7 +583,7 @@ reference, same inputs, same lists): worst per-row rel err 2.8e-3 @topk=128
 / 2.6e-3 @topk=2048 (mag 1x), 6.3e-2 @mag 30x — the same fp16-rounding class
 as the landed prefill GEMM.  In-model 16-token greedy continuation
 bit-identical to the scalar path at 2.7k.
-WAR STORY (cost: one wedged H100 + a tekton reboot): the first harness
+WAR STORY (cost: one wedged H100 + a host reboot): the first harness
 version under-allocated the sel buffer — `coli_cuda_prefill_attn_gemm`
 reads `sel_host+sB0*topk`, i.e. the array covers ALL S rows like
 `m->dsa_sel`, not just phase-B rows.  The host OOB shipped garbage indices
@@ -592,11 +592,11 @@ R-state process, nvidia-smi hung, no watchdog on datacenter GPUs).
 `dsa_gather_sel` now clamps indices to [0,T) — a corrupt selection can
 produce wrong output but never touch wild VA.  Post-reboot, CUDA refused to
 init (error 3, zero diagnostics anywhere) until `nvidia_uvm` was reloaded
-with `uvm_disable_hmm=1` — tekton's modprobe.d had that option for a
+with `uvm_disable_hmm=1` — the host's modprobe.d had that option for a
 reason (open-gpu-kernel-modules #780/#797).
 
 #### DSA phase 2 — 6.7k benchmark + DRAFT=1 composition (measured 2026-07-19)
-Four runs on tekton, 6711-token prompt (2701 for the short DRAFT point),
+Four runs on the discrete multi-GPU host, 6711-token prompt (2701 for the short DRAFT point),
 frozen usage warmed on the 2.7k prompt, TEMP=0, NGEN=128:
 
 | config | prefill | decode | hit | notes |

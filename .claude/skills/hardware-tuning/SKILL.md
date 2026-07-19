@@ -43,7 +43,7 @@ DIRECT=0 ./glm 256 4 4
 
 ### Running Profile A as a persistent service
 
-`ops/service.env.tekton.example` + `ops/systemd/` (see `ops/README.md`).  Build
+`ops/service.env.multigpu.example` + `ops/systemd/` (see `ops/README.md`).  Build
 the env file **from the profile above**, not from `service.env.example` — that
 one is the unified-memory profile and carries settings that are actively wrong
 here.  Measured gotchas, each of which produced a working-but-wrong service:
