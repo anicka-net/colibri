@@ -6005,7 +6005,7 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
 }
 
 typedef struct {
-    int active, pending, emitted, maximum, prompt_tokens, length_limited;
+    int active, pending, emitted, maximum, prompt_tokens, prof_tokens, length_limited;
     unsigned long long id;
     float temp, top_p;
     double started;
@@ -6048,7 +6048,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
-    if(g_prof) prof_report(m,&r->pb,dt,r->prompt_tokens+r->emitted,stderr);
+    if(g_prof) prof_report(m,&r->pb,dt,r->prof_tokens+r->emitted,stderr);
     r->active=0;
 }
 
@@ -6109,7 +6109,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     adaptive_cap_set(m,planned);
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
-    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    r->prompt_tokens=nt; r->prof_tokens=add>0?add:1;
+    r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
     prof_base(m,&r->pb);
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);

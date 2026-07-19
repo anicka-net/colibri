@@ -285,6 +285,8 @@ horizon; late correction alone cannot hide the NVMe read.
 - Spark removing the CUDA tier while retaining the production-sized cache:
   cap 36 is neutral; the useful no-tier result requires the short-context
   cap-63 profile.
+- Spark production W4A16 alone: pipe0 leaves almost all large-batch routed
+  work on CPU, so the same frozen 260-token prefill stayed at 86 s.
 - MTP-head route prediction: recall@8 is 6.2%; the final residual does not
   preserve early/mid-layer routing.
 - CUDA graphs for the decode chain: execution-bound, graphs were slightly slower.
@@ -309,18 +311,30 @@ horizon; late correction alone cannot hide the NVMe read.
    tokens: **1.21 -> 1.43 tok/s**, hit 76.1% -> 83.7%, RSS 38.3 -> 67.1 GB,
    no swap.  Lifecycle probe grew 17->42, shrank 42->22 before a 100k-token
    request, then cancelled cleanly.  Deployed on the production mux service.
-2. **Learned low-rank early route correction.**  Train a small correction to
+2. **Pipe0 CUDA prefill — IMPLEMENTED, opt-in.**  Production profiling first
+   exposed that mux request timers started after `step()`, excluding the whole
+   prefill; the corrected 2813-token run took 19m10s.  On a frozen 260-token
+   prompt the pipe0 baseline was 86 s: expert matmul 56%, attention 29%, felt
+   I/O 7%.  `COLI_CUDA_PREFILL=1` runs large contiguous attention and expert
+   batches on CUDA without allocating pipe1/2's full-context device KV shadows.
+   Splitting resident and missed expert groups lets async reads overlap the
+   resident CUDA pass.  Result: **86 -> 64 s (26% faster)** with W4A16, or 67 s
+   without it; the baseline and fast path produced the same 16-token greedy
+   continuation.  The remaining cold-run bottleneck is expert I/O (26 s felt
+   wait, 41% wall time).  DSA contexts beyond `index_topk` retain the existing
+   CPU attention path so this mode cannot allocate the full-size `Ic` shadow.
+3. **Learned low-rank early route correction.**  Train a small correction to
    the stale L+1 router logits from the same full-layer-horizon state.  Compare
    cross-prompt K6 recall against two-step and require enough gain to survive
    inference overhead before wiring any prefetch.
-3. **Deadline-aware pilot queue.**  Instrument rank, enqueue layer, completion,
+4. **Deadline-aware pilot queue.**  Instrument rank, enqueue layer, completion,
    demand use, and eviction.  If useful predictions are completing behind
    low-confidence work, prioritize by deadline/confidence and drop stale queue
    entries.  The K2/K4 regressions show that simply reducing breadth is wrong.
-4. **Learned eviction/reuse scoring.**  Belady's 89-91% ceiling leaves real
+5. **Learned eviction/reuse scoring.**  Belady's 89-91% ceiling leaves real
    headroom over LRU's 77%.  Test offline using recency, frequency, layer, and
    routed-set context; only proceed if it transfers across prompts.
-5. **Two-layer-horizon prediction.**  Evaluate exact and learned L+2 at equal
+6. **Two-layer-horizon prediction.**  Evaluate exact and learned L+2 at equal
    K6 budget only after the above.  Coupling depth 2 already showed the failure
    mode: extra lead time is worthless when accuracy causes cache pollution.
 
