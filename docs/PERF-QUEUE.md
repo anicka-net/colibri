@@ -296,13 +296,19 @@ horizon; late correction alone cannot hide the NVMe read.
   strong-CPU hosts; knob `COLI_FUSE_SHARED=1` exists for weak-CPU machines.
 
 ## Next Spark experiments
-1. **Adaptive expert-cache capacity.**  The 131k planner reserves full-context
-   KV and attention workspace up front, although their pages/cost grow with the
-   live context.  Start with more LRU slots for short requests, then evict and
-   free slots before KV growth needs the RAM.  This directly attacks the
-   cap-17/cap-63 gap without changing routing or model computation.  First gate:
-   replay the cap schedule from the existing trace and prove a safe memory
-   watermark; do not implement runtime resizing before that.
+1. **Adaptive expert-cache capacity — IMPLEMENTED, opt-in.**  The 131k planner
+   reserves full-context KV and attention workspace up front, although their
+   pages/cost grow with the live context.  `COLI_ADAPTIVE_CAP=1` borrows that
+   untouched RAM at request boundaries and returns it before the request's
+   declared maximum context can need it.  It is deliberately limited to
+   `KV_SLOTS=1`, `COLI_CUDA_PIPE=0`, and non-mmap serve mode.  Truncated KV pages
+   remain physically resident, so a monotonic high-water mark prevents unsafe
+   cache regrowth; transient attention scratch can still be reclaimed.
+   Offline trace replay: cap 17 = 66.2% LRU hit, short-request cap 42 = 87.6%.
+   Live mux A/B with frozen placement, 131k production settings, 64 greedy
+   tokens: **1.21 -> 1.43 tok/s**, hit 76.1% -> 83.7%, RSS 38.3 -> 67.1 GB,
+   no swap.  Lifecycle probe grew 17->42, shrank 42->22 before a 100k-token
+   request, then cancelled cleanly.  Keep opt-in until merged production soak.
 2. **Learned low-rank early route correction.**  Train a small correction to
    the stale L+1 router logits from the same full-layer-horizon state.  Compare
    cross-prompt K6 recall against two-step and require enough gain to survive

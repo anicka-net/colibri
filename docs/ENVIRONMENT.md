@@ -46,6 +46,8 @@ Format: `VAR` — default — effect.
 | `COLI_NUMA` | off (Linux only) | `COLI_NUMA=1` interleaves expert slabs across NUMA nodes via `mbind` (raw syscall, no libnuma). Helps multi-socket hosts (+7–40% expert matmul); silent no-op on single-node or non-Linux. |
 | `MLOCK` | `-1` (auto: on for macOS) | Wire the streamed expert cache into physical RAM (`mlock`) to dodge the memory compressor. `0` off, `1` force. |
 | `CAP_RAISE` | `1` (on) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. |
+| `COLI_ADAPTIVE_CAP` | `0` (off) | GB10 serve experiment: with `KV_SLOTS=1`, `COLI_CUDA_PIPE=0`, and non-mmap experts, borrow RAM reserved for future KV/workspace pages and resize the LRU at request boundaries according to the request's maximum context. The startup cap remains the safe full-context floor. A KV high-water mark prevents regrowth into pages touched before a prefix truncation/reset. |
+| `COLI_ADAPTIVE_CAP_MARGIN` | `4096` | Extra context tokens reserved when `COLI_ADAPTIVE_CAP=1`; larger values shrink the cache earlier. |
 | `PREFETCH` | `0` | Prefetch depth for streamed experts. |
 | `COLI_MMAP` | `0` | `mmap` the weights instead of read()-ing into slabs. |
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |

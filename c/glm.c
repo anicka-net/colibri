@@ -180,7 +180,7 @@ typedef struct {
     float **Lc, **Rc; int max_t;                 /* alias della KVState attiva */
     int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
     KVState *kv;
-    ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
+    ESlot **ecache; int *ecn; int ecap, ecap_alloc; /* active / allocated LRU slots per layer */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
@@ -1591,7 +1591,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->final_norm = ld(m,"model.norm.weight");
     m->L=calloc(c->n_layers,sizeof(Layer));
     int NR=c->n_layers+1;                        /* +1: riga del layer MTP */
-    m->ecap=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
+    m->ecap=m->ecap_alloc=cap; m->ecache=calloc(NR,sizeof(ESlot*)); m->ecn=calloc(NR,sizeof(int));
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
@@ -5546,6 +5546,8 @@ out:
 
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
+static void adaptive_cap_set(Model *m, int planned_ctx);
+static void adaptive_cap_note_used(int used_ctx);
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -5593,6 +5595,7 @@ static void mux_data(Tok *T, unsigned long long id, int token){
 }
 
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
+    adaptive_cap_note_used(sc->len);
     double dt=now_s()-r->started; if(dt<1e-6) dt=1e-6;
     double dh=(double)(m->hits-r->hits0), dm=(double)(m->miss-r->miss0);
     hwinfo_emit(m);
@@ -5664,6 +5667,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
         printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(raw); free(line); return 0;
     }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
+    adaptive_cap_note_used(sc->len);
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
     int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-2);
@@ -5674,6 +5678,9 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
         kv_disk_truncate(m,sc->len); }
     int add=nt-sc->len;
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
+    int64_t planned64=(int64_t)nt+sub.max_tokens;
+    int planned=planned64>maxctx?maxctx:(int)planned64;
+    adaptive_cap_set(m,planned);
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
@@ -5703,7 +5710,8 @@ static void run_serve_mux(Model *m, const char *snap){
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
-    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    for(int i=0;i<nctx;i++){ serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+        adaptive_cap_note_used(ctx[i].len); }
 #ifdef _WIN32
     /* Same byte-exact protocol as run_serve: in TEXT mode the CRT collapses CRLF in
      * fread() payloads (waits forever for the missing bytes) and expands LF on the
@@ -5819,7 +5827,8 @@ static void run_serve(Model *m, const char *snap){
     if(nctx<1||nctx>16){ fprintf(stderr,"KV_SLOTS must be between 1 and 16\n"); exit(2); }
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(ServeCtx));
-    for(int i=0;i<nctx;i++) serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+    for(int i=0;i<nctx;i++){ serve_ctx_init(m,&ctx[i],snap,i,maxctx);
+        adaptive_cap_note_used(ctx[i].len); }
     int active=0; ServeCtx *sc=&ctx[0]; kv_bind(m,&sc->kv);
     fprintf(stderr,"[KV] context slots: %d x %d tokens, projected pool %.2f GB\n",
         nctx,maxctx,kv_pool_bytes(m,maxctx)/1e9);
@@ -5833,13 +5842,15 @@ static void run_serve(Model *m, const char *snap){
     while((nr=getline(&line,&cap,stdin))>0){
         g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
-        if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+        if(!strcmp(line,"\x02RESET")){ adaptive_cap_note_used(len);
+            len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
             kv_disk_reset(m);
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
             la storia e' gia' in KV, basta ri-forwardare l'ULTIMO token per riavere i logits */
             if(len<1){ printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
             int cur=ngen; if(len+cur+g_draft+2>=maxctx) cur=maxctx-len-g_draft-2;
+            adaptive_cap_set(m,len+cur);
             uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
             ProfBase pb; if(g_prof) prof_base(m,&pb);
             float *logit=step(m,hist+len-1,1,len-1);
@@ -5880,6 +5891,7 @@ static void run_serve(Model *m, const char *snap){
             if(req_ngen>ngen) req_ngen=ngen;
             g_temp=(float)rt; g_nuc=(float)rp;
         } else { active=0; sc=&ctx[0]; kv_bind(m,&sc->kv); }
+        adaptive_cap_note_used(len);
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
         /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
          * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
@@ -5916,6 +5928,7 @@ static void run_serve(Model *m, const char *snap){
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
         first=0;
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
+        adaptive_cap_set(m,len+k+cur);
         uint64_t h0=m->hits, ms0=m->miss;
         uint64_t rs0=m->route_slots, rw0=m->route_swaps;
         uint64_t agh0=m->route_agree_hit, agt0=m->route_agree_tot;
@@ -6547,11 +6560,114 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
                 "(projected peak %.1f GB; set CAP_RAISE=0 to disable)\n",
                 ram_gb, auto_b?" auto":"", m->ecap, newcap,
                 (m->resident_bytes + (double)newcap*nsp*eb + slack)/1e9);
-            m->ecap=newcap;
+            m->ecap=m->ecap_alloc=newcap;
         } else
             fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
                 (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
     }
+}
+
+/* GB10 serve profile: borrow the RAM reserved for untouched future KV/workspace
+ * pages, then return it before a request can grow into that context.  Resizing is
+ * request-boundary only; model computation and routing stay unchanged. */
+static int g_adaptive_cap=0, g_adaptive_cap_floor=0, g_adaptive_cap_maxctx=0;
+static int g_adaptive_cap_margin=4096, g_adaptive_cap_highwater=0;
+static double g_adaptive_cap_kv_token_b=0, g_adaptive_cap_scratch_token_b=0;
+static double g_adaptive_cap_slot_b=0;
+
+static int adaptive_cap_target(Model *m, int planned_ctx){
+    int64_t guarded64=(int64_t)planned_ctx+g_adaptive_cap_margin;
+    int guarded=guarded64<0?0:
+        guarded64>g_adaptive_cap_maxctx?g_adaptive_cap_maxctx:(int)guarded64;
+    int kv_guarded=guarded>g_adaptive_cap_highwater?guarded:g_adaptive_cap_highwater;
+    double free_b=(double)(g_adaptive_cap_maxctx-kv_guarded)*g_adaptive_cap_kv_token_b
+        +(double)(g_adaptive_cap_maxctx-guarded)*g_adaptive_cap_scratch_token_b;
+    int cap=g_adaptive_cap_floor+(int)(free_b/g_adaptive_cap_slot_b);
+    if(cap>m->ecap_alloc) cap=m->ecap_alloc;
+    if(cap<g_adaptive_cap_floor) cap=g_adaptive_cap_floor;
+    return cap;
+}
+
+static void adaptive_cap_note_used(int used_ctx){
+    if(g_adaptive_cap && used_ctx>g_adaptive_cap_highwater)
+        g_adaptive_cap_highwater=used_ctx;
+}
+
+static void adaptive_cap_set(Model *m, int planned_ctx){
+    if(!g_adaptive_cap) return;
+    int target=adaptive_cap_target(m,planned_ctx);
+    if(target==m->ecap) return;
+#ifdef COLI_CUDA
+    while(__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)!=
+          __atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE)) usleep(200);
+    pthread_mutex_lock(&g_pilot_mx);
+    for(;;){
+        int busy=0;
+        for(int i=0;i<256;i++) busy+=g_pilot_inflight[i];
+        if(!busy) break;
+        pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
+    }
+    if(target<m->ecap){
+        for(int l=0;l<=m->c.n_layers;l++) if(m->ecache[l]){
+            ESlot *s=m->ecache[l]; int *nn=&m->ecn[l];
+            while(*nn>target){
+                int zmin=0;
+                for(int z=1;z<*nn;z++) if(s[z].used<s[zmin].used) zmin=z;
+                expert_host_release(m,&s[zmin]);
+                if(zmin!=*nn-1) s[zmin]=s[*nn-1];
+                memset(&s[*nn-1],0,sizeof(*s));
+                (*nn)--;
+            }
+        }
+    }
+    fprintf(stderr,"[ADAPTIVE_CAP] context <= %d + margin %d: cap %d -> %d\n",
+        planned_ctx,g_adaptive_cap_margin,m->ecap,target);
+    m->ecap=target;
+    pthread_mutex_unlock(&g_pilot_mx);
+#else
+    (void)m; (void)planned_ctx;
+#endif
+}
+
+static void adaptive_cap_init(Model *m, int maxctx){
+    const char *e=getenv("COLI_ADAPTIVE_CAP");
+    if(!e || !atoi(e)) return;
+#ifndef COLI_CUDA
+    fprintf(stderr,"COLI_ADAPTIVE_CAP requires a CUDA build\n"); exit(2);
+#else
+    if(!getenv("SERVE")){ fprintf(stderr,"COLI_ADAPTIVE_CAP requires SERVE=1\n"); exit(2); }
+    if(kv_slot_count()!=1){ fprintf(stderr,"COLI_ADAPTIVE_CAP currently requires KV_SLOTS=1\n"); exit(2); }
+    if(g_mmap){ fprintf(stderr,"COLI_ADAPTIVE_CAP is incompatible with COLI_MMAP=1\n"); exit(2); }
+    if(g_cuda_pipe){ fprintf(stderr,"COLI_ADAPTIVE_CAP requires COLI_CUDA_PIPE=0\n"); exit(2); }
+    if((e=getenv("COLI_ADAPTIVE_CAP_MARGIN"))) g_adaptive_cap_margin=atoi(e);
+    if(g_adaptive_cap_margin<0) g_adaptive_cap_margin=0;
+    Cfg *c=&m->c; int rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    if(m->has_mtp) rows+=2;
+    g_adaptive_cap_floor=m->ecap; g_adaptive_cap_maxctx=maxctx;
+    g_adaptive_cap_kv_token_b=kv_pool_bytes(m,1);
+    g_adaptive_cap_scratch_token_b=(double)c->n_heads*(c->qk_nope+c->v_head)*4.0;
+    g_adaptive_cap_slot_b=(double)rows*expert_bytes_probe(m,m->ebits);
+    int maxcap=g_adaptive_cap_floor+
+        (int)((double)maxctx*(g_adaptive_cap_kv_token_b+g_adaptive_cap_scratch_token_b)
+              /g_adaptive_cap_slot_b);
+    if(maxcap>c->n_experts) maxcap=c->n_experts;
+    if(maxcap>m->ecap_alloc){
+        for(int i=0;i<=c->n_layers;i++) if(m->ecache[i]){
+            ESlot *grown=realloc(m->ecache[i],(size_t)maxcap*sizeof(ESlot));
+            if(!grown){ fprintf(stderr,"OOM adaptive expert cache slots\n"); exit(1); }
+            m->ecache[i]=grown;
+            memset(m->ecache[i]+m->ecap_alloc,0,
+                   (size_t)(maxcap-m->ecap_alloc)*sizeof(ESlot));
+        }
+        m->ecap_alloc=maxcap;
+    }
+    g_adaptive_cap=1;
+    fprintf(stderr,"[ADAPTIVE_CAP] active: floor %d at %d tokens, max %d, margin %d "
+        "(one cap step per %.0f tokens)\n",g_adaptive_cap_floor,maxctx,m->ecap_alloc,
+        g_adaptive_cap_margin,g_adaptive_cap_slot_b/
+        (g_adaptive_cap_kv_token_b+g_adaptive_cap_scratch_token_b));
+#endif
 }
 
 /* The user's generation prompt. COLI_PROMPT is honored on every platform; a bare
@@ -6941,6 +7057,7 @@ int main(int argc, char **argv){
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx);
+      adaptive_cap_init(&m,est_ctx);
       g_prof = getenv("PROF")?atoi(getenv("PROF")):0;   /* PROF=1: opt-in performance profile */
       if(g_prof) prof_config(&m, ram_env, est_ctx); }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
