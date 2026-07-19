@@ -20,8 +20,12 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 ### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: index_topk_freq, IndexShare
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
-(`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
-reuses the selection for MTP drafts.  Below ~2k context this changes nothing;
+(`index_topk`), recomputed every token, and `index_share_for_mtp_iteration=True`
+reuses the selection for MTP drafts.  (CORRECTION 2026-07-19: `index_topk_freq`
+in the config is the FULL/SHARED *layer pattern* formula — freq=4/offset=3
+generates exactly the 21-full `indexer_types` list; verified against the HF
+reference, which has no temporal refresh.  Any decode-time refresh period is an
+approximation, not native semantics.)  Below ~2k context this changes nothing;
 past it, our attention grows linearly while native stays ~flat — and MTP verify
 pays attention twice.
 - Extraction: DONE 2026-07-18 — only 20 of 141 shards carry indexer tensors
@@ -344,6 +348,40 @@ horizon; late correction alone cannot hide the NVMe read.
 6. **Two-layer-horizon prediction.**  Evaluate exact and learned L+2 at equal
    K6 budget only after the above.  Coupling depth 2 already showed the failure
    mode: extra lead time is worthless when accuracy causes cache pollution.
+7. **Blackwell sm_121 tensor-core formats (Spark prefill/batch only).**  Decode
+   stays expert-streaming/hit-rate bound, so consumer-Blackwell features pay off
+   only in the compute-bound paths — pipe0 prefill batches and the DSA TC-gather
+   GEMMs.  Honest ranking:
+   - **Block-scaled FP8 MMA (W4A8) — first.**  sm_120/121 add native MMA on
+     block-scaled microscaling formats (mxfp8/nvfp4); our int4-with-block-scales
+     is structurally the same thing.  Signed nibbles (−8…7) upcast EXACTLY into
+     fp8 e4m3 (3 mantissa bits cover those integers), so an in-register
+     int4→fp8 dequant feeding fp8 block-scaled MMA keeps weight fidelity while
+     roughly doubling MMA throughput over the fp16 WMMA in `w4a16_*` /
+     `gemm_f16_tc*` and halving activation traffic.  Only the activation
+     quantization is lossy — per-block scales should keep it in the accepted
+     fp16-class band, but verify with the frozen-usage greedy oracle.  The
+     kernels to convert are exactly the Spark prefill hot spots (86→64 s pipe0
+     result, 2.8k DSA prefill).
+   - **nvfp4 — quality-gated experiment after.**  e2m1's value set
+     {0, ±0.5…±6} is NOT a superset of int4 levels, so it needs requantization.
+     This is "our W4A16 problem in hardware" — and the reason Hopper W4A4
+     (`COLI_CUDA_TC_INT4`, measured dead end) lost: no block-scaled formats, so
+     scales were applied in software and precision died.  Blackwell moves that
+     into the MMA instruction.
+   - **TMA bulk-copy pipelining — distant third.**  `dsa_gather_sel`, absorb,
+     and prefill GEMM tiles stage global→smem by hand; TMA (Hopper-era, kept on
+     sm_121) would improve compute/copy overlap, but the GB10 ceiling is shared
+     LPDDR5x bandwidth, so expect modest gains.
+   - **Offline ptxas for compute_121 — hygiene.**  Kills first-run JIT and gets
+     Blackwell scheduling; low single digits at best.
+   Caveats: sm_120/121 dropped thread-block clusters/wgmma-style paths, and the
+   opt-in shared memory is ~99 KB vs H100's 227 KB — with the inc.5 smem
+   formula ((2K+T+256)×4 B) the Spark dense-absorb ceiling is ~24k regardless
+   of build arch, which makes DSA's topk-bounded smem MORE valuable on Spark
+   than on Hopper.  sm_121 does NOT help: decode gemv (bandwidth-bound, int4
+   already minimal bytes), expert-miss economics (NVMe/LPDDR bound), or the
+   small-S MTP blocker (launch latency, not MMA format).
 
 ### Upstream weekend review (2026-07-19)
 
