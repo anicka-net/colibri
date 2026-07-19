@@ -321,8 +321,15 @@ horizon; late correction alone cannot hide the NVMe read.
    resident CUDA pass.  Result: **86 -> 64 s (26% faster)** with W4A16, or 67 s
    without it; the baseline and fast path produced the same 16-token greedy
    continuation.  The remaining cold-run bottleneck is expert I/O (26 s felt
-   wait, 41% wall time).  DSA contexts beyond `index_topk` retain the existing
-   CPU attention path so this mode cannot allocate the full-size `Ic` shadow.
+   wait, 41% wall time).  The initial implementation kept DSA contexts beyond
+   `index_topk` on CPU to avoid allocating the full-size `Ic` shadow.
+   UPDATE after installing the missing 227 MB indexer artifact: the CPU DSA
+   path took 15m38s on the frozen 2813-token prompt, versus 8m16s dense.
+   Prompt-sized transient device `Ic` storage now lets the CUDA DSA prefill
+   path run without a 131k shadow: **15m38s -> 5m53s (2.66x)**, also 29% faster
+   than dense.  The first greedy token matched the CPU-DSA run; engine swap
+   remained zero.  Attention fell from 74% to 21% of wall time, moving the
+   bottleneck to CUDA expert matmul (54%).
 3. **Learned low-rank early route correction.**  Train a small correction to
    the stale L+1 router logits from the same full-layer-horizon state.  Compare
    cross-prompt K6 recall against two-step and require enough gain to survive

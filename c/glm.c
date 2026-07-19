@@ -2760,7 +2760,17 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
             float *knw=layer<256?pipe_ln_cache(dev,layer,5,m->ix_knw[layer],(size_t)c->index_hd):NULL;
             float *knb=layer<256?pipe_ln_cache(dev,layer,6,m->ix_knb[layer],(size_t)c->index_hd):NULL;
             if(!knw||!knb) goto sel_fail;
-            if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
+            float *d_ic=NULL;
+            if(g_cuda_pipe){
+                if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
+                d_ic=m->kv->cuda_Ic[layer];
+            }else{
+                size_t icb=(size_t)(pos_base+S)*c->index_hd*4;
+                d_ic=coli_cuda_pipe_scratch(dev,22,icb);
+                if(!d_ic) goto sel_fail;
+                if(pos_base>0&&!coli_cuda_pipe_upload(dev,d_ic,m->Ic[layer],
+                    (size_t)pos_base*c->index_hd*4)) goto sel_fail;
+            }
             static float *pisc=NULL; static size_t pisc_cap=0;
             size_t need=(size_t)(S-sB0)*(pos_base+S);
             if(need>pisc_cap){
@@ -2770,13 +2780,13 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
             }
             ColiCudaDsaChain dsac; memset(&dsac,0,sizeof dsac);
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
-            dsac.knw_dev=knw; dsac.knb_dev=knb; dsac.d_Ic=m->kv->cuda_Ic[layer];
+            dsac.knw_dev=knw; dsac.knb_dev=knb; dsac.d_Ic=d_ic;
             dsac.nh=c->index_nh; dsac.hd=c->index_hd;
             dsac.ic_host=m->Ic[layer]+(int64_t)pos_base*c->index_hd;
             dsac.iscore_host=pisc;
             if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
                 goto sel_fail;
-            m->kv->cuda_ic_valid[layer]=pos_base+S;
+            if(g_cuda_pipe) m->kv->cuda_ic_valid[layer]=pos_base+S;
             if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
             if(g_dsc_on) g_dsc_pfull++;
         }else{
@@ -2936,7 +2946,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * bit-identical to upstream; the kernel switch is not. */
     int pipe_done=0;
 #ifdef COLI_CUDA
-    if((g_cuda_pipe||(g_cuda_prefill&&!(m->has_dsa&&pos_base+S>c->index_topk)))&&
+    if((g_cuda_pipe||g_cuda_prefill)&&
        !kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
        (!(m->has_dsa&&pos_base+S>c->index_topk) ||
         (dsa_chain_on()&&!g_dsa_force&&S>=16&&m->kv_start[layer]==0))&&
