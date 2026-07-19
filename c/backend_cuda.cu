@@ -1644,11 +1644,24 @@ extern "C" int coli_cuda_pipe_rows_add(int device,float *x_dev,const float *part
     return cuda_ok(cudaGetLastError(),"pipe rows add");
 }
 /* GEMM with device-resident activations: same quant_matmul kernel as
- * coli_cuda_matmul, zero host transfers. */
+ * coli_cuda_matmul, zero host transfers.  For prefill-sized batches the
+ * naive block-per-output kernel is bandwidth-tragic: route int4 tensors
+ * with S>=16 through the w4a16 wmma tiles instead (same math, fp16
+ * activation/weight staging with fp32 accumulate — the same tradeoff as
+ * COLI_CUDA_TC_W4A16 on the expert path).  Decode (S<16) stays on the
+ * exact fp32 kernel.  COLI_PIPE_TC=0 opts out. */
 extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x_dev,
                                    int S){
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
+    static int tc=-1;
+    if(tc<0){ const char *e=getenv("COLI_PIPE_TC"); tc=e?atoi(e):1; }
+    if(tc&&S>=16&&t->fmt==2&&(t->I&15)==0&&ctx->compute_major>=7){
+        dim3 grid((unsigned)((t->O+63)/64),(unsigned)((S+15)/16));
+        w4a16_matmul<<<grid,128>>>(y_dev,x_dev,(const uint8_t*)t->weights,t->scales,
+            S,t->I,t->O);
+        return cuda_ok(cudaGetLastError(),"pipe gemm tc");
+    }
     dim3 grid((unsigned)t->O,(unsigned)S);
     quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
         row_bytes(t->fmt,t->I));

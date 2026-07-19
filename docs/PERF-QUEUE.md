@@ -116,6 +116,22 @@ is NOT a usable bar: expert placement (`.coli_usage` evolves per run)
 makes even two identical GEMM=0 runs diverge after ~16-20 tokens.
 Remaining prefill costs: proj/rope 21 s (pipe_gemm gemv-style — same
 w4a16 treatment applies), experts 40 s, other 13 s.
+UPDATE: pipe_gemm now routes int4 tensors with S>=16 through the w4a16
+wmma tiles (`COLI_PIPE_TC=0` opts out): projection/RoPE 21.0 -> 1.7 s,
+**prefill 78.4 -> 54.0 s (50 tok/s)** on the 2.7k prompt — the shared
+expert's prefill gemms ride the same path.  Decode (S<16) stays on the
+exact fp32 kernel.  Perturbation vs fp32 projections: ~0.06 on the top-1
+logit at 2.7k, same winner; frozen-state pairs are bit-identical.
+
+#### Measured dead end: next-token expert prediction from the MTP head
+`COLI_DBG_MTPROUTE=1` (telemetry, DRAFT>=1) runs every layer's router on
+the MTP block's predicted hidden state and scores it against the next
+forward's true routing.  Result at 2.7k ctx over 256 tokens: recall@8
+6.2%, recall@16 10.2% (random = 3.1%); mid-stack layers ~0%, late layers
+15-20%.  The MTP state approximates the FINAL residual and the residual
+direction rotates too much through the stack to drive early/mid routers.
+Cross-token same-layer prediction (the NLA work) is the viable route for
+the NVMe prefetcher; keep this probe around to re-measure variants.
 
 #### FIXED: softmax shared-memory race = the run-to-run nondeterminism
 Root cause found and fixed (2026-07-19).  Three CUDA attention kernels

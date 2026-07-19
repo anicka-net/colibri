@@ -2982,6 +2982,47 @@ static int expert_is_resident(Model *m, int layer, int eid){
     return 0;
 }
 
+/* ---- MTPROUTE (COLI_DBG_MTPROUTE=1): recall della predizione expert del
+ * token SUCCESSIVO dal hidden state predetto dalla testa MTP.  La testa non
+ * produce solo il token: hx post-blocco approssima lo stato finale della
+ * posizione t+1, e i router di ogni layer girano su quello (78 gemv, niente
+ * forward).  Il numero che serve al predittore NVMe di Spark: quanti degli
+ * expert veri di t+1 stanno nei top-8/top-16 predetti. Telemetria pura. */
+static int g_mtpr_on=-1;
+static int g_mtpr_pred[256][16]; static int g_mtpr_np[256];
+static int64_t g_mtpr_pos=-1, g_mtpr_fwd_base=-1;
+static uint64_t g_mtpr_hit8[256], g_mtpr_hit16[256], g_mtpr_tot[256];
+static void mtpr_report(void){
+    uint64_t h8=0,h16=0,tt=0; int lmin=-1,lmax=-1;
+    for(int l=0;l<256;l++) if(g_mtpr_tot[l]){ h8+=g_mtpr_hit8[l]; h16+=g_mtpr_hit16[l];
+        tt+=g_mtpr_tot[l]; if(lmin<0)lmin=l; lmax=l; }
+    if(!tt) return;
+    fprintf(stderr,"[MTPROUTE] recall@8 %.1f%% recall@16 %.1f%% (layer %d..%d, %llu slot expert)\n",
+        100.0*h8/tt,100.0*h16/tt,lmin,lmax,(unsigned long long)tt);
+    for(int l=lmin;l<=lmax;l+=8) if(g_mtpr_tot[l])
+        fprintf(stderr,"[MTPROUTE]   L%02d r@8 %.1f%% r@16 %.1f%%\n",
+            l,100.0*g_mtpr_hit8[l]/g_mtpr_tot[l],100.0*g_mtpr_hit16[l]/g_mtpr_tot[l]);
+}
+static void mtpr_predict(Model *m, const float *hmtp, int64_t pos){
+    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts;
+    float *nrm=falloc(D), *lg=falloc(E);
+    for(int l=0;l<c->n_layers;l++){
+        Layer *L=&m->L[l];
+        if(!L->sparse){ g_mtpr_np[l]=0; continue; }
+        rmsnorm(nrm, hmtp, L->post_ln, D, c->eps);
+        matmul(lg, nrm, L->router, 1, D, E);
+        for(int e=0;e<E;e++) lg[e]=sigmoidf(lg[e])+L->router_bias[e];
+        int np=16>E?E:16;
+        for(int k=0;k<np;k++){ int b=-1; float bv=-1e30f;
+            for(int e=0;e<E;e++){ int used=0;
+                for(int q=0;q<k;q++) if(g_mtpr_pred[l][q]==e){used=1;break;}
+                if(!used && lg[e]>bv){ bv=lg[e]; b=e; } }
+            g_mtpr_pred[l][k]=b; }
+        g_mtpr_np[l]=np;
+    }
+    g_mtpr_pos=pos;
+    free(nrm); free(lg);
+}
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -3165,6 +3206,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     free(rank_buf); free(rank_w);
     if(g_prof)m->t_route+=now_s()-route_t0;
+    /* MTPROUTE: confronta il routing VERO di questa forward con la predizione
+     * fatta dalla testa MTP al passo precedente (stessa posizione). */
+    if(g_mtpr_on>0 && g_mtpr_pos>=0 && layer<c->n_layers && l->sparse &&
+       g_mtpr_fwd_base>=0 && g_mtpr_np[layer]>0){
+        int s=(int)(g_mtpr_pos-g_mtpr_fwd_base);
+        if(s>=0 && s<S){
+            int np=g_mtpr_np[layer], k8=0, k16=0;
+            for(int kk=0;kk<keff[s];kk++){ int e=idxs[(int64_t)s*K+kk];
+                for(int q=0;q<np;q++) if(g_mtpr_pred[layer][q]==e){ if(q<8)k8++; k16++; break; } }
+            g_mtpr_hit8[layer]+=(uint64_t)k8; g_mtpr_hit16[layer]+=(uint64_t)k16;
+            g_mtpr_tot[layer]+=(uint64_t)keff[s];
+        }
+    }
     if(g_route_fp) g_route_call++;
     if(g_couple && cp_pred && S<=8)
         for(int s2=0;s2<S;s2++) couple_prefetch(m,layer,idxs+(int64_t)s2*K,keff[s2]);
@@ -4153,6 +4207,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
         pthread_mutex_unlock(&g_pilot_mx);
     }
     float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
+    if(g_mtpr_on>0) g_mtpr_fwd_base = (!kvs && S<=4) ? pos_base : -1;
 #ifdef COLI_CUDA
     /* PIPE2 (Inc.2a): il residuo resta sul device del layer, saltando tra le schede
      * ai confini di layer. x host diventa STALE finche' la residenza e' attiva.
@@ -4487,6 +4542,9 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
         if(dbg){ rmsnorm(row, hx, m->mtp_norm, D, c->eps); matmul_qt(logit, row, &m->lm_head, 1);
                  t_pre=mtp_argmax(logit, c->vocab); }
         layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
+        if(g_mtpr_on<0){ const char *e=getenv("COLI_DBG_MTPROUTE");
+            g_mtpr_on=e?atoi(e):0; if(g_mtpr_on>0) atexit(mtpr_report); }
+        if(g_mtpr_on>0 && g==0) mtpr_predict(m,hx,(int64_t)pos+1);
         double n_post=0; for(int d=0;d<D;d++) n_post+=hx[d]*hx[d];
         rmsnorm(row, hx, m->mtp_norm, D, c->eps);
         matmul_qt(logit, row, &m->lm_head, 1);
