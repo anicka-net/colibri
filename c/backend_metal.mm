@@ -219,6 +219,63 @@ kernel void r_top8(device const float* sig [[buffer(0)]], device const float* bi
   if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
   for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
 }
+// parallel replica of r_top8's selection on ONE SIMDGROUP per row instead of one serial
+// thread (bench/kernels @ 27bfe83: serial r_top8 measured 0.465 ms/layer, ~55% of the
+// layer CB; this replica ~93x faster with exactly matching output). EXACT-MATCH is the
+// contract: each lane owns ceil(E/32) contiguous experts (blocked) and keeps a taken
+// bitmask; per selection step: lane-local strict-'>' ascending max (lowest index wins
+// within a lane, matching the serial ascending scan), then a shuffle-down argmax
+// reduction where ties prefer the LOWER index — together exactly the serial kernel's
+// first-max-wins order. The topp/normk/rscale tail is the serial code verbatim on lane 0
+// (same ops, same order => bitwise-identical results; metal-test enforces this with
+// memcmp). Contract: E<=256 (ch[8]/taken mask sizing: ceil(E/32)<=8) — the defensive
+// return below makes an out-of-contract dispatch a visible no-op (idx/w/keff untouched),
+// never an OOB write; both call sites (coli_metal_layer_decode's dispatch and the
+// standalone coli_metal_rtop8 runner) additionally gate on E<=256 in host code before
+// selecting this pipeline at all, so the return here is defense-in-depth, not the only
+// guard. Sentinel-per-lane design (ch[j]=-1e30f for e>=E) makes non-multiple-of-32 E
+// and small E correct without special-casing — validated for E=24, E=168 (REAP
+// expert-pruned packages, see the upstream feature-request thread) and E=256 by metal-test.
+// ASSUMES SIMD width 32 (shuffle offsets 16..1, 32-thread threadgroup per row): enforced
+// at init — coli_metal_init clears g_rtop8_width_ok (and therefore both call sites' use
+// of this pipeline) if threadExecutionWidth != 32.
+kernel void r_top8_par(device const float* sig [[buffer(0)]], device const float* bias [[buffer(1)]],
+                       device int* idx [[buffer(2)]], device float* w [[buffer(3)]],
+                       device int* keff [[buffer(4)]], constant int& E [[buffer(5)]],
+                       constant int& K [[buffer(6)]], constant int& Ksel [[buffer(7)]],
+                       constant float& topp [[buffer(8)]], constant int& normk [[buffer(9)]],
+                       constant float& rscale [[buffer(10)]],
+                       uint s [[threadgroup_position_in_grid]],
+                       uint slane [[thread_index_in_simdgroup]]) {
+  if(E>256) return;
+  device const float* sg=sig+(long)s*E;
+  device int* id_=idx+(long)s*K; device float* ww=w+(long)s*K;
+  int per=(E+31)/32, base=(int)slane*per;
+  float ch[8]; uint taken=0u;
+  for(int j=0;j<per;j++){ int e=base+j; ch[j]=(e<E)?sg[e]+bias[e]:-1e30f; }
+  for(int kk=0;kk<Ksel;kk++){
+    float bv=-1e30f; int bi=0x7FFFFFFF;
+    for(int j=0;j<per;j++) if(!(taken&(1u<<j)) && ch[j]>bv){ bv=ch[j]; bi=base+j; }
+    for(uint off=16;off>0;off>>=1){
+      float ov=simd_shuffle_down(bv,off); int oi=simd_shuffle_down(bi,off);
+      if(ov>bv || (ov==bv && oi<bi)){ bv=ov; bi=oi; }
+    }
+    bv=simd_broadcast(bv,0); bi=simd_broadcast(bi,0);
+    if(bi>=base && bi<base+per) taken|=1u<<(bi-base);
+    if(slane==0){ id_[kk]=bi; ww[kk]=sg[bi]; }
+  }
+  if(slane!=0) return;
+  int Ke=Ksel;
+  if(topp>0.0f && topp<1.0f){
+    for(int a=1;a<Ksel;a++){ int ii=id_[a]; float wv=ww[a]; int b=a-1;
+      while(b>=0 && ww[b]<wv){ ww[b+1]=ww[b]; id_[b+1]=id_[b]; b--; } ww[b+1]=wv; id_[b+1]=ii; }
+    float tot=1e-20f; for(int kk=0;kk<Ksel;kk++) tot+=ww[kk];
+    float cum=0; for(int kk=0;kk<Ksel;kk++){ cum+=ww[kk]; if(cum>=topp*tot){ Ke=kk+1; break; } }
+  }
+  keff[s]=Ke;
+  if(normk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=ww[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) ww[kk]/=sm; }
+  for(int kk=0;kk<Ke;kk++) ww[kk]*=rscale;
+}
 )METAL";
 
 struct ColiMetalTensor {
@@ -231,7 +288,15 @@ static id<MTLDevice> g_dev;
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_gemv, g_moe_gemv, g_moe_silu;
 static id<MTLComputePipelineState> g_a_rms, g_a_rope, g_a_copy, g_a_qabs, g_a_score, g_a_smax, g_a_clat, g_a_ctx;
-static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8;
+static id<MTLComputePipelineState> g_a_add, g_r_router, g_r_top8, g_r_top8p;
+static int g_rtop8_par = 1;      // COLI_RTOP8 (default ON); COLI_RTOP8=0 opts out to the
+                                  // serial kernel — see coli_metal_init.
+static int g_rtop8_width_ok = 1; // hardware fact, independent of the policy gate above:
+                                  // false if this device's threadExecutionWidth != 32.
+                                  // Consulted by BOTH the engine dispatch site and the
+                                  // standalone coli_metal_rtop8 runner, so no caller can
+                                  // reach r_top8_par's 32-lane reduction on an unsafe
+                                  // device even by explicitly requesting par=1.
 static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
@@ -284,6 +349,8 @@ extern "C" int coli_metal_init(void) {
   if (g_dev) return 1;
   if (getenv("COLI_METAL_UNTRACKED") && atoi(getenv("COLI_METAL_UNTRACKED")))
     g_res_opts = MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked;
+  { const char *e = getenv("COLI_RTOP8");           // default ON; COLI_RTOP8=0 opts out
+    if (e && atoi(e) == 0) g_rtop8_par = 0; }
   @autoreleasepool {
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) return 0;
@@ -299,8 +366,23 @@ extern "C" int coli_metal_init(void) {
     auto P=[&](const char*n){ return [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(n)] error:&err]; };
     g_a_rms=P("a_rmsnorm"); g_a_rope=P("a_rope"); g_a_copy=P("a_copy");
     g_a_qabs=P("a_qabs"); g_a_score=P("a_score"); g_a_smax=P("a_smax"); g_a_clat=P("a_clat"); g_a_ctx=P("a_ctx");
-    g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8");
-    if(!g_a_add||!g_r_router||!g_r_top8){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    g_a_add=P("a_add"); g_r_router=P("r_router"); g_r_top8=P("r_top8"); g_r_top8p=P("r_top8_par");
+    if(!g_a_add||!g_r_router||!g_r_top8||!g_r_top8p){ fprintf(stderr,"[metal] tail pipelines failed\n"); g_dev=nil; return 0; }
+    // r_top8_par's reduction hardcodes SIMD width 32 (shuffle-down offsets 16..1, one
+    // 32-thread threadgroup per row). True on all Apple Silicon shipped to date, but a
+    // non-32-width device would reduce wrongly AND race multiple lane-0 writers, so this
+    // is a hard safety fact (g_rtop8_width_ok), not just a policy default: it gates BOTH
+    // the engine dispatch site and the standalone coli_metal_rtop8 runner (degrade-to-safe,
+    // same pattern as the pool/ring fallbacks elsewhere) — no caller can opt back into an
+    // unsafe reduction on such a device, even by explicitly requesting par=1.
+    if ([g_r_top8p threadExecutionWidth] != 32) {
+      g_rtop8_width_ok = 0;
+      if (g_rtop8_par)
+        fprintf(stderr, "[metal] COLI_RTOP8 parallel top-8 disabled: threadExecutionWidth=%lu "
+                        "!= 32 (r_top8_par's reduction assumes 32-lane simdgroups) — serial "
+                        "r_top8 in use\n", (unsigned long)[g_r_top8p threadExecutionWidth]);
+      g_rtop8_par = 0;
+    }
     if (!g_gemv || !g_moe_gemv || !g_moe_silu || !g_a_rms || !g_a_rope || !g_a_copy ||
         !g_a_qabs || !g_a_score || !g_a_smax || !g_a_clat || !g_a_ctx) {
       fprintf(stderr, "[metal] pipeline failed\n"); g_dev = nil; return 0; }
@@ -597,12 +679,22 @@ extern "C" int coli_metal_layer_decode(float *x,
     // 5) silu(gate)*up + exact top-K select
     [e setComputePipelineState:g_moe_silu]; [e setBuffer:ash1_ offset:0 atIndex:0]; [e setBuffer:ash2_ offset:0 atIndex:1];
     [e dispatchThreads:MTLSizeMake((size_t)S*SI,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-    { [e setComputePipelineState:g_r_top8];
+    { // COLI_RTOP8 (default ON) swaps the serial 1-thread-per-row select for the exact-
+      // match 1-simdgroup-per-row replica (same buffers/args; only pipeline+grid change).
+      // E<=256 is required by r_top8_par's ch[8]/32-lane blocking contract; this call
+      // site's E is always 256 today (layer_forward_rows' own architecture-shape gate in
+      // colibri.c requires c->n_experts==256 to reach coli_metal_layer_decode at all —
+      // see PR body "Scope statement") but the check is kept here too, defense-in-depth,
+      // so a future relaxation of that gate (e.g. to admit REAP-pruned E=168 models into
+      // the fused path) degrades safely to the serial kernel instead of mis-dispatching.
+      int use_par = g_rtop8_par && g_rtop8_width_ok && E<=256;
+      [e setComputePipelineState:use_par?g_r_top8p:g_r_top8];
       [e setBuffer:asig_ offset:0 atIndex:0]; [e setBuffer:rbB offset:rboff atIndex:1];
       [e setBuffer:aidx_ offset:0 atIndex:2]; [e setBuffer:aw_ offset:0 atIndex:3]; [e setBuffer:akeff_ offset:0 atIndex:4];
       [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6]; [e setBytes:&Ksel length:4 atIndex:7];
       [e setBytes:&topp length:4 atIndex:8]; [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
-      [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
+      if(use_par) [e dispatchThreadgroups:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+      else        [e dispatchThreads:MTLSizeMake(S,1,1) threadsPerThreadgroup:MTLSizeMake(S,1,1)]; }
     BAR();
     // 6) shared down
     bind_gemv(e,shd_w,shd_s,shd_fmt,SI,AH,ash1_,ashout_,S);
@@ -647,6 +739,44 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] gemm cmdbuf error (S=%d O=%d)\n",S,O); return 0; }
     memcpy(y,[g_gy contents],(size_t)S*O*4);
+  }
+  return 1;
+}
+
+// Standalone single-kernel runner for the top-8 select (see backend_metal.h). Fresh
+// shared buffers per call (a test/probe path, not a hot path); grids exactly as the
+// engine dispatch site: serial = S threads of one S-wide threadgroup, parallel = S
+// threadgroups x 32 (one simdgroup per row). "par" is a REQUEST, not a guarantee: same
+// E<=256 and SIMD-width-32 host-side checks as the engine dispatch site gate the actual
+// pipeline choice, so a caller (including metal-test itself) can never reach the parallel
+// kernel out of contract by asking for it — par=1 with E>256, or on a non-32-wide device,
+// transparently runs the serial kernel instead and still returns 1 (success).
+extern "C" int coli_metal_rtop8(int par, const float *sig, const float *bias, int S, int E, int K,
+                                int Ksel, float topp, int normk, float rscale,
+                                int *idx, float *w, int *keff) {
+  if (!g_dev || S < 1 || E < 1 || K < 1 || Ksel < 1 || Ksel > K) return 0;
+  int use_par = par && g_r_top8p && g_rtop8_width_ok && E<=256;
+  @autoreleasepool {
+    id<MTLBuffer> bs=[g_dev newBufferWithBytes:sig  length:(size_t)S*E*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bb=[g_dev newBufferWithBytes:bias length:(size_t)E*4   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bi=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bw=[g_dev newBufferWithLength:(size_t)S*K*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bk=[g_dev newBufferWithLength:(size_t)S*4   options:MTLResourceStorageModeShared];
+    if(!bs||!bb||!bi||!bw||!bk) return 0;
+    memset(bi.contents,0xFF,(size_t)S*K*4);           // poison: untouched slots stay visible
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:use_par?g_r_top8p:g_r_top8];
+    [e setBuffer:bs offset:0 atIndex:0]; [e setBuffer:bb offset:0 atIndex:1];
+    [e setBuffer:bi offset:0 atIndex:2]; [e setBuffer:bw offset:0 atIndex:3]; [e setBuffer:bk offset:0 atIndex:4];
+    [e setBytes:&E length:4 atIndex:5]; [e setBytes:&K length:4 atIndex:6]; [e setBytes:&Ksel length:4 atIndex:7];
+    [e setBytes:&topp length:4 atIndex:8]; [e setBytes:&normk length:4 atIndex:9]; [e setBytes:&rscale length:4 atIndex:10];
+    if(use_par) [e dispatchThreadgroups:MTLSizeMake((NSUInteger)S,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+    else        [e dispatchThreads:MTLSizeMake((NSUInteger)S,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)S,1,1)];
+    [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if(cb.status==MTLCommandBufferStatusError){ fprintf(stderr,"[metal] rtop8 cmdbuf error\n"); return 0; }
+    memcpy(idx,bi.contents,(size_t)S*K*4);
+    memcpy(w,bw.contents,(size_t)S*K*4);
+    memcpy(keff,bk.contents,(size_t)S*4);
   }
   return 1;
 }
