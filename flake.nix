@@ -108,11 +108,11 @@
         apps = {
           default = {
             type = "app";
-            program = "${colibri}/bin/glm";
+            program = pkgs.lib.getExe colibri;
           };
           coli = {
             type = "app";
-            program = "${colibri}/bin/coli";
+            program = pkgs.lib.getExe' colibri "coli";
           };
         };
 
