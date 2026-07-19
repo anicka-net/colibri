@@ -4115,6 +4115,19 @@ static void stops_arm(const Cfg *c, int tok_eos){
     g_nstop=0;
     for(int i=0;i<c->n_stop;i++) g_stop[g_nstop++]=c->stop_ids[i];
     if(tok_eos>=0 && !is_stop(tok_eos)) g_stop[g_nstop++]=tok_eos;
+    /* In serve mode (API), keep only <|endoftext|> as a stop token. The tokens
+     * <|user|> and <|observation|> are role markers that the Python server
+     * handles — keeping them as stop tokens causes the engine to halt
+     * prematurely when the model tries to emit <tool_call> blocks, because
+     * int4-quantized logits can be noisy enough that argmax picks a stop-token
+     * ID instead of the correct tool-call token. (#401) */
+    if(getenv("SERVE")){
+        int kept=0;
+        for(int i=0;i<g_nstop;i++) if(g_stop[i]==tok_eos) g_stop[kept++]=g_stop[i];
+        if(kept<g_nstop) fprintf(stderr,"[stop] serve mode: filtered %d non-EOS stop tokens (tool-call safety, #401)\n",
+            g_nstop-kept);
+        g_nstop=kept;
+    }
     fprintf(stderr,"[stop] %d stop tokens:",g_nstop);
     for(int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]);
     fprintf(stderr,"\n");
