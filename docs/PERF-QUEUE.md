@@ -308,7 +308,7 @@ horizon; late correction alone cannot hide the NVMe read.
    Live mux A/B with frozen placement, 131k production settings, 64 greedy
    tokens: **1.21 -> 1.43 tok/s**, hit 76.1% -> 83.7%, RSS 38.3 -> 67.1 GB,
    no swap.  Lifecycle probe grew 17->42, shrank 42->22 before a 100k-token
-   request, then cancelled cleanly.  Keep opt-in until merged production soak.
+   request, then cancelled cleanly.  Deployed on the production mux service.
 2. **Learned low-rank early route correction.**  Train a small correction to
    the stale L+1 router logits from the same full-layer-horizon state.  Compare
    cross-prompt K6 recall against two-step and require enough gain to survive
@@ -323,6 +323,27 @@ horizon; late correction alone cannot hide the NVMe read.
 5. **Two-layer-horizon prediction.**  Evaluate exact and learned L+2 at equal
    K6 budget only after the above.  Coupling depth 2 already showed the failure
    mode: extra lead time is worthless when accuracy causes cache pollution.
+
+### Upstream weekend review (2026-07-19)
+
+Imported two changes with direct value here:
+
+- Upstream's measured-RSS guard (#403), hardened for this fork's asynchronous
+  pilot and adaptive cache.  It uses current Linux RSS, drains queued/in-flight
+  pilot loads before compacting LRU rows, frees CUDA host wrappers, and keeps an
+  emergency ceiling so the next short request cannot regrow past a measured
+  unsafe cap.
+- The multi-seed DSA selection benchmark (#357), which removes deterministic
+  quickselect pivot luck from randomized-shape speedups; the fixed plateau
+  remains a single deterministic tie-stress input.  The local run completed
+  with a stable 7-20x range rather than a single-input spike.
+
+Deferred the resident ragged-KV patch: production uses `KV_SLOTS=1`, while
+adaptive caching deliberately rejects multi-slot mode, so it cannot improve
+the deployed path.  Revisit only with a measured concurrent/ragged workload.
+Auto-NUMA and non-finite sampling already have local equivalents; converter,
+release, Windows-prompt, and tool-calling changes do not affect this Spark
+profile.
 
 #### DSA phase 2, increment 3 — per-row PREFILL selection (landed)
 `attn_pipe_prefill` now handles batches crossing/past index_topk with a phase
