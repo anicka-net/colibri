@@ -30,6 +30,8 @@ COLI_CUDA_DLLEXPORT void coli_cuda_shutdown(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_count(void);
 COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
+/* 1 when cudaMalloc storage shares physical system RAM, 0 for discrete VRAM. */
+COLI_CUDA_DLLEXPORT int coli_cuda_device_is_integrated(int device);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
@@ -134,7 +136,7 @@ typedef struct {
     void *topk_user;
     float *ic_host;                   /* out: the S new k_idx rows (host Ic canonical) */
 } ColiCudaDsaChain;
-COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain(int device,
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,
         const ColiCudaTensor *qa, const ColiCudaTensor *qb,

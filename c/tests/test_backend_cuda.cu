@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
     if (!coli_cuda_init(devices, ndev)) return 77;
     if (coli_cuda_device_count() != ndev) return 1;
     int d0 = devices[0], d1 = devices[ndev > 1 ? 1 : 0];
+    int integrated = coli_cuda_device_is_integrated(d0);
     size_t count = 99, bytes = 99;
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
@@ -185,6 +186,7 @@ int main(int argc, char **argv) {
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
     coli_cuda_shutdown();
-    std::printf("cuda backend: q8/q4/q2/f32 correctness ok on %d device(s)\n", ndev);
+    std::printf("cuda backend: q8/q4/q2/f32 correctness ok on %d device(s), integrated=%d\n",
+                ndev,integrated);
     return 0;
 }

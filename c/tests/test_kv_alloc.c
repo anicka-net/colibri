@@ -26,6 +26,13 @@ int main(void){
     assert(adaptive_cap_target(&m,10)==41);
     g_adaptive_cap_highwater=90;
     assert(adaptive_cap_target(&m,10)==27);
+    assert(cuda_ic_shadow_bytes_for(2,128,131072,1)==134217728.0);
+    assert(cuda_ic_shadow_bytes_for(2,128,131072,3)==402653184.0);
+    assert(cuda_ic_shadow_layer_eligible(1,1,1,1));
+    assert(!cuda_ic_shadow_layer_eligible(0,1,1,1)); /* SHARED indexer */
+    assert(!cuda_ic_shadow_layer_eligible(1,0,1,1)); /* dense layer */
+    assert(!cuda_ic_shadow_layer_eligible(1,1,0,1)); /* resident path unavailable */
+    assert(!cuda_ic_shadow_layer_eligible(1,1,1,0)); /* discrete CUDA memory */
     printf("OK kv_alloc re-allocation\n");
     return 0;
 }
