@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
+#include <chrono>
 #include <mutex>
 
 struct ColiCudaTensor {
@@ -1532,8 +1532,8 @@ extern "C" void coli_cuda_dsac_times(double *sync_s, double *topk_s){
     if(topk_s) *topk_s=coli_dsac_t_topk;
 }
 static double dsac_now(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9;
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
