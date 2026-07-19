@@ -1224,6 +1224,42 @@ static int64_t la_hit[4], la_tot[4];  /* [0]=prev, [1]=skip-attn, [2]=PILOT, [3]
 static int la_pred[3][130][16]; static signed char la_val[3][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+static FILE *g_pilot_trace_fp=NULL;
+static float *g_pilot_trace_pred=NULL;
+static unsigned char *g_pilot_trace_valid=NULL;
+static int g_pilot_trace_e=0, g_pilot_trace_layers=0, g_pilot_trace_init=0;
+static void pilot_trace_setup(Model *m){
+    if(g_pilot_trace_init) return;
+    g_pilot_trace_init=1;
+    const char *path=getenv("PILOT_TRACE");
+    if(!path||!*path) return;
+    g_pilot_trace_fp=fopen(path,"wb");
+    if(!g_pilot_trace_fp){ fprintf(stderr,"[PILOT_TRACE] cannot open %s\n",path); return; }
+    g_pilot_trace_e=m->c.n_experts; g_pilot_trace_layers=m->c.n_layers;
+    g_pilot_trace_pred=calloc((size_t)g_pilot_trace_layers*g_pilot_trace_e,sizeof(float));
+    g_pilot_trace_valid=calloc((size_t)g_pilot_trace_layers,1);
+    if(!g_pilot_trace_pred||!g_pilot_trace_valid){ fprintf(stderr,"OOM pilot trace\n"); exit(1); }
+    uint32_t hdr[3]={0x31544c50u,(uint32_t)g_pilot_trace_e,(uint32_t)g_pilot_trace_layers};
+    fwrite(hdr,sizeof hdr,1,g_pilot_trace_fp);
+}
+static void pilot_trace_predict(Model *m,int layer,const float *scores){
+    pilot_trace_setup(m);
+    if(!g_pilot_trace_fp||layer<0||layer>=g_pilot_trace_layers) return;
+    memcpy(g_pilot_trace_pred+(size_t)layer*g_pilot_trace_e,scores,
+           (size_t)g_pilot_trace_e*sizeof(float));
+    g_pilot_trace_valid[layer]=1;
+}
+static void pilot_trace_true(Model *m,int layer,const float *scores){
+    pilot_trace_setup(m);
+    if(!g_pilot_trace_fp||layer<0||layer>=g_pilot_trace_layers||
+       !g_pilot_trace_valid[layer]) return;
+    uint32_t li=(uint32_t)layer;
+    fwrite(&li,sizeof li,1,g_pilot_trace_fp);
+    fwrite(g_pilot_trace_pred+(size_t)layer*g_pilot_trace_e,
+           sizeof(float),(size_t)g_pilot_trace_e,g_pilot_trace_fp);
+    fwrite(scores,sizeof(float),(size_t)g_pilot_trace_e,g_pilot_trace_fp);
+    g_pilot_trace_valid[layer]=0;
+}
 static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (miss LRU) in
                           * draft MTP / absorb / verify-main e in layer MTP (int8) vs main
                           * (int4), con i byte letti. Default OFF: a flag spento gli atomic
@@ -3371,6 +3407,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        if(S==1) pilot_trace_true(m,layer,choice);
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         if(do_cache_route){
@@ -4224,6 +4261,12 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     }
     for(int s=0;s<S;s++){
         const float *xs = x+(int64_t)s*D;
+        if(S==1&&getenv("PILOT_TRACE")){
+            rmsnorm(nrm,xs,l->post_ln,D,c->eps);
+            matmul(ch,nrm,l->router,1,D,E);
+            for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+            pilot_trace_predict(m,lnext,ch);
+        }
         if(can_two){
             /* Two-step: approximate MoE(src_layer) via shared expert only (resident, no disk),
              * then run lnext's router on the corrected state. */
@@ -4236,10 +4279,13 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             for(int i=0;i<D;i++) hc[i] = xs[i] + sout[i];
             rmsnorm(nrm, hc, l->post_ln, D, c->eps);
         } else {
-            rmsnorm(nrm, xs, l->post_ln, D, c->eps);
+            if(!(S==1&&getenv("PILOT_TRACE")))
+                rmsnorm(nrm, xs, l->post_ln, D, c->eps);
         }
-        matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        if(can_two||!(S==1&&getenv("PILOT_TRACE"))){
+            matmul(ch, nrm, l->router, 1, D, E);
+            for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        }
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
