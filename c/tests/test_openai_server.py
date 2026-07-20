@@ -653,6 +653,65 @@ class HTTPTest(unittest.TestCase):
         with urlopen(request, timeout=2) as response:
             self.assertEqual(json.load(response)["type"], "message")
 
+    def test_anthropic_models_token_count_and_error_shape(self):
+        with self.request("/v1/models") as response:
+            result = json.load(response)
+        self.assertFalse(result["has_more"])
+        self.assertEqual(result["data"][0]["type"], "model")
+        self.assertEqual(result["data"][0]["display_name"], "GLM-5.2 (Colibri)")
+
+        with self.request("/v1/messages/count_tokens", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hello"}],
+        }) as response:
+            count = json.load(response)
+            self.assertEqual(response.headers["x-colibri-token-count"], "estimated")
+        self.assertGreater(count["input_tokens"], 0)
+
+        with self.assertRaises(HTTPError) as caught:
+            self.request("/v1/messages", {
+                "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            })
+        error = json.load(caught.exception)
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(error["error"]["type"], "invalid_request_error")
+        self.assertTrue(error["request_id"].startswith("req_"))
+        self.assertIsNotNone(caught.exception.headers["request-id"])
+
+    def test_ollama_discovery_chat_generate_and_stream(self):
+        with self.request("/api/version") as response:
+            self.assertTrue(json.load(response)["version"].startswith("colibri-"))
+        with self.request("/api/tags") as response:
+            self.assertEqual(json.load(response)["models"][0]["name"], "test-model")
+        with self.request("/api/ps") as response:
+            self.assertEqual(json.load(response)["models"][0]["model"], "test-model")
+        with self.request("/api/show", {"model": "test-model"}) as response:
+            self.assertIn("tools", json.load(response)["capabilities"])
+
+        with self.request("/api/chat", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "stream": False, "options": {"num_predict": 4, "temperature": 0},
+        }) as response:
+            chat = json.load(response)
+        self.assertEqual(chat["message"]["content"], "Héllo")
+        self.assertTrue(chat["done"])
+        self.assertEqual(chat["eval_count"], 2)
+
+        with self.request("/api/generate", {
+            "model": "test-model", "prompt": "Complete me", "raw": True,
+            "stream": False,
+        }) as response:
+            generated = json.load(response)
+        self.assertEqual(generated["response"], "Héllo")
+
+        with self.request("/api/chat", {
+            "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        }) as response:
+            events = [json.loads(line) for line in response if line.strip()]
+        self.assertEqual(events[0]["message"]["content"], "Hé")
+        self.assertEqual(events[-1]["done"], True)
+        self.assertEqual(events[-1]["message"]["content"], "")
+
     def test_rejects_prompt_over_context_byte_ceiling(self):
         old = self.server.context_length
         self.server.context_length = 8
@@ -793,6 +852,26 @@ class DS4CompatibilityHTTPTest(unittest.TestCase):
             stream = response.read().decode()
         self.assertIn('"type":"response.function_call_arguments.delta"', stream)
         self.assertNotIn("<tool_call>", stream)
+
+    def test_ollama_translates_tool_calls(self):
+        tool = {"type": "function", "function": {"name": "lookup",
+                "description": "Look up a bird", "parameters": {
+                    "type": "object", "properties": {"q": {"type": "string"}}}}}
+        body = {"model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Find it"}],
+                "tools": [tool], "stream": False, "think": False}
+        with self.request("/api/chat", body) as response:
+            result = json.load(response)
+        call = result["message"]["tool_calls"][0]["function"]
+        self.assertEqual(call["name"], "lookup")
+        self.assertEqual(call["arguments"], {"q": "bird"})
+
+        with self.request("/api/chat", {**body, "stream": True}) as response:
+            events = [json.loads(line) for line in response if line.strip()]
+        calls = [event["message"]["tool_calls"] for event in events
+                 if event.get("message", {}).get("tool_calls")]
+        self.assertEqual(calls[0][0]["function"]["arguments"], {"q": "bird"})
+        self.assertTrue(events[-1]["done"])
 
         anthropic_tool = {"name": "lookup", "description": "Look up a bird",
                           "input_schema": {"type": "object", "properties": {

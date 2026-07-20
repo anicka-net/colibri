@@ -41,6 +41,50 @@ DIRECT=0 ./glm 256 4 4
   at long context it wins. `DRAFT>1` degrades (self-fed drafts).
 - `COLI_NUMA=1` measured neutral on decode (GPU-bound) — not worth sweeping.
 
+### Running Profile A as a persistent service
+
+`ops/service.env.multigpu.example` + `ops/systemd/` (see `ops/README.md`).  Build
+the env file **from the profile above**, not from `service.env.example` — that
+one is the unified-memory profile and carries settings that are actively wrong
+here.  Measured gotchas, each of which produced a working-but-wrong service:
+
+- **Never set `AUTOPIN=0`** on this profile.  It skips the startup pin pass that
+  fills the VRAM tier from `.coli_usage`: the service runs correctly at
+  **1.7 tok/s instead of ~9**, with `nvidia-smi` showing a few hundred MB
+  instead of `CUDA_EXPERT_GB`.  Confirm the banner has both
+  `hot expert tier: N/19200 experts` and `[PIN] placement:`.
+- **Python >= 3.7** (`ThreadingHTTPServer`).  Where the distro default is older
+  (SLES 15 ships 3.6) the unit must invoke a newer interpreter by ABSOLUTE
+  PATH: systemd expands `${VAR}` in arguments but not in the executable
+  position (`203/EXEC`).
+- **tmpfs snapshots vanish on reboot.**  `ops/colibri-preflight.sh` (ExecStartPre)
+  refuses to start on a missing/short snapshot, a wrong `nvidia_uvm` parameter,
+  or an old Python, instead of failing minutes into a load; pair it with a long
+  `RestartSec` so retries do not fight the reload for I/O.
+- **Logs**: the engine banner and per-request lines go to stderr.  If the
+  service user cannot read the journal, add
+  `StandardError=append:%h/.colibri/server.log` — otherwise startup failures are
+  invisible.  `/health` and `/profile` expose tier sizes and per-turn timings.
+- **Model identity**: the shipped unit hardcodes `--model-alias deepseek-v4-pro
+  --hidden-model-alias deepseek-chat` and the other env example sets a
+  `deepseek-*` `COLI_MODEL_ID`, so that a DS4-compatible deployment can keep its
+  existing clients.  Drop both unless something depends on them — otherwise
+  `/v1/models` advertises DeepSeek ids for a GLM model, which confuses every
+  client that lists models.
+- **`enable`, not just `start`**: `loginctl enable-linger` restarts the user
+  manager, which stops a merely-started unit and (being disabled) never brings
+  it back — the same reason it would not survive a reboot.
+
+Expected throughput, short prompts, `CUDA_EXPERT_GB=150`: **~9 tok/s** direct,
+**~5-6 tok/s** through the HTTP/streaming path.  The 19.6 tok/s headline is a
+warmed-cache best case — `.coli_usage` frozen on the *same* prompt.  For
+arbitrary prompts the expert hit rate is ~55-63% and decode is expert-matmul
+bound (45% of wall, CPU tier a ~2.1x straggler over the GPU tier): all 19200
+experts are RAM-pinned (363 GB, zero disk I/O), but only ~7900 fit VRAM.
+Raising the tier to 175 GB buys hit 57.8 -> 62.9% and +3.8% throughput while
+leaving only ~7 GB VRAM margin at a full 32k prompt — not worth it; the cache
+improves on its own as `.coli_usage` learns real traffic.
+
 ### Long context on Profile A: DSA sparse attention
 
 With the `out-idx-*` indexer files present the engine auto-enables DSA, and as
@@ -52,12 +96,23 @@ the defaults do this. Knobs and caveats:
 
 - `COLI_DSA_CHAIN=0` / `COLI_DSA_TCGATHER=0` fall back to the slower
   CPU-selection / scalar sel-absorb paths (debug/A-B only).
+- `COLI_DSA_REFRESH=N` (default 1) recomputes decode selection only every Nth
+  token.  Keep the default: N>1 changes greedy output for ~1% at 13.4k
+  (selection is only 3% of decode) — quality-changing, measured near-dead-end.
 - `COLI_DBG_DSACHAIN=1` prints engagement counters
   (`[DSAC] engaged: ... fallback: ...`) — check `fb 0` after any change in this
   area; the fallbacks are silent by design.
-- Current ceiling: the device KV/Ic shadows and absorb kernels cap at
-  **T<=8192**; past that the engine falls back to CPU paths (cap lift is the
-  next queue item).
+- Context ceiling (post inc.5): DSA/GEMM paths run to **T<=131072**; the dense
+  absorb kernels go to ~56k on Hopper via the dynamic-smem opt-in and fall back
+  to CPU beyond.  Measured at 13.4k: DSA 2.98 vs dense 1.83 tok/s (+63%) and
+  prefill 780 vs 872 s.  Validated at 26.8k (CTX=32768): prefill 1621 s
+  (linear in tokens), decode 2.09 tok/s, zero fallbacks; the decode T-growth
+  is the three DENSE layers' O(T) full attention, not DSA.
+- Device KV/Ic shadows are **fp16 by default** (inc.7, `COLI_KV_F16=0` restores
+  fp32): ~0.7 GB/GPU at 16k, ~12 GB/GPU at 256k — budget `CUDA_EXPERT_GB`
+  accordingly at 32k+.  Host KV stays exact fp32; the mode is performance-
+  neutral at 13.4k and numerically in the same accepted class as W4A16/TC
+  (greedy near-ties can flip).  Use `=0` for bit-comparisons against fp32 runs.
 - MTP composes with DSA (84–88% acceptance at 2.8–6.7k) but adds only ~5%
   end-to-end until small-S GPU forwards get cheaper.
 

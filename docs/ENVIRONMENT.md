@@ -26,6 +26,8 @@ Format: `VAR` — default — effect.
 | `SEED` | unset → seeded from clock + PID | RNG seed for sampling. **Unset = different every run.** Set a fixed value for reproducible sampling. |
 | `KVSAVE` | `1` (on) | Persist the KV cache to `<model>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
 | `KV_SLOTS` | `1` | Number of independent KV conversation slots (1–16), used in serve mode. |
+| `COLI_KV_CACHE_GB` | `0` (off) | Mux-service disk library for many conversations with one RAM KV context. Exact longest-token-prefix lookup, copy-on-write checkpoints, and LRU eviction under this steady-state GB budget. Requires `KVSAVE=1` and `KV_SLOTS=1`. |
+| `COLI_KV_CACHE_DIR` | `<model>/.coli_kv_cache` | Storage directory used when `COLI_KV_CACHE_GB>0`. Put it on persistent local disk, not tmpfs. Files contain token ids and model activations; keep the directory private and use one directory per engine process. |
 | `THINK` | `0` (off) | Emit a `<think>` reasoning block. `THINK=1` turns on visible reasoning. |
 | `MTP` | on | Multi-Token Prediction (speculative draft head). `MTP=0` disables it. |
 
@@ -148,17 +150,19 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 
 ---
 
-## Server / CLI (`openai_server.py`, `coli`)
+## Native server / CLI (`native_server.c`, `coli_native.c`)
 
-These are read by the Python programs (not the `glm` engine), so they don't appear in `glm.c`. They cover the OpenAI-compatible server, tool calling, and the debug view.
+These are read by the native CLI/server (not the `glm` engine), so they don't
+appear in `glm.c`. Development-only Python tools do not participate at runtime.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `COLI_DEBUG` | `0` (off) | Tee the engine transaction to stderr, by level. **`1`** = decoded model output stream only (byte-by-byte, on both the tool-call and plain paths). **`2`** = both sides — the fully-rendered prompt the engine received *and* the output, bracketed and correlated by request id, so stderr reads as the whole conversation. Invaluable for seeing what the model received vs. emitted during an OpenCode session. |
+| `COLI_DEBUG_HTTP` | `0` (off) | Log redacted HTTP request metadata and API errors: method, path, model, body size, stream mode, message/tool counts, status, and request id. Authorization values and prompt content are never logged. |
 | `COLI_TOOL_SALVAGE` | `0` (off) | Opt-in de-mangler: reconstruct a malformed int4 tool call by mapping its lone payload onto the tool's primary parameter. Never rewrites well-formed output; recommended for int4 deployments. |
 | `COLI_THINK` | `0` (off) | Make thinking the default when the client sends *neither* `reasoning_effort` nor `enable_thinking`. Any explicit client value still wins. |
 | `COLI_MODEL` | unset | Default model directory (fallback for `--model`). |
-| `COLI_MODEL_ID` | `glm-5.2-colibri` | Model id reported by the API. |
+| `COLI_MODEL_ID` | `glm-5.2` | Model id reported by the API. |
 | `COLI_API_KEY` | unset | Required bearer token for the server. |
 | `COLI_MAX_QUEUE` | `8` | Max queued requests. |
 | `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. |
@@ -171,7 +175,7 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 
 ## Set by the CLI (don't usually set by hand)
 
-`coli` / `openai_server.py` set these internally to select a run mode or pass through a flag:
+The native `coli` CLI sets these internally to select a run mode or pass through a flag:
 
 - `SNAP` — model snapshot directory (required by `glm`; set from `--model`).
 - `SERVE`, `SERVE_BATCH` — select serve / batched-serve mode.

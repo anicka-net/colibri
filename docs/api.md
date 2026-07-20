@@ -3,19 +3,19 @@
 ## `coli serve`
 
 `coli serve` keeps one model process loaded and exposes a text-only
-OpenAI-compatible HTTP API. The gateway uses only the Python standard library;
-inference still runs in the same dependency-free C engine.
+OpenAI-compatible HTTP API. The gateway, scheduler, and engine protocol client
+are native C and add no runtime dependencies beyond libc and pthreads.
 
 ```bash
 cd c
-COLI_MODEL=/nvme/glm52_i4 COLI_API_KEY=local-secret ./coli serve \
-  --host 127.0.0.1 --port 8000 --model-id glm-5.2-colibri
+COLI_MODEL=/nvme/glm52_i4 COLI_API_KEY=local-secret ./coli-native serve \
+  --host 127.0.0.1 --port 8000 --model-id glm-5.2
 
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Authorization: Bearer local-secret' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "glm-5.2-colibri",
+    "model": "glm-5.2",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
@@ -31,6 +31,52 @@ responses, SSE streaming, usage counts,
 may use `think: false` or `thinking: {"type": "disabled"}`. Reasoning is
 returned separately as `reasoning_content` in the OpenAI chat API and as
 thinking blocks in the Anthropic API.
+
+### Claude Code via the Anthropic API
+
+The gateway implements the Anthropic inference surface needed by Claude Code:
+`POST /v1/messages`, Anthropic SSE events, tool-use/tool-result blocks, extended
+thinking blocks, `POST /v1/messages/count_tokens`, model discovery, Anthropic
+error envelopes and both `x-api-key` and Bearer authentication. Administrative
+APIs such as batches, files, billing and organizations are intentionally not
+implemented.
+
+Point Claude Code at the server and select Colibri's advertised model id:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=local                 # match COLI_API_KEY, or any value if unset
+export ANTHROPIC_MODEL=glm-5.2
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.2
+export API_TIMEOUT_MS=2147483647               # long prefill can exceed Claude Code's default
+claude
+```
+
+The token-count endpoint is an estimate (`x-colibri-token-count: estimated`)
+because the current engine wire protocol has no tokenizer RPC. Completed
+generation usage is exact. Claude Code may disable MCP tool search for a custom
+`ANTHROPIC_BASE_URL`; its ordinary built-in tools and explicitly configured MCP
+servers continue to work.
+
+### Ollama-compatible API
+
+Ollama clients can use the same host directly. Implemented endpoints are
+`POST /api/chat`, `POST /api/generate`, `POST /api/show`, `GET /api/tags`,
+`GET /api/ps`, and `GET /api/version`. Chat/generate support JSON and NDJSON
+streaming, tools, separate thinking output, the common `options` fields
+`num_predict`, `temperature` and `top_p`, and the Colibri `cache_slot` extension.
+
+```bash
+curl http://127.0.0.1:8000/api/chat -d '{
+  "model": "glm-5.2",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": false
+}'
+```
+
+Colibri is a text-generation runtime, not an Ollama model store. Pull, push,
+create, copy, delete, embeddings and image inputs are not implemented; unknown
+endpoints return Ollama-shaped errors.
 
 Use `--model-alias` for additional advertised ids and
 `--hidden-model-alias` for accepted compatibility ids. `--default-thinking`
@@ -65,7 +111,7 @@ The API is OpenAI-compatible, so most coding CLIs and editor extensions work by
 pointing them at Colibri as an *OpenAI-compatible* provider. Three settings:
 
 - **Base URL** — `http://localhost:8000/v1`
-- **Model** — `glm-5.2-colibri` (or whatever you pass to `--model-id`)
+- **Model** — `glm-5.2` (or whatever you pass to `--model-id`)
 - **API key** — any non-empty string, e.g. `local`
 
 Colibri needs **no** API key by default, but many clients refuse to start without
@@ -76,7 +122,7 @@ Smoke-test the endpoint first (no key needed unless you set one):
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"glm-5.2-colibri","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 **aider**
@@ -84,7 +130,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```bash
 export OPENAI_API_BASE=http://localhost:8000/v1
 export OPENAI_API_KEY=local
-aider --model openai/glm-5.2-colibri     # the openai/ prefix routes to OPENAI_API_BASE
+aider --model openai/glm-5.2     # the openai/ prefix routes to OPENAI_API_BASE
 ```
 
 **crush** — add a provider to `crush.json` (`~/.config/crush/crush.json`, or
@@ -100,7 +146,7 @@ aider --model openai/glm-5.2-colibri     # the openai/ prefix routes to OPENAI_A
       "base_url": "http://localhost:8000/v1/",
       "api_key": "local",
       "models": [
-        { "name": "GLM-5.2 (Colibri)", "id": "glm-5.2-colibri",
+        { "name": "GLM-5.2 (Colibri)", "id": "glm-5.2",
           "context_window": 131072, "default_max_tokens": 1024 }
       ]
     }
@@ -113,7 +159,7 @@ The `"api_key": "local"` dummy is what satisfies clients that demand a key.
 KV configuration actually allows.
 
 **Continue, Cline / Roo, `llm`, the OpenAI SDKs, …** — set the provider's base
-URL to `http://localhost:8000/v1`, the model to `glm-5.2-colibri`, and any dummy
+URL to `http://localhost:8000/v1`, the model to `glm-5.2`, and any dummy
 key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
 
 > **Set your expectations before connecting an agentic CLI.** Two costs dominate,
@@ -143,7 +189,7 @@ OpenAI clients omit it and keep the original slot 0 behavior.
 
 ```json
 {
-  "model": "glm-5.2-colibri",
+  "model": "glm-5.2",
   "messages": [{"role": "user", "content": "Continue this conversation"}],
   "cache_slot": 1
 }
@@ -155,6 +201,33 @@ each request's tokenized prompt against the slot's history and reuses the common
 KV prefix, so stateless HTTP turns keep their cache across requests and even
 across engine restarts. Use `COLI_KV_SLOTS=N` as the environment equivalent.
 Start small: at the default 4096-token context, every slot costs hundreds of MB.
+
+## Many conversations, one RAM context
+
+For a family server or agent workloads, `COLI_KV_CACHE_GB=N` replaces
+RAM-multiplied slots with a bounded disk library while keeping `KV_SLOTS=1`.
+Every completed conversation is checkpointed under a content-derived name.
+Before each request the engine finds the saved token history with the longest
+exact prefix, restores only that prefix, and prefills the remaining suffix.
+Shared system/tool prompts therefore reuse the same model state across unrelated
+clients without exposing or attending to either conversation's private tail.
+
+```bash
+COLI_KV_SLOTS=1 \
+COLI_KV_CACHE_GB=512 \
+COLI_KV_CACHE_DIR=/persistent/colibri-kv \
+./coli serve --model /path/to/model
+```
+
+Snapshots are immutable and published with temp-file + rename, so branching
+conversations cannot overwrite a shared prefix. The oldest snapshots are
+evicted after checkpoints until the steady-state budget is met; atomic
+publication can temporarily require one additional snapshot's worth of disk.
+The directory contains token ids and activations, so permissions are restricted
+to the service user and the directory must be treated as conversation data.
+Use one cache directory per running engine; the library is single-writer.
+This mode is currently available in the mux/OpenAI service, not interactive
+`coli chat`.
 
 ## Web dashboard
 

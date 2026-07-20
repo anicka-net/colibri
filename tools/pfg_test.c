@@ -22,6 +22,9 @@ int main(int argc,char**argv){
     int S=argc>1?atoi(argv[1]):341, T=argc>2?atoi(argv[2]):341;
     int zero_rope=argc>3?atoi(argv[3]):0, zero_nope=argc>4?atoi(argv[4]):0;
     int H=64,Q=192,R=64,V=256,K=512,O=6144;
+    /* l'harness alloca latent/rope fp32 propri: forza le ombre fp32
+     * (COLI_KV_F16 valida in-model, non qui) */
+    setenv("COLI_KV_F16","0",1);
     int dev0[1]={0};
     if(!coli_cuda_init(dev0,1)){ fprintf(stderr,"cuda init failed\n"); return 1; }
     int dev=coli_cuda_device_at(0);

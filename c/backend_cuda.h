@@ -117,6 +117,18 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
 
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
+/* COLI_KV_F16 (default 1): the device KV/Ic shadows are stored as fp16.  The
+ * host canonical caches stay exact fp32.  Shadow pointers remain float* in
+ * every signature (opaque to the host); ALL element offsets into a shadow must
+ * go through these helpers or be byte-scaled by the element size (2 or 4). */
+COLI_CUDA_DLLEXPORT int coli_cuda_kv_f16(void);
+/* Upload host fp32 rows into a shadow at element offset, converting if f16. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload_kv(int device,void *dst,const float *src,
+                            size_t elems,size_t elem_off);
+/* Strided device fp32 rows -> shadow rows (the prefill KV writer). */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d_kv(int device,void *dst,int dpitch,
+                            const float *src,int spitch,int width,int height,
+                            size_t elem_off);
 /* DSA selection support for the fused chain (phase 2 inc.2).  All-or-nothing:
  * pass NULL to keep the dense absorb.  On indexer-FULL layers the ix_* tensors
  * are set and the chain computes the new k_idx row + selection scores on the
@@ -135,7 +147,16 @@ typedef struct {
                    int *sel, int *nsel);
     void *topk_user;
     float *ic_host;                   /* out: the S new k_idx rows (host Ic canonical) */
+    int score_off;                    /* COLI_DSA_REFRESH reuse token: append k_idx to the
+                                       * Ic shadow but skip scoring/top-k; sel/nsel arrive
+                                       * prefilled by the caller (topk_fn stays NULL) */
 } ColiCudaDsaChain;
+/* Cumulative wall-time of the chain's mid-sync score download (includes the
+ * implicit pipeline drain) and of the host top-k callback, for COLI_DBG_DSACHAIN. */
+COLI_CUDA_DLLEXPORT void coli_cuda_dsac_times(double *sync_s, double *topk_s);
+/* COLI_DBG_DSACHAIN=2: cumulative GPU time of the chain's three phases
+ * (loop1 projections+KV writes+scoring, loop2 absorb+o_proj, tail). */
+COLI_CUDA_DLLEXPORT void coli_cuda_dsac_phase_times(double out[3]);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,

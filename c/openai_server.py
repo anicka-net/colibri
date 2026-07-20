@@ -5,6 +5,7 @@ import argparse
 import codecs
 import collections
 import contextlib
+import datetime
 import json
 import math
 import mimetypes
@@ -60,6 +61,17 @@ class ClientCancelled(Exception):
 def error_object(error):
     return {"error": {"message": error.message, "type": error.error_type,
                       "param": error.param, "code": error.code}}
+
+
+def anthropic_error_object(error, request_id):
+    error_type = {"server_error": "api_error"}.get(error.error_type, error.error_type)
+    return {"type": "error", "error": {"type": error_type,
+                                           "message": error.message},
+            "request_id": request_id}
+
+
+def ollama_error_object(error):
+    return {"error": error.message}
 
 
 class GenerationScheduler:
@@ -246,7 +258,7 @@ def anthropic_messages(body):
             part_type = part.get("type")
             if part_type == "text":
                 text.append(content_text([part], f"messages.{index}.content"))
-            elif part_type == "thinking":
+            elif part_type in ("thinking", "redacted_thinking"):
                 continue
             elif part_type == "tool_use" and item["role"] == "assistant":
                 calls.append({"id": part.get("id") or "call_compat", "type": "function",
@@ -289,6 +301,55 @@ def anthropic_tools(tools):
             "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
         }})
     return result
+
+
+def ollama_messages(messages):
+    """Translate Ollama chat messages to the internal OpenAI-shaped representation."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    result = []
+    for index, item in enumerate(messages):
+        if not isinstance(item, dict) or item.get("role") not in (
+                "system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, "Unsupported Ollama message role.", f"messages.{index}.role")
+        if item.get("images"):
+            raise APIError(400, "GLM-5.2 Colibri is text-only; Ollama images are unsupported.",
+                           f"messages.{index}.images", "unsupported_content_type")
+        message = {"role": item["role"],
+                   "content": content_text(item.get("content", ""),
+                                           f"messages.{index}.content")}
+        calls = item.get("tool_calls")
+        if calls:
+            normalized = []
+            for call_index, call in enumerate(calls):
+                fn = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+                    raise APIError(400, "Ollama tool calls require a function name.",
+                                   f"messages.{index}.tool_calls.{call_index}")
+                arguments = fn.get("arguments", {})
+                normalized.append({"id": call.get("id") or f"call_ollama_{call_index}",
+                                   "type": "function", "function": {
+                                       "name": fn["name"],
+                                       "arguments": (arguments if isinstance(arguments, str)
+                                                     else json.dumps(arguments, ensure_ascii=False))}})
+            message["tool_calls"] = normalized
+        result.append(message)
+    return result
+
+
+def ollama_options(body, server_max_tokens):
+    options = body.get("options") or {}
+    if not isinstance(options, dict):
+        raise APIError(400, "`options` must be an object.", "options")
+    normalized = dict(body)
+    if "num_predict" in options:
+        normalized["max_tokens"] = options["num_predict"]
+    if "temperature" in options:
+        normalized["temperature"] = options["temperature"]
+    if "top_p" in options:
+        normalized["top_p"] = options["top_p"]
+    maximum, temperature, top_p = generation_options(normalized, server_max_tokens)
+    return normalized, maximum, temperature, top_p
 
 
 # ---- GLM-5.2 tool calling -----------------------------------------------------------------
@@ -895,7 +956,12 @@ class Engine:
 
 
 def model_object(model_id, created, context_length=None, max_tokens=None):
-    model = {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
+    created_at = datetime.datetime.fromtimestamp(created, datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+    # Deliberately a superset accepted by OpenAI/OpenRouter and Anthropic clients.
+    model = {"id": model_id, "object": "model", "type": "model", "created": created,
+             "created_at": created_at, "display_name": "GLM-5.2 (Colibri)",
+             "owned_by": "colibri"}
     if context_length:
         model.update({
             "name": "GLM-5.2 (Colibri)",
@@ -992,11 +1058,21 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if request_id:
             self.send_header("x-request-id", request_id)
+            self.send_header("request-id", request_id)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.send_cors_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    def send_api_error(self, error, request_id, path):
+        if path.startswith("/v1/messages"):
+            body = anthropic_error_object(error, request_id)
+        elif path.startswith("/api/"):
+            body = ollama_error_object(error)
+        else:
+            body = error_object(error)
+        self.send_json(error.status, body, request_id, error.headers)
 
     def send_cors_headers(self):
         origin = self.headers.get("Origin")
@@ -1004,7 +1080,8 @@ class APIHandler(BaseHTTPRequestHandler):
             return
         self.send_header("Access-Control-Allow-Origin", "*" if "*" in self.server.cors_origins else origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, x-api-key")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
         self.send_header("Access-Control-Expose-Headers",
                          "x-request-id, x-colibri-queue-wait-ms, Retry-After")
         self.send_header("Access-Control-Max-Age", "600")
@@ -1056,7 +1133,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def serve_static(self, path):
         """Serve the built web UI (web/dist) so `coli web` is one process.
         Read-only, no auth (same trust level as /health), traversal-safe."""
-        if path.startswith("/v1/") or path == "/health":
+        if path.startswith("/v1/") or path.startswith("/api/") or path == "/health":
             return False
         base = self.WEB_DIST.resolve()
         if not base.is_dir():
@@ -1118,18 +1195,38 @@ class APIHandler(BaseHTTPRequestHandler):
                 return
             self.require_auth()
             if path == "/v1/models":
-                self.send_json(200, {"object": "list", "data": [model_object(
+                models = [model_object(
                     model_id, self.server.created, self.server.context_length,
                     self.server.max_tokens)
-                    for model_id in self.server.model_ids]}, request_id)
+                    for model_id in self.server.model_ids]
+                self.send_json(200, {"object": "list", "data": models,
+                                     "has_more": False,
+                                     "first_id": models[0]["id"] if models else None,
+                                     "last_id": models[-1]["id"] if models else None}, request_id)
             elif path.startswith("/v1/models/") and unquote(path[11:]) in self.server.model_ids:
                 self.send_json(200, model_object(unquote(path[11:]), self.server.created,
                                                  self.server.context_length,
                                                  self.server.max_tokens), request_id)
+            elif path == "/api/version":
+                self.send_json(200, {"version": "colibri-1.0"}, request_id)
+            elif path in ("/api/tags", "/api/ps"):
+                created_at = datetime.datetime.fromtimestamp(
+                    self.server.created, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                models = [{"name": model_id, "model": model_id,
+                           "modified_at": created_at, "size": 0,
+                           "digest": "colibri", "details": {
+                               "format": "colibri", "family": "glm", "families": ["glm"],
+                               "parameter_size": "744B", "quantization_level": "Q4"}}
+                          for model_id in self.server.model_ids]
+                if path == "/api/ps":
+                    for model in models:
+                        model["expires_at"] = "9999-12-31T23:59:59Z"
+                        model["size_vram"] = 0
+                self.send_json(200, {"models": models}, request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, error_object(error), request_id, error.headers)
+            self.send_api_error(error, request_id, urlsplit(self.path).path)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1139,11 +1236,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
+        path = urlsplit(self.path).path
         try:
             self.require_auth()
             body = self.read_json()
-            self.check_model(body)
-            path = urlsplit(self.path).path
+            if path not in ("/v1/messages/count_tokens", "/api/show"):
+                self.check_model(body)
             if path == "/v1/chat/completions":
                 self.chat_completion(body, request_id)
             elif path == "/v1/completions":
@@ -1151,11 +1249,21 @@ class APIHandler(BaseHTTPRequestHandler):
             elif path == "/v1/responses":
                 self.responses_api(body, request_id)
             elif path == "/v1/messages":
+                self.check_model(body)
                 self.anthropic_message(body, request_id)
+            elif path == "/v1/messages/count_tokens":
+                self.check_model(body)
+                self.anthropic_count_tokens(body, request_id)
+            elif path == "/api/chat":
+                self.ollama_chat(body, request_id)
+            elif path == "/api/generate":
+                self.ollama_generate(body, request_id)
+            elif path == "/api/show":
+                self.ollama_show(body, request_id)
             else:
                 raise APIError(404, "Not found.", None, "not_found")
         except APIError as error:
-            self.send_json(error.status, error_object(error), request_id, error.headers)
+            self.send_api_error(error, request_id, path)
         except ClientCancelled:
             pass
         except (BrokenPipeError, ConnectionResetError):
@@ -1165,7 +1273,7 @@ class APIHandler(BaseHTTPRequestHandler):
             api_error = APIError(500, "The colibri engine failed to process the request.",
                                  None, "engine_error", "server_error")
             try:
-                self.send_json(500, error_object(api_error), request_id)
+                self.send_api_error(api_error, request_id, path)
             except OSError:
                 pass
 
@@ -1398,8 +1506,169 @@ class APIHandler(BaseHTTPRequestHandler):
                           "message": "The colibri engine failed to process the request."}}})
         self.protocol_stream(normalized, prompt, request_id, factory, done, failed)
 
-    def anthropic_message(self, body, request_id):
+    def anthropic_count_tokens(self, body, request_id):
         normalized = dict(body)
+        normalized["messages"] = anthropic_messages(body)
+        normalized["tools"] = anthropic_tools(body.get("tools"))
+        thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
+        prompt = render_chat(normalized["messages"], thinking, effort,
+                             normalized["tools"], normalized.get("tool_choice"))
+        estimate = max(1, math.ceil(len(prompt.encode("utf-8")) / 4))
+        self.send_json(200, {"input_tokens": estimate}, request_id,
+                       {"x-colibri-token-count": "estimated"})
+
+    @staticmethod
+    def _ollama_time():
+        return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def ollama_show(self, body, request_id):
+        model = body.get("model") or body.get("name")
+        if model not in self.server.accepted_model_ids:
+            raise APIError(404, f"The model `{model}` does not exist.", "model", "model_not_found")
+        self.send_json(200, {"modelfile": "FROM colibri\n", "parameters": "",
+            "template": "GLM-5.2 native chat template", "details": {
+                "parent_model": "", "format": "colibri", "family": "glm",
+                "families": ["glm"], "parameter_size": "744B", "quantization_level": "Q4"},
+            "model_info": {"general.architecture": "glm4moe",
+                           "general.parameter_count": 744000000000,
+                           "glm.context_length": self.server.context_length or 0},
+            "capabilities": ["completion", "tools", "thinking"]}, request_id)
+
+    def _ollama_run(self, body, prompt, request_id, chat, tools, thinking):
+        _normalized, maximum, temperature, top_p = ollama_options(body, self.server.max_tokens)
+        stream = body.get("stream", True)
+        if not isinstance(stream, bool):
+            raise APIError(400, "`stream` must be a boolean.", "stream")
+        cache_slot = body.get("cache_slot")
+        if cache_slot is not None and (isinstance(cache_slot, bool) or
+                not isinstance(cache_slot, int) or not 0 <= cache_slot < self.server.kv_slots):
+            raise APIError(400, "Invalid cache slot.", "cache_slot")
+        model, started = body["model"], time.monotonic_ns()
+        watchdog = self.headers.get("X-Colibri-Watchdog") == "1"
+        with self.server.watchdog_request(watchdog), \
+                self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+            queue_wait, cache_slot = admission
+            headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            output = []
+            if not stream:
+                stats = self.server.engine.generate(prompt, maximum, temperature, top_p,
+                                                    output.append, cache_slot,
+                                                    self.client_disconnected)
+                reasoning, text = split_reasoning("".join(output), thinking)
+                text, calls = parse_tool_calls(text, tools) if tools else (text, [])
+                elapsed = time.monotonic_ns() - started
+                result = {"model": model, "created_at": self._ollama_time(), "done": True,
+                          "done_reason": "length" if stats["length_limited"] else "stop",
+                          "total_duration": elapsed, "load_duration": 0,
+                          "prompt_eval_count": stats["prompt_tokens"], "prompt_eval_duration": 0,
+                          "eval_count": stats["completion_tokens"], "eval_duration": elapsed}
+                if chat:
+                    message = {"role": "assistant", "content": text}
+                    if reasoning: message["thinking"] = reasoning
+                    if calls:
+                        message["tool_calls"] = [{"function": {
+                            "name": call["function"]["name"],
+                            "arguments": json.loads(call["function"]["arguments"])}}
+                            for call in calls]
+                    result["message"] = message
+                else:
+                    result["response"] = text
+                    if reasoning: result["thinking"] = reasoning
+                self.send_json(200, result, request_id, headers)
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("x-request-id", request_id)
+            for name, value in headers.items(): self.send_header(name, value)
+            self.send_cors_headers(); self.end_headers()
+            connected, raw = True, []
+            def write(payload):
+                nonlocal connected
+                if not connected: return
+                try:
+                    self.wfile.write((json.dumps(payload, ensure_ascii=False,
+                                                 separators=(",", ":")) + "\n").encode())
+                    self.wfile.flush()
+                except OSError:
+                    connected = False
+            def emit(kind, chunk):
+                payload = {"model": model, "created_at": self._ollama_time(), "done": False}
+                if chat:
+                    payload["message"] = {"role": "assistant", "content": ""}
+                    payload["message"][kind] = chunk
+                else:
+                    payload.update({"response": "", kind: chunk})
+                write(payload)
+            def content(chunk):
+                raw.append(chunk)
+                if not tools: emit("content" if chat else "response", chunk)
+            splitter = ReasoningStream(thinking, lambda chunk: emit("thinking", chunk), content)
+            stats = self.server.engine.generate(prompt, maximum, temperature, top_p,
+                                                splitter.feed, cache_slot, lambda: not connected)
+            splitter.close()
+            if tools:
+                text, calls = parse_tool_calls("".join(raw), tools)
+                if text: emit("content", text)
+                for call in calls:
+                    write({"model": model, "created_at": self._ollama_time(), "done": False,
+                           "message": {"role": "assistant", "content": "", "tool_calls": [{
+                               "function": {"name": call["function"]["name"], "arguments":
+                                            json.loads(call["function"]["arguments"])}}]}})
+            elapsed = time.monotonic_ns() - started
+            final = {"model": model, "created_at": self._ollama_time(), "done": True,
+                     "done_reason": "length" if stats["length_limited"] else "stop",
+                     "total_duration": elapsed, "load_duration": 0,
+                     "prompt_eval_count": stats["prompt_tokens"], "prompt_eval_duration": 0,
+                     "eval_count": stats["completion_tokens"], "eval_duration": elapsed}
+            final["message" if chat else "response"] = ({"role": "assistant", "content": ""}
+                                                         if chat else "")
+            write(final)
+            self.close_connection = True
+
+    def ollama_chat(self, body, request_id):
+        messages = ollama_messages(body.get("messages"))
+        tools = body.get("tools") or None
+        if tools is not None and not isinstance(tools, list):
+            raise APIError(400, "`tools` must be an array.", "tools")
+        normalized = dict(body)
+        if isinstance(body.get("think"), str):
+            normalized["reasoning_effort"] = body["think"]; normalized.pop("think")
+        thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
+        prompt = render_chat(messages, thinking, effort, tools, body.get("tool_choice"))
+        self.validate_prompt(prompt, {**body, "max_tokens": ollama_options(
+            body, self.server.max_tokens)[1]})
+        self._ollama_run(body, prompt, request_id, True, tools, thinking)
+
+    def ollama_generate(self, body, request_id):
+        prompt = body.get("prompt", "")
+        if not isinstance(prompt, str):
+            raise APIError(400, "`prompt` must be a string.", "prompt")
+        if body.get("images"):
+            raise APIError(400, "GLM-5.2 Colibri is text-only; images are unsupported.",
+                           "images", "unsupported_content_type")
+        normalized = dict(body)
+        if isinstance(body.get("think"), str):
+            normalized["reasoning_effort"] = body["think"]; normalized.pop("think")
+        thinking, effort = reasoning_settings(normalized, self.server.default_thinking)
+        if not body.get("raw", False):
+            messages = []
+            if body.get("system") is not None:
+                messages.append({"role": "system", "content": body["system"]})
+            messages.append({"role": "user", "content": prompt})
+            prompt = render_chat(messages, thinking, effort)
+        self.validate_prompt(prompt, {**body, "max_tokens": ollama_options(
+            body, self.server.max_tokens)[1]})
+        self._ollama_run(body, prompt, request_id, False, None, thinking)
+
+    def anthropic_message(self, body, request_id):
+        if "max_tokens" not in body:
+            raise APIError(400, "`max_tokens` is required.", "max_tokens")
+        normalized = dict(body)
+        if isinstance(normalized.get("thinking"), dict) and \
+                normalized["thinking"].get("type") == "adaptive":
+            normalized["thinking"] = {**normalized["thinking"], "type": "enabled"}
         normalized["messages"] = anthropic_messages(body)
         normalized["tools"] = anthropic_tools(body.get("tools"))
         choice = body.get("tool_choice")
@@ -1761,7 +2030,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
+def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2", api_key=None,
           cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, expert_bits=8, dense_bits=None,
           model_aliases=(), hidden_model_aliases=(), context_length=None,
@@ -1809,7 +2078,7 @@ def main():
     parser.add_argument("--engine", default=str(HERE / "glm"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2"))
     parser.add_argument("--model-alias", action="append", default=[])
     parser.add_argument("--hidden-model-alias", action="append", default=[])
     parser.add_argument("--default-thinking", action="store_true",

@@ -28,6 +28,9 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
 #endif
@@ -164,6 +167,14 @@ typedef struct {
     uint8_t *disk_buf;   /* staging buffer: one contiguous record per position (#1) */
     int64_t disk_buf_cap;
 } KVState;
+
+typedef struct {
+    int enabled;
+    int64_t budget;
+    unsigned long seq;
+    char dir[2048];
+} KVCachePool;
+static KVCachePool g_kv_cache;
 
 typedef struct {
     KVState *kv;
@@ -2529,6 +2540,14 @@ static void seldump(int layer,int pos,int nsel,const int *sel){
 /* kvs/pos describe a ragged decode batch: each row may belong to a different
  * sequence.  NULL keeps the original contiguous, currently-bound KV path. */
 #ifdef COLI_CUDA
+/* COLI_KV_F16: le ombre vivono nel formato del backend (fp16 di default) —
+ * i puntatori cuda_* sono OPACHI e ogni offset in elementi va scalato per
+ * kv_esz() o passato per gli helper _kv. */
+static size_t kv_esz(void){
+    static size_t e=0;
+    if(!e) e=coli_cuda_kv_f16()?2:4;
+    return e;
+}
 /* Ombra KV per-KVState sul device: righe [0,upto) valide sulla scheda di kv_b.
  * L'host resta canonico; ogni slot si riallinea indipendentemente e una
  * riscrittura accorcia solo l'ombra di quello slot. */
@@ -2539,8 +2558,8 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
         if(ks->cuda_Lc[layer]) coli_cuda_pipe_free(dev,ks->cuda_Lc[layer]);
         if(ks->cuda_Rc[layer]) coli_cuda_pipe_free(dev,ks->cuda_Rc[layer]);
         ks->cuda_Lc[layer]=NULL;ks->cuda_Rc[layer]=NULL;
-        float *Lc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*kvl*4);
-        float *Rc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*R*4);
+        float *Lc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*kvl*kv_esz());
+        float *Rc=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*R*kv_esz());
         if(!Lc||!Rc){
             if(Lc) coli_cuda_pipe_free(dev,Lc);
             if(Rc) coli_cuda_pipe_free(dev,Rc);
@@ -2551,10 +2570,10 @@ static int kv_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
     }
     int v=ks->cuda_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,ks->cuda_Lc[layer]+(size_t)v*kvl,
-            coli_kv_row(ks->Lc[layer],v,kvl),(size_t)(upto-v)*kvl*4)||
-           !coli_cuda_pipe_upload(dev,ks->cuda_Rc[layer]+(size_t)v*R,
-            coli_kv_row(ks->Rc[layer],v,R),(size_t)(upto-v)*R*4)) return 0;
+        if(!coli_cuda_pipe_upload_kv(dev,ks->cuda_Lc[layer],
+            coli_kv_row(ks->Lc[layer],v,kvl),(size_t)(upto-v)*kvl,(size_t)v*kvl)||
+           !coli_cuda_pipe_upload_kv(dev,ks->cuda_Rc[layer],
+            coli_kv_row(ks->Rc[layer],v,R),(size_t)(upto-v)*R,(size_t)v*R)) return 0;
         ks->cuda_valid[layer]=upto;
     }
     return 1;
@@ -2566,15 +2585,15 @@ static int ic_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
     Cfg *c=&m->c; int hd=c->index_hd, dev=l->kv_b.cuda_device;
     if(!ks||!ks->Ic||!ks->Ic[layer]||upto>ks->max_t) return 0;
     if(!ks->cuda_Ic[layer]){
-        float *Ic=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*hd*4);
+        float *Ic=(float*)coli_cuda_pipe_alloc(dev,(size_t)ks->max_t*hd*kv_esz());
         if(!Ic) return 0;
         ks->cuda_Ic[layer]=Ic;
         ks->cuda_ic_valid[layer]=0;
     }
     int v=ks->cuda_ic_valid[layer];
     if(v<upto){
-        if(!coli_cuda_pipe_upload(dev,ks->cuda_Ic[layer]+(size_t)v*hd,
-            coli_kv_row(ks->Ic[layer],v,hd),(size_t)(upto-v)*hd*4)) return 0;
+        if(!coli_cuda_pipe_upload_kv(dev,ks->cuda_Ic[layer],
+            coli_kv_row(ks->Ic[layer],v,hd),(size_t)(upto-v)*hd,(size_t)v*hd)) return 0;
         ks->cuda_ic_valid[layer]=upto;
     }
     return 1;
@@ -2586,9 +2605,12 @@ static int ic_dev_sync(Model *m, Layer *l, KVState *ks, int layer, int upto){
  * s*(pos_base+S), nk=pos_base+s+1 valori.  Chiamato dal backend a meta' catena. */
 static int chain_dsa_topk(void *u, const float *scores, int S, int pos_base,
                           int dtopk, int *sel, int *nsel){
-    (void)u; int T=pos_base+S;
+    int T=pos_base+S;
+    /* dtopk è la CAPACITÀ delle righe sel (index_topk + coda di riuso); la
+     * selezione resta sempre di index_topk elementi, semantica nativa */
+    int want=((Model*)u)->c.index_topk; if(want<1||want>dtopk) want=dtopk;
     for(int s=0;s<S;s++){
-        int nk=pos_base+s+1, keep=nk<dtopk?nk:dtopk;
+        int nk=pos_base+s+1, keep=nk<want?nk:want;
         const float *isc=scores+(size_t)s*T;
         float *tmp=falloc(nk); memcpy(tmp,isc,(size_t)nk*sizeof(float));
         partial_select_desc(tmp,nk,keep);
@@ -2619,12 +2641,21 @@ static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln
 /* COLI_DBG_DSACHAIN: engagement counters for the in-chain DSA selection */
 static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain;
 static long g_dsc_pfull,g_dsc_pshared,g_dsc_pfb;      /* prefill selection */
+static long g_dsc_reuse;                              /* COLI_DSA_REFRESH riusi */
 static int g_dsc_on=-1;
 static void dsc_report(void){
-    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld | fallback: pre %ld chain %ld"
+    double ts=0,tk=0; coli_cuda_dsac_times(&ts,&tk);
+    fprintf(stderr,"[DSAC] engaged: full %ld shared %ld reuse %ld | fallback: pre %ld chain %ld"
             " | prefill: full %ld shared %ld fb %ld\n",
-            g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain,
+            g_dsc_full,g_dsc_shared,g_dsc_reuse,g_dsc_fb_pre,g_dsc_fb_chain,
             g_dsc_pfull,g_dsc_pshared,g_dsc_pfb);
+    if(ts>0||tk>0)
+        fprintf(stderr,"[DSAC] chain mid-sync %.3fs (pipeline drain + score dl)"
+                " | host top-k %.3fs\n",ts,tk);
+    { double ph[3]; coli_cuda_dsac_phase_times(ph);
+      if(ph[0]>0||ph[1]>0||ph[2]>0)
+        fprintf(stderr,"[DSAC] chain GPU phases: proj+kv+score %.3fs |"
+                " absorb+o_proj %.3fs | tail %.3fs\n",ph[0],ph[1],ph[2]); }
 }
 static int dsc_enabled(void){
     if(g_dsc_on<0){ g_dsc_on=getenv("COLI_DBG_DSACHAIN")?atoi(getenv("COLI_DBG_DSACHAIN")):0;
@@ -2637,6 +2668,33 @@ static int dsa_chain_on(void){
     if(g_dsa_chain<0){ const char *e=getenv("COLI_DSA_CHAIN"); g_dsa_chain=e?atoi(e):1; }
     return g_dsa_chain;
 }
+/* COLI_DSA_DEVTOPK (default 1): top-k della selezione di PREFILL sul device
+ * (bit-identico all'host, vedi dsa_topk_rows nel backend) — niente download
+ * S_b*T dei punteggi ne' buffer host gigante.  =0 ripristina il top-k host. */
+static int dsa_devtopk_on(void){
+    static int v=-1;
+    if(v<0){ const char *e=getenv("COLI_DSA_DEVTOPK"); v=e?(atoi(e)!=0):1; }
+    return v;
+}
+/* COLI_DSA_REFRESH=N (default 1): in decode i layer FULL ricalcolano la selezione
+ * solo ogni N token; nei token intermedi riusano l'ultima selezione del layer,
+ * estesa con la coda delle posizioni nuove (mai perdere i token più recenti).
+ * ATTENZIONE: N>1 è un'APPROSSIMAZIONE — la semantica nativa (HF reference)
+ * seleziona a ogni token; index_topk_freq nel config è il PATTERN DI LAYER
+ * full/shared, non una frequenza temporale.  k_idx viene comunque accodato a
+ * Ic a ogni token (obbligatorio per i refresh futuri). */
+static int g_dsa_refresh=-1;
+static int dsa_refresh_n(void){
+    if(g_dsa_refresh<0){ const char *e=getenv("COLI_DSA_REFRESH");
+        g_dsa_refresh=e?atoi(e):1;
+        if(g_dsa_refresh<1) g_dsa_refresh=1;
+        if(g_dsa_refresh>64) g_dsa_refresh=64; }
+    return g_dsa_refresh;
+}
+/* cache per-layer dell'ultima selezione (solo refresh>1): posizione del refresh,
+ * numero di elementi, contesto kv di validità (slot diversi non si mischiano) */
+static int *g_dsa_rc_sel[128]; static int g_dsa_rc_n[128];
+static int g_dsa_rc_pos[128];  static void *g_dsa_rc_kv[128];
 /* Top-k esatto per la selezione di PREFILL sui punteggi device: righe di fase A
  * (nk<=topk) -> nsel 0 (attenzione densa causale), righe di fase B -> stessa
  * semantica del percorso CPU (partial select + scan in ordine di posizione).
@@ -2688,10 +2746,11 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if(l->q_a.cuda_device!=dev||l->q_b.cuda_device!=dev||
        l->kv_a.cuda_device!=dev||l->o.cuda_device!=dev) return 0;
     int st0=m->kv_start[layer], T=pos_base+S-st0, old=pos_base-st0;
-    if(T<S||T>8192) return 0;
+    if(T<S||T>131072) return 0;   /* tetto di memoria (scratch T*kvl), non di smem */
     double t0=now_s();
     size_t xb=(size_t)S*D*4, qrb=(size_t)S*ql*4, qb=(size_t)S*H*qh*4;
-    size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*4, rb=(size_t)T*R*4;
+    /* gli scratch Lc/Rc di ripiego vivono nel formato ombra (kv_esz) */
+    size_t cb=(size_t)S*(kvl+R)*4, lb=(size_t)T*kvl*kv_esz(), rb=(size_t)T*R*kv_esz();
     float *chost=NULL; int ok=0;
     /* scratch persistenti (slot fissi per device): zero churn di cudaMalloc */
     float *xd =x_is_dev?(float*)x:coli_cuda_pipe_scratch(dev,0,xb);
@@ -2721,13 +2780,14 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
      * re-upload only as fallback.  Re-streaming the whole prefix every call cost
      * O(context) PCIe traffic per layer per token. */
     { int dev_kv = g_cuda_pipe && layer<c->n_layers && kv_dev_sync(m,l,m->kv,layer,pos_base);
-      if(dev_kv){ ld_=m->kv->cuda_Lc[layer]+(size_t)st0*kvl; rd=m->kv->cuda_Rc[layer]+(size_t)st0*R; }
+      if(dev_kv){ ld_=(float*)((char*)m->kv->cuda_Lc[layer]+(size_t)st0*kvl*kv_esz());
+                  rd =(float*)((char*)m->kv->cuda_Rc[layer]+(size_t)st0*R*kv_esz()); }
       else if(old>0){
-        if(!coli_cuda_pipe_upload(dev,ld_,coli_kv_row(m->Lc[layer],st0,kvl),(size_t)old*kvl*4)||
-           !coli_cuda_pipe_upload(dev,rd,coli_kv_row(m->Rc[layer],st0,R),(size_t)old*R*4)) goto done;
+        if(!coli_cuda_pipe_upload_kv(dev,ld_,coli_kv_row(m->Lc[layer],st0,kvl),(size_t)old*kvl,0)||
+           !coli_cuda_pipe_upload_kv(dev,rd,coli_kv_row(m->Rc[layer],st0,R),(size_t)old*R,0)) goto done;
       }
-      if(!coli_cuda_pipe_copy2d(dev,ld_+(size_t)old*kvl,kvl,cd,kvl+R,kvl,S)) goto done;
-      if(!coli_cuda_pipe_copy2d(dev,rd+(size_t)old*R,R,cd+kvl,kvl+R,R,S)) goto done;
+      if(!coli_cuda_pipe_copy2d_kv(dev,ld_,kvl,cd,kvl+R,kvl,S,(size_t)old*kvl)) goto done;
+      if(!coli_cuda_pipe_copy2d_kv(dev,rd,R,cd+kvl,kvl+R,R,S,(size_t)old*R)) goto done;
       /* KV host resta canonica: scarica i record nuovi (gia' normati+ropati) */
       if(!coli_cuda_pipe_download(dev,cd,chost,cb)) goto done;
       for(int s=0;s<S;s++){
@@ -2751,7 +2811,10 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
     if(sel_need){
         dsc_enabled();
         int sB0=c->index_topk-pos_base; if(sB0<0) sB0=0;
-        if(!(dsa_chain_on() && S>=16)) goto sel_fail;
+        if(!(dsa_chain_on() && S>4)) goto sel_fail;   /* S<=4 e' territorio della catena;
+                                                        * 5..15 riempie tile wmma a meta'
+                                                        * ma batte di GRAN lunga la CPU
+                                                        * O(T)/riga (append agentici!) */
         if(c->idx_type[layer]){
             QT *wq=&m->ix_wq[layer],*wk=&m->ix_wk[layer],*wp=&m->ix_wp[layer];
             if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
@@ -2766,29 +2829,45 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
                 if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
                 d_ic=m->kv->cuda_Ic[layer];
             }else{
-                size_t icb=(size_t)(pos_base+S)*c->index_hd*4;
+                size_t icb=(size_t)(pos_base+S)*c->index_hd*kv_esz();
                 d_ic=coli_cuda_pipe_scratch(dev,22,icb);
                 if(!d_ic) goto sel_fail;
-                if(pos_base>0&&!coli_cuda_pipe_upload(dev,d_ic,m->Ic[layer],
-                    (size_t)pos_base*c->index_hd*4)) goto sel_fail;
-            }
-            static float *pisc=NULL; static size_t pisc_cap=0;
-            size_t need=(size_t)(S-sB0)*(pos_base+S);
-            if(need>pisc_cap){
-                float *p=realloc(pisc,need*sizeof(float));
-                if(!p) goto sel_fail;
-                pisc=p; pisc_cap=need;
+                if(pos_base>0&&!coli_cuda_pipe_upload_kv(dev,d_ic,m->Ic[layer],
+                    (size_t)pos_base*c->index_hd,0)) goto sel_fail;
             }
             ColiCudaDsaChain dsac; memset(&dsac,0,sizeof dsac);
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
             dsac.knw_dev=knw; dsac.knb_dev=knb; dsac.d_Ic=d_ic;
             dsac.nh=c->index_nh; dsac.hd=c->index_hd;
             dsac.ic_host=m->Ic[layer]+(int64_t)pos_base*c->index_hd;
-            dsac.iscore_host=pisc;
-            if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
-                goto sel_fail;
+            if(dsa_devtopk_on()){
+                /* selezione sul device: sel/nsel arrivano gia' pronti */
+                int dtopk=c->index_topk;
+                if((int64_t)S*dtopk > m->dsa_scap){
+                    free(m->dsa_sel); free(m->dsa_nsel);
+                    m->dsa_scap=(int64_t)S*dtopk;
+                    m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
+                    m->dsa_nsel=malloc((size_t)S*sizeof(int));
+                    if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; goto sel_fail; }
+                }
+                dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel; dsac.topk=dtopk;
+                if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
+                    goto sel_fail;
+                for(int s2=0;s2<sB0;s2++) m->dsa_nsel[s2]=0;
+            }else{
+                static float *pisc=NULL; static size_t pisc_cap=0;
+                size_t need=(size_t)(S-sB0)*(pos_base+S);
+                if(need>pisc_cap){
+                    float *p=realloc(pisc,need*sizeof(float));
+                    if(!p) goto sel_fail;
+                    pisc=p; pisc_cap=need;
+                }
+                dsac.iscore_host=pisc;
+                if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
+                    goto sel_fail;
+                if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
+            }
             if(g_cuda_pipe) m->kv->cuda_ic_valid[layer]=pos_base+S;
-            if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
             if(g_dsc_on) g_dsc_pfull++;
         }else{
             if(!m->dsa_nsel) goto sel_fail;
@@ -2827,15 +2906,15 @@ sel_fail:
                 float *st=stage+(size_t)d2*(stage_one/4);
                 size_t qsb=(size_t)S*hn*qh*4, csb=(size_t)S*hn*vh*4;
                 float *qs_r=coli_cuda_pipe_scratch(sdev,18,qsb);
-                float *ld_r=coli_cuda_pipe_scratch(sdev,19,(size_t)T*kvl*4);
-                float *rr_r=coli_cuda_pipe_scratch(sdev,20,(size_t)T*R*4);
+                float *ld_r=coli_cuda_pipe_scratch(sdev,19,(size_t)T*kvl*kv_esz());
+                float *rr_r=coli_cuda_pipe_scratch(sdev,20,(size_t)T*R*kv_esz());
                 float *cx_r=coli_cuda_pipe_scratch(sdev,21,csb);
                 int okd=qs_r&&ld_r&&rr_r&&cx_r;
                 /* slice di q: [S,H,qh] -> [S,hn,qh] contigua sul device di casa */
                 okd=okd&&coli_cuda_pipe_copy2d(dev,st,hn*qh,qd+(size_t)h0*qh,H*qh,hn*qh,S);
                 okd=okd&&coli_cuda_pipe_peer_copy(sdev,qs_r,dev,st,qsb);
-                okd=okd&&coli_cuda_pipe_peer_copy(sdev,ld_r,dev,ld_,(size_t)T*kvl*4);
-                okd=okd&&coli_cuda_pipe_peer_copy(sdev,rr_r,dev,rd,(size_t)T*R*4);
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,ld_r,dev,ld_,(size_t)T*kvl*kv_esz());
+                okd=okd&&coli_cuda_pipe_peer_copy(sdev,rr_r,dev,rd,(size_t)T*R*kv_esz());
                 okd=okd&&coli_cuda_attention_absorb_batch_dev(l->kv_b_shard[d2],cx_r,qs_r,ld_r,rr_r,
                         S,hn,c->qk_nope,R,vh,kvl,T,c->attn_scale);
                 okd=okd&&coli_cuda_pipe_peer_copy(dev,st,sdev,cx_r,csb);
@@ -2950,7 +3029,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     if((g_cuda_pipe||g_cuda_prefill)&&
        !kvs&&S>=8&&layer<c->n_layers&&g_cuda_enabled&&c->kv_lora<=512&&
        (!(m->has_dsa&&pos_base+S>c->index_topk) ||
-        (dsa_chain_on()&&!g_dsa_force&&S>=16&&m->kv_start[layer]==0))&&
+        (dsa_chain_on()&&!g_dsa_force&&S>4&&m->kv_start[layer]==0))&&
        l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
        l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
        qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
@@ -3166,8 +3245,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 cuda_core=0;
                 if(g_cuda_pipe&&!kvs&&layer<c->n_layers&&kv_dev_sync(m,l,ks,layer,pos+1))
                     cuda_core=coli_cuda_attention_absorb_kvdev(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
-                        Q+(int64_t)s*H*qh,ks->cuda_Lc[layer]+(size_t)st0*kvl,
-                        ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope,H,c->qk_nope,c->qk_rope,
+                        Q+(int64_t)s*H*qh,
+                        (float*)((char*)ks->cuda_Lc[layer]+(size_t)st0*kvl*kv_esz()),
+                        (float*)((char*)ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope*kv_esz()),
+                        H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
                 if(!cuda_core)
                     cuda_core=coli_cuda_attention_absorb(l->kv_b.cuda,ctx+(int64_t)s*H*vh,
@@ -4352,23 +4433,26 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
      * ignorerebbe la selezione. */
     int sel_pref = m->has_dsa && li<c->n_layers && !g_dsa_force && S>4 &&
                    pos_base+S>c->index_topk;
-    if(sel_pref && !(S>=16 && m->kv_start[li]==0 && dsa_chain_on())) return 0;
+    if(sel_pref && !(m->kv_start[li]==0 && dsa_chain_on())) return 0;
     /* COLI_DBG_DSACHAIN=1: contatori d'ingaggio (full/shared ok, fallback e dove) */
     dsc_enabled();
     #define DSC_FB(tag) do{ if(g_dsc_on){ g_dsc_fb_pre++; if(g_dsc_fb_pre<=20) \
         fprintf(stderr,"[DSAC] pre-fb %s li=%d\n",tag,li);} return 0; }while(0)
     ColiCudaDsaChain dsac, *pdsa=NULL;
-    int chain_did_sel=0;
+    int chain_did_sel=0, dsa_reused=0;
+    int rfr=dsa_refresh_n();
+    /* dcap: capacità delle righe sel = index_topk + coda di riuso (refresh>1) */
+    int dcap=c->index_topk+(rfr-1);
     if(sel_active){
-        if((int64_t)S*c->index_topk > m->dsa_scap){
+        if((int64_t)S*dcap > m->dsa_scap){
             free(m->dsa_sel); free(m->dsa_nsel);
-            m->dsa_scap=(int64_t)S*c->index_topk;
+            m->dsa_scap=(int64_t)S*dcap;
             m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
             m->dsa_nsel=calloc((size_t)S,sizeof(int));
             if(!m->dsa_sel||!m->dsa_nsel) DSC_FB("alloc");
         }
         memset(&dsac,0,sizeof dsac);
-        dsac.topk=c->index_topk; dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel;
+        dsac.topk=dcap; dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel;
         if(dsa_idx_layer){
             QT *wq=&m->ix_wq[li],*wk=&m->ix_wk[li],*wp=&m->ix_wp[li];
             if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
@@ -4379,24 +4463,40 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
             float *knb=li<256?pipe_ln_cache(dev,li,6,m->ix_knb[li],(size_t)c->index_hd):NULL;
             if(!knw||!knb) DSC_FB("kn");
             if(!ic_dev_sync(m,l,m->kv,li,pos_base)) DSC_FB("icsync");
-            static float *chain_iscore=NULL; static size_t chain_iscore_cap=0;
-            size_t need=(size_t)S*(pos_base+S);
-            if(need>chain_iscore_cap){
-                float *p=realloc(chain_iscore,need*sizeof(float));
-                if(!p) DSC_FB("iscore");
-                chain_iscore=p; chain_iscore_cap=need;
-            }
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
             dsac.knw_dev=knw; dsac.knb_dev=knb;
             dsac.d_Ic=m->kv->cuda_Ic[li];
             dsac.nh=c->index_nh; dsac.hd=c->index_hd;
-            dsac.iscore_host=chain_iscore;
-            dsac.topk_fn=chain_dsa_topk; dsac.topk_user=m;
             dsac.ic_host=m->Ic[li]+(int64_t)pos_base*c->index_hd;
+            /* riuso temporale (COLI_DSA_REFRESH>1): dentro la finestra, ultima
+             * selezione del layer + coda delle posizioni nuove; fuori, refresh. */
+            int cp=g_dsa_rc_pos[li];
+            if(rfr>1 && g_dsa_rc_n[li]>0 && g_dsa_rc_kv[li]==(void*)m->kv &&
+               cp<pos_base && (pos_base+S-1)-cp<rfr){
+                int n0=g_dsa_rc_n[li];
+                for(int s=0;s<S;s++){
+                    int pos=pos_base+s, *dst=m->dsa_sel+(int64_t)s*dcap, nd=n0;
+                    memcpy(dst,g_dsa_rc_sel[li],(size_t)n0*sizeof(int));
+                    /* la finestra garantisce pos-cp <= rfr-1, quindi nd <= dcap */
+                    for(int t=cp+1;t<=pos;t++) dst[nd++]=t;
+                    m->dsa_nsel[s]=nd;
+                }
+                dsac.score_off=1; dsa_reused=1;
+            }else{
+                static float *chain_iscore=NULL; static size_t chain_iscore_cap=0;
+                size_t need=(size_t)S*(pos_base+S);
+                if(need>chain_iscore_cap){
+                    float *p=realloc(chain_iscore,need*sizeof(float));
+                    if(!p) DSC_FB("iscore");
+                    chain_iscore=p; chain_iscore_cap=need;
+                }
+                dsac.iscore_host=chain_iscore;
+                dsac.topk_fn=chain_dsa_topk; dsac.topk_user=m;
+            }
         }else{
             /* SHARED: la selezione dell'ultimo layer FULL deve valere per QUESTE righe */
             for(int s=0;s<S;s++)
-                if(m->dsa_nsel[s]<1||m->dsa_nsel[s]>c->index_topk) DSC_FB("nsel");
+                if(m->dsa_nsel[s]<1||m->dsa_nsel[s]>dcap) DSC_FB("nsel");
         }
         pdsa=&dsac;
     }
@@ -4436,11 +4536,23 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                g_fuse_shared?l->sh_down.cuda:NULL,sI,
                dsa_idx_layer?chain_xn:NULL,pdsa)){
             m->kv->cuda_valid[li]=pos_base+S;
-            if(g_dsc_on&&sel_active){ if(dsa_idx_layer)g_dsc_full++; else g_dsc_shared++; }
+            if(g_dsc_on&&sel_active){ if(!dsa_idx_layer)g_dsc_shared++;
+                                      else if(dsa_reused)g_dsc_reuse++; else g_dsc_full++; }
             if(sel_active&&dsa_idx_layer){
                 /* k_idx calcolato sul device: righe host arrivate via ic_host */
                 chain_did_sel=1;
                 m->kv->cuda_ic_valid[li]=pos_base+S;
+                if(rfr>1&&!dsa_reused){
+                    /* refresh riuscito: memorizza la selezione dell'ultima riga */
+                    if(!g_dsa_rc_sel[li]) g_dsa_rc_sel[li]=malloc((size_t)c->index_topk*sizeof(int));
+                    int nlast=m->dsa_nsel[S-1];
+                    if(g_dsa_rc_sel[li]&&nlast>=1&&nlast<=c->index_topk){
+                        memcpy(g_dsa_rc_sel[li],m->dsa_sel+(int64_t)(S-1)*dcap,
+                               (size_t)nlast*sizeof(int));
+                        g_dsa_rc_n[li]=nlast; g_dsa_rc_pos[li]=pos_base+S-1;
+                        g_dsa_rc_kv[li]=(void*)m->kv;
+                    }else g_dsa_rc_n[li]=0;
+                }
             }
             if(!isnan(chain_scores[0])) chain_pre_logits=1;
             if(g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda) chain_did_shared=1;
@@ -4634,14 +4746,15 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                                                      : (g_cuda_ndev<=1 ? 1 : 8);
     /* DSA oltre index_topk: la catena residente gestisce la selezione per i
      * batch decode (S<=4) INTERAMENTE oltre la soglia (fase 2 inc.2); i batch
-     * prefill (S>=16) fanno la selezione per riga nel percorso GEMM (inc.3,
-     * split di fase in attn_pipe_prefill).  Batch 5..15 e batch decode a
-     * cavallo della soglia restano sul percorso CPU.  COLI_DSA_CHAIN=0
+     * S>4 fanno la selezione per riga nel percorso GEMM (inc.3, split di fase
+     * in attn_pipe_prefill; il limite storico S>=16 lasciava gli append
+     * agentici 5..15 sulla CPU O(T)/riga — 80s per 8 token a 13.4k).  Solo i
+     * batch decode a cavallo della soglia restano su CPU.  COLI_DSA_CHAIN=0
      * ripristina il comportamento tutto-CPU. */
     int pipe2 = g_cuda_pipe>=2 && !kvs && S>=pipe_s_min && g_cuda_enabled && c->kv_lora<=512 &&
                 (!(m->has_dsa && pos_base+S>c->index_topk) ||
                  (dsa_chain_on() && !g_dsa_force &&
-                  (S<=4 ? pos_base>=c->index_topk : S>=16)));
+                  (S<=4 ? pos_base>=c->index_topk : 1)));
     /* TAP/INJECT leggono/scrivono il residuo HOST dopo ogni layer; sotto PIPE2 x resta
      * sul device (stale sul host) -> i hook vedrebbero dati morti. Niente fallback muti. */
     if(pipe2 && (g_tap_l>=0 || g_inj_l>=0)){
@@ -4841,6 +4954,23 @@ static void kv_alloc(Model *m, int max_t){
 static void kv_bind(Model *m, KVState *k){
     m->kv=k; m->Lc=k->Lc; m->Rc=k->Rc; m->Ic=k->Ic;
     m->max_t=k->max_t; m->kv_start=k->kv_start;
+}
+
+/* Rewind del prefisso (serve/mux/reset): le righe host [len,..) verranno
+ * riscritte, quindi i watermark delle OMBRE device vanno riportati a len.
+ * Senza questo clamp, un prefill post-rewind che ripiega su CPU lascerebbe
+ * cuda_valid oltre la storia vera e l'attention assorbirebbe righe stantie
+ * dall'ombra (il percorso GPU si auto-riparava, quello CPU no). */
+static void kv_shadow_rewind(Model *m, KVState *k, int len){
+#ifdef COLI_CUDA
+    if(!k) return;
+    if(k->cuda_valid)    for(int i=0;i<m->c.n_layers;i++)
+        if(k->cuda_valid[i]>len) k->cuda_valid[i]=len;
+    if(k->cuda_ic_valid) for(int i=0;i<m->c.n_layers;i++)
+        if(k->cuda_ic_valid[i]>len) k->cuda_ic_valid[i]=len;
+#else
+    (void)m;(void)k;(void)len;
+#endif
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
@@ -5892,18 +6022,48 @@ static void repin_pass_limit(Model *m,int limit){
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
- * costa ~182 KB/token. File <SNAP>/.coli_kv append-only: header (magic + dimensioni +
+ * costa ~215 KB/token con il DSA indexer corrente. File <SNAP>/.coli_kv append-only: header (magic + dimensioni +
  * nrec) e un record per posizione [tok i32][Lc+Rc dei 78 layer][Ic DSA]. A fine turno
  * si appendono SOLO le posizioni nuove e si riscrive nrec per ultimo: un crash a meta'
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 static int g_kvsave=1;
 #define KV_MAGIC "COLIKV1\0"
+#define KV_META_MAGIC "COLIKT1\0"
+
+static int kv_common_prefix(const int *a, int na, const int *b, int nb){
+    int n=na<nb?na:nb, i=0;
+    while(i<n && a[i]==b[i]) i++;
+    return i;
+}
+
+static int kv_file_sync(FILE *f){
+    if(fflush(f)) return 0;
+#ifdef _WIN32
+    return _commit(_fileno(f))==0;
+#else
+    return fsync(fileno(f))==0;
+#endif
+}
+
+static int kv_file_seek(FILE *f, int64_t off, int whence){
+#ifdef _WIN32
+    return _fseeki64(f,off,whence)==0;
+#else
+    return fseeko(f,(off_t)off,whence)==0;
+#endif
+}
+
 static void kv_hdr(Model *m, int32_t *h, int nrec){
     Cfg *c=&m->c; int nic=0;
     for(int i=0;i<c->n_layers;i++) if(m->Ic && m->Ic[i]) nic++;
     h[0]=c->n_layers; h[1]=c->kv_lora; h[2]=c->qk_rope;
     h[3]=m->has_dsa?c->index_hd:0; h[4]=nic; h[5]=c->vocab; h[6]=nrec; h[7]=0;
+}
+static int kv_hdr_matches(Model *m, const int32_t *h){
+    int32_t w[8]; kv_hdr(m,w,0);
+    for(int i=0;i<6;i++) if(h[i]!=w[i]) return 0;
+    return 1;
 }
 /* Bytes of one on-disk record: [tok i32][Lc+Rc per layer][Ic per DSA layer].
  * Layout matches what kv_disk_append writes and kv_disk_load reads. */
@@ -5939,7 +6099,7 @@ static void kv_disk_truncate(Model *m, int nrec){
     FILE *f=fopen(k->disk_path,"r+b");
     if(!f){ k->disk_nrec=0; return; }
     k->disk_nrec=nrec;
-    int32_t nr=nrec; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
+    int32_t nr=nrec; kv_file_seek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
     fflush(f); fclose(f);
 }
 static void kv_disk_reset(Model *m){ kv_disk_truncate(m,0); }
@@ -5956,7 +6116,7 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         if(!nb) return;                    /* OOM: skip this turn, retry next */
         k->disk_buf=nb; k->disk_buf_cap=rec;
     }
-    fseek(f, 8+8*4 + (int64_t)k->disk_nrec*rec, SEEK_SET);
+    kv_file_seek(f,8+8*4+(int64_t)k->disk_nrec*rec,SEEK_SET);
     for(int p=k->disk_nrec;p<len;p++){
         uint8_t *b=k->disk_buf;            /* pack token + every layer into one record */
         *(int32_t*)b = hist[p]; b+=4;
@@ -5970,27 +6130,31 @@ static void kv_disk_append(Model *m, const int *hist, int len){
         fwrite(k->disk_buf, 1, (size_t)rec, f);   /* one fwrite per position (was ~157) */
     }
     fflush(f);                                   /* dati prima, contatore poi */
-    int32_t nr=len; fseek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
+    int32_t nr=len; kv_file_seek(f,8+6*4,SEEK_SET); fwrite(&nr,4,1,f);
     fflush(f);                                   /* persist the counter too */
     k->disk_nrec=len;
 }
-static int kv_disk_load(Model *m, int *hist, int maxctx){
-    if(!g_kvsave) return 0;
-    KVState *k=m->kv;
+static int kv_disk_load_prefix(Model *m, const char *path, int *hist,
+                               int maxctx, int limit, const int *expect, int announce){
+    if(!g_kvsave || !path || !path[0]) return 0;
     Cfg *c=&m->c;
-    FILE *f=fopen(k->disk_path,"rb"); if(!f) return 0;
-    char mg[8]; int32_t h[8], w[8]; kv_hdr(m,w,0);
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    char mg[8]; int32_t h[8];
     if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) || fread(h,4,8,f)!=8 ||
-       h[0]!=w[0]||h[1]!=w[1]||h[2]!=w[2]||h[3]!=w[3]||h[4]!=w[4]||h[5]!=w[5]){
+       !kv_hdr_matches(m,h)){
         fprintf(stderr,"[KV] ignoring .coli_kv from a different model or version\n"); fclose(f); return 0; }
     int nrec=h[6];
     if(nrec<1){ fclose(f); return 0; }
-    if(nrec>=maxctx-8-g_draft){
+    if(limit<0 && nrec>=maxctx-8-g_draft){
         fprintf(stderr,"[KV] saved conversation (%d tokens) exceeds the context: starting over\n",nrec);
         fclose(f); return 0; }
+    if(limit>=0 && nrec>limit) nrec=limit;
+    if(nrec>=maxctx){ fclose(f); return 0; }
     double t0=now_s();
     for(int p=0;p<nrec;p++){
-        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; } hist[p]=tk;
+        int32_t tk; if(fread(&tk,4,1,f)!=1){ nrec=p; break; }
+        if(expect && tk!=expect[p]){ nrec=p; break; }
+        hist[p]=tk;
         for(int i=0;i<c->n_layers;i++){
             if(fread(m->Lc[i]+(int64_t)p*c->kv_lora, 4, c->kv_lora, f)!=(size_t)c->kv_lora ||
                fread(m->Rc[i]+(int64_t)p*c->qk_rope, 4, c->qk_rope, f)!=(size_t)c->qk_rope){ nrec=p; goto out; }
@@ -6001,15 +6165,250 @@ static int kv_disk_load(Model *m, int *hist, int maxctx){
 out:
     fclose(f);
     if(nrec>0){
+        memset(m->kv_start,0,(size_t)(c->n_layers+1)*sizeof(int));
         if(m->has_mtp) m->kv_start[c->n_layers]=-1;    /* la finestra MTP riparte da sola */
-        fprintf(stderr,"[KV] resumed conversation from disk: %d tokens in %.1fs (no re-prefill)\n",
+        if(announce) fprintf(stderr,"[KV] resumed conversation from disk: %d tokens in %.1fs (no re-prefill)\n",
             nrec, now_s()-t0);
     }
+    return nrec;
+}
+
+static int kv_disk_load(Model *m, int *hist, int maxctx){
+    KVState *k=m->kv;
+    int nrec=kv_disk_load_prefix(m,k->disk_path,hist,maxctx,-1,NULL,1);
     k->disk_nrec=nrec;
     return nrec;
 }
 
-typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+static int kv_cache_mkdir(const char *path){
+#ifdef _WIN32
+    if(_mkdir(path) && errno!=EEXIST) return 0;
+#else
+    if(mkdir(path,0700) && errno!=EEXIST) return 0;
+    chmod(path,0700);
+#endif
+    return 1;
+}
+
+static int kv_cache_pair_path(const char *tok, char *kv, size_t cap){
+    size_t n=strlen(tok);
+    if(n<4 || strcmp(tok+n-4,".tok") || n+1>cap) return 0;
+    memcpy(kv,tok,n-3); memcpy(kv+n-3,"kv",3); kv[n]=0;
+    return 1;
+}
+
+/* Return exact token-prefix length, or -1 for an invalid/incomplete entry. */
+static int kv_cache_meta_match(Model *m, const char *tok_path,
+                               const int *tokens, int nt, int *stored_len){
+    FILE *f=fopen(tok_path,"rb"); if(!f) return -1;
+    char mg[8]; int32_t h[8];
+    if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_META_MAGIC,8) ||
+       fread(h,4,8,f)!=8 || !kv_hdr_matches(m,h) || h[6]<1){
+        fclose(f); return -1;
+    }
+    char kv_path[2048]; struct stat st;
+    int64_t rec=kv_rec_bytes(m), nrec=h[6];
+    if(!kv_cache_pair_path(tok_path,kv_path,sizeof(kv_path)) ||
+       nrec>(INT64_MAX-40)/rec || stat(kv_path,&st) ||
+       (int64_t)st.st_size < 40+nrec*rec){
+        fclose(f); return -1;
+    }
+    FILE *kf=fopen(kv_path,"rb"); char kmg[8]; int32_t kh[8];
+    if(!kf || fread(kmg,1,8,kf)!=8 || memcmp(kmg,KV_MAGIC,8) ||
+       fread(kh,4,8,kf)!=8 || !kv_hdr_matches(m,kh) || kh[6]<h[6]){
+        if(kf) fclose(kf); fclose(f); return -1;
+    }
+    fclose(kf);
+    int n=nt<h[6]?nt:h[6], match=0;
+    for(int i=0;i<n;i++){
+        int32_t t;
+        if(fread(&t,4,1,f)!=1){ fclose(f); return -1; }
+        if(t!=tokens[i]) break;
+        match++;
+    }
+    fclose(f); if(stored_len) *stored_len=h[6];
+    return match;
+}
+
+static int kv_cache_find_best(Model *m, const int *tokens, int nt,
+                              char *best_tok, size_t cap){
+    DIR *d=opendir(g_kv_cache.dir); if(!d) return 0;
+    struct dirent *e; int best=0; time_t best_time=0;
+    while((e=readdir(d))){
+        size_t n=strlen(e->d_name);
+        if(n<5 || strcmp(e->d_name+n-4,".tok")) continue;
+        char path[2048];
+        if(snprintf(path,sizeof(path),"%s/%s",g_kv_cache.dir,e->d_name)>=(int)sizeof(path)) continue;
+        int match=kv_cache_meta_match(m,path,tokens,nt,NULL);
+        struct stat st;
+        if(match>best || (match==best && match>0 && !stat(path,&st) && st.st_mtime>best_time)){
+            if(strlen(path)+1<=cap){
+                strcpy(best_tok,path); best=match;
+                best_time=!stat(path,&st)?st.st_mtime:0;
+            }
+        }
+    }
+    closedir(d); return best;
+}
+
+static void kv_cache_hash(const int *tokens, int len, uint64_t *a, uint64_t *b){
+    uint64_t x=1469598103934665603ULL, y=1099511628211ULL;
+    for(int i=0;i<len;i++){
+        uint32_t v=(uint32_t)tokens[i];
+        for(int s=0;s<32;s+=8){
+            uint8_t c=(uint8_t)(v>>s);
+            x=(x^c)*1099511628211ULL;
+            y^=(uint64_t)c+0x9e3779b97f4a7c15ULL+(y<<6)+(y>>2);
+        }
+    }
+    *a=x; *b=y;
+}
+
+static int kv_cache_write_data(Model *m, const char *path, const int *hist, int len){
+    FILE *f=fopen(path,"wb"); if(!f) return 0;
+#ifndef _WIN32
+    chmod(path,0600);
+#endif
+    int ok=1; int32_t h[8]; kv_hdr(m,h,len);
+    if(fwrite(KV_MAGIC,1,8,f)!=8 || fwrite(h,4,8,f)!=8) ok=0;
+    Cfg *c=&m->c; KVState *k=m->kv; int64_t rec=kv_rec_bytes(m);
+    if(ok && rec>k->disk_buf_cap){
+        uint8_t *nb=realloc(k->disk_buf,(size_t)rec);
+        if(!nb) ok=0; else { k->disk_buf=nb; k->disk_buf_cap=rec; }
+    }
+    for(int p=0;ok && p<len;p++){
+        uint8_t *q=k->disk_buf;
+        int32_t tk=hist[p]; memcpy(q,&tk,4); q+=4;
+        for(int i=0;i<c->n_layers;i++){
+            memcpy(q,m->Lc[i]+(int64_t)p*c->kv_lora,(size_t)c->kv_lora*4); q+=c->kv_lora*4;
+            memcpy(q,m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); q+=c->qk_rope*4;
+        }
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
+            memcpy(q,m->Ic[i]+(int64_t)p*c->index_hd,(size_t)c->index_hd*4); q+=c->index_hd*4;
+        }
+        if(fwrite(k->disk_buf,1,(size_t)rec,f)!=(size_t)rec) ok=0;
+    }
+    if(ok) ok=kv_file_sync(f);
+    if(fclose(f)) ok=0;
+    if(!ok) remove(path);
+    return ok;
+}
+
+static int kv_cache_extend_data(Model *m, const char *path,
+                                const int *hist, int from, int len){
+    FILE *f=fopen(path,"r+b"); if(!f) return 0;
+    char mg[8]; int32_t h[8]; int ok=1;
+    if(fread(mg,1,8,f)!=8 || memcmp(mg,KV_MAGIC,8) ||
+       fread(h,4,8,f)!=8 || !kv_hdr_matches(m,h) || h[6]<from) ok=0;
+    Cfg *c=&m->c; KVState *k=m->kv; int64_t rec=kv_rec_bytes(m);
+    if(ok && rec>k->disk_buf_cap){
+        uint8_t *nb=realloc(k->disk_buf,(size_t)rec);
+        if(!nb) ok=0; else { k->disk_buf=nb; k->disk_buf_cap=rec; }
+    }
+    if(ok && !kv_file_seek(f,40+(int64_t)from*rec,SEEK_SET)) ok=0;
+    for(int p=from;ok && p<len;p++){
+        uint8_t *q=k->disk_buf;
+        int32_t tk=hist[p]; memcpy(q,&tk,4); q+=4;
+        for(int i=0;i<c->n_layers;i++){
+            memcpy(q,m->Lc[i]+(int64_t)p*c->kv_lora,(size_t)c->kv_lora*4); q+=c->kv_lora*4;
+            memcpy(q,m->Rc[i]+(int64_t)p*c->qk_rope,(size_t)c->qk_rope*4); q+=c->qk_rope*4;
+        }
+        if(m->has_dsa) for(int i=0;i<c->n_layers;i++) if(m->Ic[i]){
+            memcpy(q,m->Ic[i]+(int64_t)p*c->index_hd,(size_t)c->index_hd*4); q+=c->index_hd*4;
+        }
+        if(fwrite(k->disk_buf,1,(size_t)rec,f)!=(size_t)rec) ok=0;
+    }
+    if(ok) ok=kv_file_sync(f);               /* new records durable before nrec */
+    if(ok){
+        int32_t nr=len;
+        if(!kv_file_seek(f,8+6*4,SEEK_SET) || fwrite(&nr,4,1,f)!=1 || !kv_file_sync(f)) ok=0;
+    }
+    if(fclose(f)) ok=0;
+    return ok;
+}
+
+static int kv_cache_write_meta(Model *m, const char *path, const int *hist, int len){
+    FILE *f=fopen(path,"wb"); if(!f) return 0;
+#ifndef _WIN32
+    chmod(path,0600);
+#endif
+    int32_t h[8]; kv_hdr(m,h,len);
+    int ok=fwrite(KV_META_MAGIC,1,8,f)==8 && fwrite(h,4,8,f)==8;
+    if(ok && fwrite(hist,4,(size_t)len,f)!=(size_t)len) ok=0;
+    if(ok) ok=kv_file_sync(f);
+    if(fclose(f)) ok=0;
+    if(!ok) remove(path);
+    return ok;
+}
+
+typedef struct { char kv[2048], tok[2048]; int64_t bytes; time_t age; } KVEvict;
+static int kv_evict_cmp(const void *aa, const void *bb){
+    const KVEvict *a=aa,*b=bb;
+    return a->age<b->age?-1:a->age>b->age?1:strcmp(a->kv,b->kv);
+}
+
+static void kv_cache_evict(const char *keep_tok){
+    DIR *d=opendir(g_kv_cache.dir); if(!d) return;
+    KVEvict *v=NULL; int n=0,cap=0; int64_t total=0; struct dirent *e;
+    while((e=readdir(d))){
+        size_t z=strlen(e->d_name);
+        if(z<4 || strcmp(e->d_name+z-3,".kv")) continue;
+        KVEvict x={0};
+        if(snprintf(x.kv,sizeof(x.kv),"%s/%s",g_kv_cache.dir,e->d_name)>=(int)sizeof(x.kv)) continue;
+        struct stat ks,ts; if(stat(x.kv,&ks)) continue;
+        strcpy(x.tok,x.kv); strcpy(x.tok+strlen(x.tok)-2,"tok");
+        x.bytes=ks.st_size; x.age=ks.st_mtime;
+        if(!stat(x.tok,&ts)){ x.bytes+=ts.st_size; x.age=ts.st_mtime; }
+        if(n==cap){ cap=cap?cap*2:16; KVEvict *nv=realloc(v,(size_t)cap*sizeof(*v));
+            if(!nv){ free(v); closedir(d); return; } v=nv; }
+        v[n++]=x; total+=x.bytes;
+    }
+    closedir(d);
+    qsort(v,(size_t)n,sizeof(*v),kv_evict_cmp);
+    for(int i=0;i<n && total>g_kv_cache.budget;i++){
+        if(keep_tok && !strcmp(v[i].tok,keep_tok)) continue;
+        if(!remove(v[i].kv)){ remove(v[i].tok); total-=v[i].bytes; }
+    }
+    if(total>g_kv_cache.budget)
+        fprintf(stderr,"[KV-CACHE] newest snapshot alone exceeds %.1f GB; kept for correctness\n",
+                g_kv_cache.budget/1e9);
+    free(v);
+}
+
+static void kv_cache_setup(Model *m, const char *snap, int nctx){
+    const char *s=getenv("COLI_KV_CACHE_GB");
+    if(!s || atof(s)<=0) return;
+    if(!g_kvsave){ fprintf(stderr,"COLI_KV_CACHE_GB requires KVSAVE=1\n"); exit(2); }
+    if(nctx!=1){ fprintf(stderr,"COLI_KV_CACHE_GB requires KV_SLOTS=1 (one active RAM context)\n"); exit(2); }
+    const char *dir=getenv("COLI_KV_CACHE_DIR");
+    int n=dir?snprintf(g_kv_cache.dir,sizeof(g_kv_cache.dir),"%s",dir)
+             :snprintf(g_kv_cache.dir,sizeof(g_kv_cache.dir),"%s/.coli_kv_cache",snap);
+    if(n<0 || n>=(int)sizeof(g_kv_cache.dir) || !kv_cache_mkdir(g_kv_cache.dir)){
+        fprintf(stderr,"[KV-CACHE] cannot create cache directory: %s\n",g_kv_cache.dir); exit(2);
+    }
+    g_kv_cache.budget=(int64_t)(atof(s)*1e9);
+    g_kv_cache.enabled=1;
+    DIR *d=opendir(g_kv_cache.dir); struct dirent *e;
+    if(d){ while((e=readdir(d))){
+        char p[2048];
+        if(snprintf(p,sizeof(p),"%s/%s",g_kv_cache.dir,e->d_name)>=(int)sizeof(p)) continue;
+        if(strstr(e->d_name,".tmp.")){ remove(p); continue; }
+        size_t z=strlen(e->d_name);
+        if(z>=5 && !strcmp(e->d_name+z-4,".tok")){
+            char kv[2048]; struct stat st;
+            if(kv_cache_pair_path(p,kv,sizeof(kv)) && stat(kv,&st)) remove(p);
+        }
+    } closedir(d); }
+    fprintf(stderr,"[KV-CACHE] one RAM context, %.1f GB disk budget at %s (%.0f KB/token)\n",
+        g_kv_cache.budget/1e9,g_kv_cache.dir,kv_rec_bytes(m)/1000.0);
+    kv_cache_evict(NULL);
+}
+
+typedef struct {
+    KVState kv;
+    int *hist, len, first;
+    char source_tok[2048];
+} ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 static void adaptive_cap_set(Model *m, int planned_ctx);
 static void adaptive_cap_note_used(int used_ctx);
@@ -6045,6 +6444,130 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
 }
 
+static void kv_cache_remove_pair(const char *tok){
+    char kv[2048];
+    if(kv_cache_pair_path(tok,kv,sizeof(kv))) remove(kv);
+    remove(tok);
+}
+
+static int kv_cache_checkpoint(Model *m, ServeCtx *s){
+    if(!g_kv_cache.enabled || s->len<1) return 1;
+    uint64_t a,b; kv_cache_hash(s->hist,s->len,&a,&b);
+    char final_kv[2048]={0},final_tok[2048]={0};
+    int exact=0;
+    for(int suffix=0;suffix<100;suffix++){
+        int n=suffix
+            ? snprintf(final_kv,sizeof(final_kv),"%s/%016llx%016llx-%d-%d.kv",
+                g_kv_cache.dir,(unsigned long long)a,(unsigned long long)b,s->len,suffix)
+            : snprintf(final_kv,sizeof(final_kv),"%s/%016llx%016llx-%d.kv",
+                g_kv_cache.dir,(unsigned long long)a,(unsigned long long)b,s->len);
+        if(n<0 || n>=(int)sizeof(final_kv)) return 0;
+        strcpy(final_tok,final_kv); strcpy(final_tok+strlen(final_tok)-2,"tok");
+        struct stat st;
+        if(stat(final_tok,&st)){ break; }
+        int stored=0, match=kv_cache_meta_match(m,final_tok,s->hist,s->len,&stored);
+        if(match==s->len && stored==s->len){ exact=1; break; }
+        if(match<0) break;                       /* stale/corrupt pair: replace it */
+        final_kv[0]=final_tok[0]=0;              /* real hash collision */
+    }
+    if(!final_kv[0]) return 0;
+    if(exact){
+        FILE *f=fopen(final_tok,"r+b");
+        if(f){ fwrite(KV_META_MAGIC,1,8,f); kv_file_sync(f); fclose(f); }
+    }else{
+        double t0=now_s();
+        int old_len=0, old_match=-1, linear=0;
+        char old_kv[2048];
+        if(s->source_tok[0] && strcmp(s->source_tok,final_tok) &&
+           kv_cache_pair_path(s->source_tok,old_kv,sizeof(old_kv))){
+            old_match=kv_cache_meta_match(m,s->source_tok,s->hist,s->len,&old_len);
+            linear=old_len>0 && old_len<s->len && old_match==old_len;
+        }
+        if(linear){
+            /* Publish the old prefix under the new name first. At every point
+             * either the old pair or this pair is valid; then append only the
+             * new records with the legacy data-before-nrec commit order. */
+            if(!kv_cache_write_meta(m,final_tok,s->hist,old_len) ||
+               rename(old_kv,final_kv)){
+                remove(final_tok); linear=0;      /* old source pair is untouched */
+            }else{
+                remove(s->source_tok);
+                strcpy(s->source_tok,final_tok);
+                if(!kv_cache_extend_data(m,final_kv,s->hist,old_len,s->len)){
+                    fprintf(stderr,"[KV-CACHE] delta checkpoint failed; retained %d-token prefix\n",old_len);
+                    kv_cache_evict(final_tok); return 0;
+                }
+                unsigned long seq=++g_kv_cache.seq; char tmp_tok[2048];
+                if(snprintf(tmp_tok,sizeof(tmp_tok),"%s.tmp.%ld.%lu",
+                    final_tok,(long)getpid(),seq)>=(int)sizeof(tmp_tok) ||
+                   !kv_cache_write_meta(m,tmp_tok,s->hist,s->len) ||
+                   rename(tmp_tok,final_tok)){
+                    remove(tmp_tok);
+                    fprintf(stderr,"[KV-CACHE] metadata publish failed; retained %d-token prefix\n",old_len);
+                    kv_cache_evict(final_tok); return 0;
+                }
+                fprintf(stderr,"[KV-CACHE] extended %d -> %d tokens (+%.2f GB) in %.1fs\n",
+                    old_len,s->len,(double)(s->len-old_len)*kv_rec_bytes(m)/1e9,now_s()-t0);
+            }
+        }
+        if(!linear){
+            unsigned long seq=++g_kv_cache.seq;
+            char tmp_kv[2048],tmp_tok[2048];
+            if(snprintf(tmp_kv,sizeof(tmp_kv),"%s.tmp.%ld.%lu",final_kv,(long)getpid(),seq)>=(int)sizeof(tmp_kv) ||
+               snprintf(tmp_tok,sizeof(tmp_tok),"%s.tmp.%ld.%lu",final_tok,(long)getpid(),seq)>=(int)sizeof(tmp_tok))
+                return 0;
+            if(!kv_cache_write_data(m,tmp_kv,s->hist,s->len) ||
+               !kv_cache_write_meta(m,tmp_tok,s->hist,s->len)){
+                remove(tmp_kv); remove(tmp_tok);
+                fprintf(stderr,"[KV-CACHE] checkpoint failed: %s\n",strerror(errno));
+                return 0;
+            }
+            if(rename(tmp_kv,final_kv) || rename(tmp_tok,final_tok)){
+                remove(tmp_kv); remove(tmp_tok); remove(final_kv);
+                fprintf(stderr,"[KV-CACHE] checkpoint publish failed: %s\n",strerror(errno));
+                return 0;
+            }
+#ifndef _WIN32
+            chmod(final_kv,0600); chmod(final_tok,0600);
+#endif
+            fprintf(stderr,"[KV-CACHE] checkpointed %d tokens (%.2f GB) in %.1fs\n",
+                s->len,(40+(double)s->len*kv_rec_bytes(m))/1e9,now_s()-t0);
+        }
+    }
+    if(s->source_tok[0] && strcmp(s->source_tok,final_tok)){
+        int old_len=0;
+        int match=kv_cache_meta_match(m,s->source_tok,s->hist,s->len,&old_len);
+        if(match==old_len && old_len<=s->len) kv_cache_remove_pair(s->source_tok);
+    }
+    strcpy(s->source_tok,final_tok);
+    kv_cache_evict(final_tok);
+    return 1;
+}
+
+static int kv_cache_restore_best(Model *m, ServeCtx *s,
+                                 const int *prompt, int nt, int maxctx){
+    int current=kv_common_prefix(s->hist,s->len,prompt,nt);
+    char best_tok[2048]={0};
+    int best=kv_cache_find_best(m,prompt,nt,best_tok,sizeof(best_tok));
+    if(best<=current) return current;             /* RAM wins ties: zero disk I/O */
+    char best_kv[2048];
+    if(!kv_cache_pair_path(best_tok,best_kv,sizeof(best_kv))) return current;
+    kv_shadow_rewind(m,&s->kv,0);
+    double t0=now_s();
+    int got=kv_disk_load_prefix(m,best_kv,s->hist,maxctx,best,prompt,0);
+    if(got!=best){
+        s->len=current; s->first=current==0;
+        fprintf(stderr,"[KV-CACHE] failed to restore %s; retaining %d-token RAM prefix\n",
+                best_kv,current);
+        return current;
+    }
+    s->len=got; s->first=got==0;
+    strcpy(s->source_tok,best_tok);
+    fprintf(stderr,"[KV-CACHE] restored longest prefix: %d/%d tokens, %.1fs\n",
+            got,nt,now_s()-t0);
+    return got;
+}
+
 typedef struct {
     int active, pending, emitted, maximum, prompt_tokens, prof_tokens, length_limited;
     unsigned long long id;
@@ -6077,6 +6600,10 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
      * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
      * batched forwards, so the shares describe the whole engine over the
      * window, not the single request (same convention as the STAT hit% below). */
+    kv_bind(m,&sc->kv);
+    if(g_kv_cache.enabled) kv_cache_checkpoint(m,sc);
+    else kv_disk_append(m,sc->hist,sc->len);
+    /* DONE is the client commit point: publish it only after the turn is durable. */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
            r->prompt_tokens,r->emitted,
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
@@ -6085,7 +6612,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
-    fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
+    fflush(stdout);
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
@@ -6108,7 +6635,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
         }
         for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==id){
             req[i].active=0; kv_bind(m,&ctx[i].kv);
-            kv_disk_append(m,ctx[i].hist,ctx[i].len);
+            if(g_kv_cache.enabled) kv_cache_checkpoint(m,&ctx[i]);
+            else kv_disk_append(m,ctx[i].hist,ctx[i].len);
             printf("ERROR %llu CANCELLED\n",id); fflush(stdout); free(line); return 0;
         }
         printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
@@ -6140,9 +6668,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-2);
     free(raw); free(line);
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
-    int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    int prefix=g_kv_cache.enabled
+        ? kv_cache_restore_best(m,sc,tmp,nt,maxctx)
+        : kv_common_prefix(sc->hist,sc->len,tmp,nt);
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
-        kv_disk_truncate(m,sc->len); }
+        kv_shadow_rewind(m,&sc->kv,prefix);
+        if(!g_kv_cache.enabled) kv_disk_truncate(m,sc->len); }
     int add=nt-sc->len;
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     int64_t planned64=(int64_t)nt+sub.max_tokens;
@@ -6176,10 +6707,18 @@ static void run_serve_mux(Model *m, const char *snap){
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>16){fprintf(stderr,"KV_SLOTS deve essere tra 1 e 16\n");exit(2);}
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
+    if(g_inj_v && g_kvsave){
+        g_kvsave=0;
+        fprintf(stderr,"[INJECT] KVSAVE forced to 0: persisted KV cannot encode steering state\n");
+    }
+    if(getenv("COLI_KV_CACHE_GB") && atof(getenv("COLI_KV_CACHE_GB"))>0 && nctx!=1){
+        fprintf(stderr,"COLI_KV_CACHE_GB requires KV_SLOTS=1 (one active RAM context)\n"); exit(2);
+    }
     KVState *initial=m->kv; free(initial->kv_start); free(initial);
     ServeCtx *ctx=calloc(nctx,sizeof(*ctx)); ServeReq *req=calloc(nctx,sizeof(*req));
     for(int i=0;i<nctx;i++){ serve_ctx_init(m,&ctx[i],snap,i,maxctx);
         adaptive_cap_note_used(ctx[i].len); }
+    kv_cache_setup(m,snap,nctx);
 #ifdef _WIN32
     /* Same byte-exact protocol as run_serve: in TEXT mode the CRT collapses CRLF in
      * fread() payloads (waits forever for the missing bytes) and expands LF on the
@@ -6313,6 +6852,7 @@ static void run_serve(Model *m, const char *snap){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ adaptive_cap_note_used(len);
             len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+            kv_shadow_rewind(m,m->kv,0);
             kv_disk_reset(m);
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
@@ -6374,6 +6914,7 @@ static void run_serve(Model *m, const char *snap){
             if(prefix<old_len){
                 len=prefix;
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+                kv_shadow_rewind(m,m->kv,len);
                 kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
             }
             k=prompt_tokens-len;
@@ -6386,7 +6927,8 @@ static void run_serve(Model *m, const char *snap){
                        bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
-            if(len+k+8+g_draft>=maxctx){ len=0; first=1; kv_disk_reset(m);
+            if(len+k+8+g_draft>=maxctx){ len=0; first=1;
+                kv_shadow_rewind(m,m->kv,0); kv_disk_reset(m);
                 bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;

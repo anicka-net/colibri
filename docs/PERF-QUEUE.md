@@ -17,11 +17,15 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
-### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN @6.7k (prefill -4.6%, decode +20%); open: T>8192 cap lift, index_topk_freq
+### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: IndexShare, decode-attention attribution (inc.6 ruled out selection cost)
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
-(`index_topk`), refreshed every 4 steps, and `index_share_for_mtp_iteration=True`
-reuses the selection for MTP drafts.  Below ~2k context this changes nothing;
+(`index_topk`), recomputed every token, and `index_share_for_mtp_iteration=True`
+reuses the selection for MTP drafts.  (CORRECTION 2026-07-19: `index_topk_freq`
+in the config is the FULL/SHARED *layer pattern* formula — freq=4/offset=3
+generates exactly the 21-full `indexer_types` list; verified against the HF
+reference, which has no temporal refresh.  Any decode-time refresh period is an
+approximation, not native semantics.)  Below ~2k context this changes nothing;
 past it, our attention grows linearly while native stays ~flat — and MTP verify
 pays attention twice.
 - Extraction: DONE 2026-07-18 — only 20 of 141 shards carry indexer tensors
@@ -187,7 +191,7 @@ tok/forward) vs MTP=0 **5.50 tok/s** — MTP is already (barely) ahead at
 2.8k, so the crossover sits below that; the gap should widen with T.
 
 #### Long-context rerun after the determinism fix (canonical numbers)
-2701-token prompt, tekton, `COLI_PREFILL_GEMM=1 COLI_CUDA_TC_W4A16=1`,
+2701-token prompt, discrete multi-GPU host, `COLI_PREFILL_GEMM=1 COLI_CUDA_TC_W4A16=1`,
 frozen usage warmed on the workload (hit 82-93%):
 | config | prefill | decode @2.8k |
 |---|---|---|
@@ -278,6 +282,79 @@ The existing shared-expert two-step reached 76.9% hit / 701 GB but took
 122.1 s. Do not deploy from this single prompt; run a fixed-token multi-prompt
 A/B before choosing between stale, bias, and two-step.
 
+### 7b. Precomputed prefix KV caches (implemented and validated on GB10)
+Every new CLI/agent conversation re-prefills the same multi-thousand-token tool
+system prompt.  At the measured prefill rates that is ~2 min for a 5k prompt —
+paid per fresh session, and it dwarfs everything else in the interactive path.
+The persistence format is ALREADY sufficient: `kv_disk_append` writes, per
+token, the token id plus every layer's `Lc`/`Rc` **and the DSA `Ic` indexer
+rows**, and `kv_hdr` binds layers/kv_lora/qk_rope/index_hd/n_ic/vocab, so a
+restored prefix needs no re-scoring and a mismatched model is rejected.  Record
+size is `4 + n_layers*(kv_lora+qk_rope)*4 + n_ic*index_hd*4` = **~190 KiB/token**
+in the current GLM-5.2 snapshot: about 0.93 GiB for 5k tokens.
+The mux/OpenAI service now has the missing plumbing behind
+`COLI_KV_CACHE_GB`: a bounded content-keyed library, exact longest-prefix
+matching at submit time, copy-on-write branch checkpoints, incremental
+extension of linear histories, compact token sidecars for cheap matching,
+and LRU eviction.  `COLI_KV_CACHE_DIR` must point to private persistent disk
+and be owned by one engine process.  Unit and full C checks cover restore,
+branching, crash recovery, corruption fallback, and eviction.
+
+GB10 live validation (2026-07-20, one 3,170-token shared prefix):
+- Cold A: **348.4 s**.
+- Divergent B reusing the RAM prefix: **6.3 s**.
+- Resume A after B: **3,172 tokens restored from disk in 0.2 s**,
+  **7.6 s** end to end.
+- Branch from A: **5.3 s**.
+- After a full engine restart, resume B again restored 3,172 tokens in
+  **0.2 s** and completed in **13.4 s**.
+- The identical cache-disabled control took **345.6 s** and produced
+  byte-identical greedy text, finish reason, and token counts.
+- Native C server integration exposed one durability race: `DONE` reached the
+  client before the checkpoint, so an immediate service stop could lose the
+  just-completed turn.  `mux_done` now persists first and treats `DONE` as the
+  commit point.  A GB10 stop/restart smoke test found both checkpoint files
+  present when the first HTTP response returned, then restored **92/107**
+  tokens from disk and prefetched only 15; the resumed reply completed in
+  **30.1 s** versus **77.0 s** for the cold turn.
+- Note RoPE bakes ABSOLUTE positions in, so a cache is only valid at position 0
+  and two prefixes cannot be concatenated — fine for system prompts, which is
+  exactly the use case.
+
+### 8. Multi-user serving (reliability first, pipelining later)
+Findings from the 2026-07-19 serve-path review.  What EXISTS: per-slot KV
+isolation + prefix reuse in both serve modes (requests diff against slot
+history, only the delta prefills — the `[API] KV slot N prefix a/b, prefill k`
+line); frontend admission (capacity=KV_SLOTS, bounded queue, 429 overflow);
+mux (`SERVE_BATCH=1`) batched ragged decode with fair per-token interleaving.
+The rewind/shadow-staleness hazard (host truncation without clamping
+`cuda_valid`/`cuda_ic_valid`) is FIXED via `kv_shadow_rewind` at all four
+truncation sites.  Open items, in priority order:
+- **Chunked prefill in mux**: a new submit's prefill runs synchronously in
+  `mux_submit` and stalls every active stream — minutes at 100k+ context.
+  Interleave decode iterations between prefill chunks.
+- **Ragged-safe chain + DSA decode**: `step_decode_batch` passes `kvs[]`, and
+  both the resident chain and the GPU selection decode are gated `!kvs` — so
+  two simultaneous users drop to the slow ragged/CPU attention (and mux
+  disables MTP).  Extending the chain to per-row KV states recovers
+  single-user-class decode for small user counts.
+- **Per-slot memory budget**: each slot costs host KV (~23 GB @131k) plus
+  fp16 device shadows (~12 GB @131k) — KV_SLOTS × CTX collides with
+  `CUDA_EXPERT_GB`; the adaptive-cap idea (borrow untouched reservations)
+  generalizes here.
+- **LONG-TERM (explicit goal, not today): pipeline users across GPUs /
+  interconnected Sparks** — per-user home devices or layer-pipeline
+  parallelism so concurrent users scale with hardware instead of sharing one
+  decode batch.  Prereqs: the ragged-safe chain above, per-slot device
+  residency, and (Spark) network-transparent expert tiers.  The planned Spark
+  fabric is RoCE + NVMe-oF, which changes the shape of all three: the
+  inter-stage payload is one residual vector (~24 KB/token — RDMA makes layer
+  pipelining latency-trivial), a single NVMe-oF expert store serves every
+  Spark (one snapshot copy; remote-miss latency makes prefetch lead time
+  worth MORE than bandwidth), and a peer Spark's RAM over RDMA slots between
+  local RAM and NVMe as a distributed expert-cache tier driven by the
+  placement stats we already collect.
+
 ## Measured dead ends (do not revisit without new evidence)
 - Spark 131k/cap-17 coupling prefetch: K1 is neutral; K2/K4/K8 regress as
   speculative reads evict useful experts.  Depth 2 also thrashes cap 63.
@@ -354,6 +431,40 @@ A/B before choosing between stale, bias, and two-step.
 6. **Two-layer-horizon prediction.**  Evaluate exact and learned L+2 at equal
    K6 budget only after the above.  Coupling depth 2 already showed the failure
    mode: extra lead time is worthless when accuracy causes cache pollution.
+7. **Blackwell sm_121 tensor-core formats (Spark prefill/batch only).**  Decode
+   stays expert-streaming/hit-rate bound, so consumer-Blackwell features pay off
+   only in the compute-bound paths — pipe0 prefill batches and the DSA TC-gather
+   GEMMs.  Honest ranking:
+   - **Block-scaled FP8 MMA (W4A8) — first.**  sm_120/121 add native MMA on
+     block-scaled microscaling formats (mxfp8/nvfp4); our int4-with-block-scales
+     is structurally the same thing.  Signed nibbles (−8…7) upcast EXACTLY into
+     fp8 e4m3 (3 mantissa bits cover those integers), so an in-register
+     int4→fp8 dequant feeding fp8 block-scaled MMA keeps weight fidelity while
+     roughly doubling MMA throughput over the fp16 WMMA in `w4a16_*` /
+     `gemm_f16_tc*` and halving activation traffic.  Only the activation
+     quantization is lossy — per-block scales should keep it in the accepted
+     fp16-class band, but verify with the frozen-usage greedy oracle.  The
+     kernels to convert are exactly the Spark prefill hot spots (86→64 s pipe0
+     result, 2.8k DSA prefill).
+   - **nvfp4 — quality-gated experiment after.**  e2m1's value set
+     {0, ±0.5…±6} is NOT a superset of int4 levels, so it needs requantization.
+     This is "our W4A16 problem in hardware" — and the reason Hopper W4A4
+     (`COLI_CUDA_TC_INT4`, measured dead end) lost: no block-scaled formats, so
+     scales were applied in software and precision died.  Blackwell moves that
+     into the MMA instruction.
+   - **TMA bulk-copy pipelining — distant third.**  `dsa_gather_sel`, absorb,
+     and prefill GEMM tiles stage global→smem by hand; TMA (Hopper-era, kept on
+     sm_121) would improve compute/copy overlap, but the GB10 ceiling is shared
+     LPDDR5x bandwidth, so expect modest gains.
+   - **Offline ptxas for compute_121 — hygiene.**  Kills first-run JIT and gets
+     Blackwell scheduling; low single digits at best.
+   Caveats: sm_120/121 dropped thread-block clusters/wgmma-style paths, and the
+   opt-in shared memory is ~99 KB vs H100's 227 KB — with the inc.5 smem
+   formula ((2K+T+256)×4 B) the Spark dense-absorb ceiling is ~24k regardless
+   of build arch, which makes DSA's topk-bounded smem MORE valuable on Spark
+   than on Hopper.  sm_121 does NOT help: decode gemv (bandwidth-bound, int4
+   already minimal bytes), expert-miss economics (NVMe/LPDDR bound), or the
+   small-S MTP blocker (launch latency, not MMA format).
 
 ### Upstream weekend review (2026-07-19)
 
@@ -376,6 +487,133 @@ Auto-NUMA and non-finite sampling already have local equivalents; converter,
 release, Windows-prompt, and tool-calling changes do not affect this Spark
 profile.
 
+#### Increment 9 — serve-path hardening + attribution + the 5..15 gate (landed)
+Four things from the 2026-07-19 serving/validation pass:
+1. **32k VALIDATED** (26,844 tokens, CTX=32768, frozen usage): prefill
+   1620.8 s — linear in token count vs 780 s at 13.4k — decode 2.09 tok/s,
+   ZERO fallbacks.  First run past 2x the old cap.
+2. **`kv_shadow_rewind`**: history truncation (serve prefix rewind, RESET,
+   context-overflow reset) now clamps the device shadow watermarks
+   (`cuda_valid`/`cuda_ic_valid`).  Before, a post-rewind prefill that hit a
+   CPU-fallback layer left the shadow claiming validity over stale rows —
+   silent corruption on the next decode.  Fixed at all four truncation sites.
+3. **Turn-append smoke (the agentic number)**: serve protocol, 13.4k-token
+   prefix, three turns.  Cold prefill 775 s; an 18-token append (over the
+   rewind path) **7.8 s**.  Prefix/KV reuse across turns works end-to-end.
+   The third turn (8-token append) exposed the **5..15 row hole**: the GPU
+   selection paths were gated `S>=16` while the chain covers `S<=4`, so small
+   appends — exactly the agentic pattern — ran CPU O(T)-per-row selection on
+   all 78 layers: **80 s for 8 tokens**.  Gates relaxed to `S>4` (wmma tiles
+   pad at 5..15 rows; still far ahead of CPU).
+4. **Decode-attention attribution (the inc.6 puzzle, resolved)**:
+   `COLI_DBG_DSACHAIN=2` adds CUDA-event phase timing to the chain.  At
+   13.4k the chain's GPU time is ~120 ms/token — proj+kv+score 0.58 s,
+   **absorb+o_proj 4.73 s (88%)**, tail 0.12 s over the smoke's decode — and
+   the NON-chain residual is the three DENSE layers (L0-2), which bypass the
+   chain, run per-token `attn_pipe_prefill` with an O(T) full absorb in the
+   64-block launch shape, and inflate the misnamed projection/RoPE bucket
+   (8.35 s @13.4k -> 16.56 s @26.8k, exactly linear in T).  NEXT decode
+   levers, in order: (a) route the dense layers through the resident chain
+   (kills the O(T)-with-sync-drain per token), (b) split-T/multi-block absorb
+   launch shape (helps both dense absorb and the 1.4 ms/layer sel-absorb).
+
+#### Increment 8 — device-side top-k for prefill selection (landed, default ON)
+`COLI_DSA_DEVTOPK=1` (default; `=0` restores the host top-k) moves the
+prefill selection top-k onto the device: `dsa_topk_rows` (one block per
+query row) finds the exact keep-th-largest threshold with a 4-pass byte
+radix select on a monotonic fp32 key, then emits indices with a stable
+block-scan compaction — strictly-greater in position order, ties in
+position order until keep — i.e. the host `partial_select` semantics
+BIT-EXACTLY.  Scoring is chunked (512 rows), so the S_b×T score matrix
+never exists anywhere: not as the device scratch (which stops allocating
+past ~64k), not as the host staging buffer (611 MB at 13.4k, 67 GB at
+131k — the silent CPU-fallback trigger), and not as the S_b×T×21-layer
+PCIe download (260 GB at 256k).  Only the selection itself moves
+(S_b×topk ints, independent of T).  nsel is host-computed (min(nk,topk)).
+Scratch slot 40 (table widened to 44); no new exports.
+MEASURED at 13.4k (frozen usage): greedy output TOKEN-IDENTICAL to the
+host path (same device scores -> same selection), prefill 780.1 vs
+780.7 s (parity — the downloads were already overlapped at this T), RSS
+−0.6 GB (the host score buffer), fb 0.  The payoff is that 64k-256k
+prefill selection now runs on GPU at all.
+Follow-up (deferred): keep the selection device-resident across the
+FULL->SHARED layers of one batch to skip the per-layer re-upload
+(needs per-device stamping + a lazy host download for mixed CPU
+fallbacks; the upload is topk-bounded, so it can wait).
+
+#### Increment 7 — fp16 KV/Ic device shadows (landed, default ON)
+`COLI_KV_F16=1` (default; `=0` restores fp32) stores the device KV shadows
+(`cuda_Lc`/`cuda_Rc`) and the DSA indexer shadow (`cuda_Ic`) as `__half`:
+half the shadow VRAM and half the read bandwidth in every consumer.  This is
+the 256k enabler — fp32 shadows would cost ~48 GB total at 256k (a third of
+the expert budget); fp16 makes it ~24 GB.  The HOST canonical caches stay
+EXACT fp32: chain and prefill writers compute rows in fp32 staging (scratch
+slots 37-39), download the exact fp32 to host, and convert only the device
+copy; uploads go through `coli_cuda_pipe_upload_kv`/`copy2d_kv` (new
+exports, Windows loader entries done).  Readers are templated on the storage
+type — absorption/sel/batch kernels, `dsa_score`, `dsa_gather_sel`, and the
+`gemm_f16_tc` family, which now feeds the tensor cores DIRECTLY from fp16
+(the fp32→fp16 smem staging conversion disappears; `LcSel`/`RcSel` gather
+buffers are fp16 too).  Host-KV staging paths (`absorb_batch`,
+`project_batch`, ragged) stay fp32; `pfg_test` pins `COLI_KV_F16=0`.
+MEASURED at 13.4k (frozen usage, 64 greedy tokens, fb 0 both modes):
+decode 2.95 (f32) vs 2.91 (f16) tok/s and prefill 781.6 vs 778.0 s — parity
+within drift; prefill score-softmax-value 87.7 → 84.5 s; VRAM −0.6 GB/GPU
+(the whole shadow is only ~1.2 GB/GPU at this T — the win is capacity at
+32k+).  Numerics: same first-decode winner and top-8 set, logit shifts
+≤0.6 = the accepted fp16 class (as W4A16/TC); greedy text flips a near-tie
+on the degenerate repetitive longprompt, as every fp16-class change does.
+Follow-up idea: int8 shadows would halve again but need per-row scales in
+every reader — only worth it if 256k VRAM pressure demands it.
+
+#### DSA phase 2, increment 6 — COLI_DSA_REFRESH knob + selection-cost attribution (landed, default off)
+Motivated by the (now corrected, see item 1) belief that native semantics
+refresh selection every 4 steps.  `COLI_DSA_REFRESH=N` (default 1 = native
+per-token selection, zero change): FULL layers recompute top-k every Nth
+decode token; between refreshes they reuse the layer's cached selection
+extended with the new tail positions (recent tokens are never dropped), with
+per-layer caches, rewind/slot invalidation, and k_idx still appended to the
+Ic shadow every token.  Chain gains a `score_off` mode (k_idx append without
+scoring/sync/top-k); new exported accessor `coli_cuda_dsac_times` went
+through the 4-entry Windows loader ritual.
+MEASURED at 13.4k (frozen usage, 64 greedy tokens): REFRESH=4 reuses 846 of
+1134 FULL engagements, decode **2.94 -> 2.98 tok/s (~1%, within drift)** —
+and the greedy continuation DIVERGES.  Verdict: quality-affecting for a
+noise-level gain at this T — near-dead-end, keep default 1.  The knob's real
+product is the attribution (`COLI_DBG_DSACHAIN=1` now prints cumulative
+mid-sync and host-top-k time): sync **0.54 s** + top-k **0.13 s** of 21.5 s
+decode = **3%**.  The selection machinery is NOT the DSA decode T-growth
+term at 13.4k, which also de-prioritizes device-side top-k for DECODE
+(prefill still needs it: the S_b×T score download grows ~20x by 256k, and
+host top-k is O(T) per token so revisit past ~64k).  Where decode attention
+(16.4 s/64 tok) actually goes, per the profile: projection/RoPE 8.3 s +
+~7.8 s absorb-side — both nominally T-independent, yet short-context
+attention is 1.5 s/64 tok.  NEXT PROBE: attribute the chain's per-phase
+time at long T (suspects: `attention_absorb_sel_kernel`'s H=64-block launch
+shape serializing 2048 rows per block, and what the projection timer
+actually covers in the chain path).
+
+#### DSA phase 2, increment 5 — T>8192 cap lift (landed)
+The absorb-batch kernel family's `T<=8192` checks were shared-memory limits
+in disguise ((2K+T+256) floats of dynamic smem vs the 48 KB default), not
+algorithmic ones: `absorb_smem_ok()` now computes the actual need and raises
+the kernel's dynamic-smem attribute to the device opt-in maximum when needed
+(227 KB on Hopper -> T up to ~56k for dense absorb; past that the functions
+refuse and the CPU fallback engages as before).  The memory-bound paths
+(`coli_cuda_prefill_attn_gemm`, the `attn_pipe_prefill` gate) lift straight
+to T<=131072; the DSA decode chain never had a T cap (sel-absorb is over
+topk); KV/Ic device shadows already size by CTX (~1.4 GB/GPU at 16k).
+MEASURED at 13.4k ctx (2x the 6.7k prompt, CTX=16384, frozen 2.7k-warmed
+usage, 64 tokens): DSA prefill **780.0 s** vs dense 871.9 (-10.5%); decode
+DSA **2.98 tok/s** vs dense 1.83 (**+63%**, was +20% at 6.7k — the flat-vs-
+linear divergence the cap was hiding), attention 16.4 vs 29.8 s/64 tok,
+fallbacks 0, prefill engagement 21/57.  Dense decode at 13.4k itself now
+runs on GPU via the smem opt-in (pre-lift: CPU path).  Both configs pay
+~65-69% expert hit (usage frozen on the short prompt), so cross-config
+ratios are the trustworthy numbers.  (Increment 6 then measured the
+selection machinery at 3% of decode — the growth lives elsewhere; see
+its entry above.)
+
 #### DSA phase 2, increment 4 — prefill sel-absorb TC gather (landed)
 Phase-B rows now gather their selected Lc/Rc rows into contiguous buffers
 (`dsa_gather_sel`, one block per (row,key), amortized across all 64 heads —
@@ -394,7 +632,7 @@ reference, same inputs, same lists): worst per-row rel err 2.8e-3 @topk=128
 / 2.6e-3 @topk=2048 (mag 1x), 6.3e-2 @mag 30x — the same fp16-rounding class
 as the landed prefill GEMM.  In-model 16-token greedy continuation
 bit-identical to the scalar path at 2.7k.
-WAR STORY (cost: one wedged H100 + a tekton reboot): the first harness
+WAR STORY (cost: one wedged H100 + a host reboot): the first harness
 version under-allocated the sel buffer — `coli_cuda_prefill_attn_gemm`
 reads `sel_host+sB0*topk`, i.e. the array covers ALL S rows like
 `m->dsa_sel`, not just phase-B rows.  The host OOB shipped garbage indices
@@ -403,11 +641,11 @@ R-state process, nvidia-smi hung, no watchdog on datacenter GPUs).
 `dsa_gather_sel` now clamps indices to [0,T) — a corrupt selection can
 produce wrong output but never touch wild VA.  Post-reboot, CUDA refused to
 init (error 3, zero diagnostics anywhere) until `nvidia_uvm` was reloaded
-with `uvm_disable_hmm=1` — tekton's modprobe.d had that option for a
+with `uvm_disable_hmm=1` — the host's modprobe.d had that option for a
 reason (open-gpu-kernel-modules #780/#797).
 
 #### DSA phase 2 — 6.7k benchmark + DRAFT=1 composition (measured 2026-07-19)
-Four runs on tekton, 6711-token prompt (2701 for the short DRAFT point),
+Four runs on the discrete multi-GPU host, 6711-token prompt (2701 for the short DRAFT point),
 frozen usage warmed on the 2.7k prompt, TEMP=0, NGEN=128:
 
 | config | prefill | decode | hit | notes |

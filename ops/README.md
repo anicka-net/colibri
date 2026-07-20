@@ -22,9 +22,26 @@ systemctl --user enable --now colibri-server.service colibri-watchdog.timer
 loginctl enable-linger "$USER"
 ```
 
+Two example env files ship here: `service.env.example` (unified-memory /
+Spark-class hosts) and `service.env.multigpu.example` (discrete multi-GPU,
+"profile A").  **Start from the one that matches the machine** — they differ in
+settings that silently cost an order of magnitude, notably `AUTOPIN`, which must
+NOT be disabled where a VRAM expert tier is used.  The hardware-tuning skill
+documents the per-profile reasoning and the measured service gotchas.
+
+`ExecStartPre` runs `ops/colibri-preflight.sh`, which refuses to start when the
+snapshot is missing or short (tmpfs does not survive a reboot), when
+`nvidia_uvm` lacks `uvm_disable_hmm=1`. Set `COLI_PREFLIGHT_*` in the env file
+to enable the checks that apply to the host. The installed service and HTTP
+runtime are native C and do not require Python.
+
 Edit `service.env` first. `COLI_CONTEXT` is both the allocated engine context
 and the value advertised to clients. KV memory grows with context and slots, so
 increase `COLI_KV_SLOTS` only after measuring available memory.
+
+For many users without multiplying RAM, leave `COLI_KV_SLOTS=1` and set
+`COLI_KV_CACHE_GB` plus `COLI_KV_CACHE_DIR`. The latter must be private,
+persistent local storage rather than a tmpfs snapshot.
 
 The watchdog waits through startup, requires an idle GPU, and then sends a
 one-token non-thinking inference request. It restarts only when that request
