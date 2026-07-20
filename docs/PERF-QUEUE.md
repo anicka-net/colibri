@@ -300,6 +300,13 @@ GB10 live validation (2026-07-20, one 3,170-token shared prefix):
   **0.2 s** and completed in **13.4 s**.
 - The identical cache-disabled control took **345.6 s** and produced
   byte-identical greedy text, finish reason, and token counts.
+- Native C server integration exposed one durability race: `DONE` reached the
+  client before the checkpoint, so an immediate service stop could lose the
+  just-completed turn.  `mux_done` now persists first and treats `DONE` as the
+  commit point.  A GB10 stop/restart smoke test found both checkpoint files
+  present when the first HTTP response returned, then restored **92/107**
+  tokens from disk and prefetched only 15; the resumed reply completed in
+  **30.1 s** versus **77.0 s** for the cold turn.
 - Note RoPE bakes ABSOLUTE positions in, so a cache is only valid at position 0
   and two prefixes cannot be concatenated — fine for system prompts, which is
   exactly the use case.
