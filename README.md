@@ -148,6 +148,13 @@ on-device across layers so the CPU expert loop runs uninterrupted; on Apple
 Silicon an experimental [Metal backend](docs/metal.md) does the batched expert
 math on the unified-memory GPU.
 
+> **On real NVMe, measure `DIRECT=1`.** O_DIRECT bypasses the page cache and is
+> often a large win on drives with DRAM cache and bandwidth headroom (+34%
+> decode measured with `PIPE=1` on a Blackwell/Windows box; 4.25→9.69 GB/s in
+> iobench on a GB10) — but it is drive-dependent: QLC/DRAM-less or virtualised
+> disks can be neutral to negative. Try it first; keep what your hardware
+> rewards.
+
 ### Faithful model, compressed state
 
 The forward pass is validated **token-exact against a `transformers` oracle**
