@@ -272,6 +272,16 @@ where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
+A calibrated 75x256 per-layer bias was then tested with fixed-token replay:
+four unseen prompts, 128 decode tokens, cap 17, equal K6 budget, and three
+alternating A/B pairs per prompt (24 runs).  Bias was faster in all 12 paired
+comparisons, with a **1.84% median latency reduction** (paired bootstrap 95%
+CI: **1.50-2.02%**).  Median profile hit rate rose 77.15% -> 78.15%, fetched
+bytes fell 777.2 -> 752.4 GB, and felt I/O wait fell 42.45 -> 40.80 s.  This
+confirms a small generalizing signal, but misses the 5% deployment gate.
+Keep `PILOT_BIAS` experimental.  Before new predictor work, replay the
+production `PILOT_TWO=1` setting against stale K6 on the same fixtures.
+
 ### 7b. Precomputed prefix KV caches (implemented and validated on GB10)
 Every new CLI/agent conversation re-prefills the same multi-thousand-token tool
 system prompt.  At the measured prefill rates that is ~2 min for a 5k prompt —
