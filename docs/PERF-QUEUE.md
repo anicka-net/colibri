@@ -279,8 +279,14 @@ comparisons, with a **1.84% median latency reduction** (paired bootstrap 95%
 CI: **1.50-2.02%**).  Median profile hit rate rose 77.15% -> 78.15%, fetched
 bytes fell 777.2 -> 752.4 GB, and felt I/O wait fell 42.45 -> 40.80 s.  This
 confirms a small generalizing signal, but misses the 5% deployment gate.
-Keep `PILOT_BIAS` experimental.  Before new predictor work, replay the
-production `PILOT_TWO=1` setting against stale K6 on the same fixtures.
+Keep `PILOT_BIAS` experimental.
+
+The production `PILOT_TWO=1` setting was replayed on the same protocol and
+was slower in all 12 paired comparisons: **1.14% median latency regression**
+(paired bootstrap 95% CI: **0.77-1.30%**).  Two-step improved hit rate by
+1.2 points and saved 15.9 GB plus 2.35 s of felt I/O wait per paired run, but
+its extra shared-expert computation cost more than those savings.  Production
+was returned to stale K6 with `PILOT_TWO=0` on 2026-07-20.
 
 ### 7b. Precomputed prefix KV caches (implemented and validated on GB10)
 Every new CLI/agent conversation re-prefills the same multi-thousand-token tool
