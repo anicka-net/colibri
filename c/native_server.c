@@ -352,8 +352,14 @@ static void *engine_dispatch(void *arg) {
   free(line);
   e->stopped = 1;
   pthread_mutex_lock(&e->pending_mu);
-  for (request *r = e->pending; r; r = r->next)
+  request *pending = e->pending;
+  e->pending = NULL;
+  for (request *r = pending; r;) {
+    request *next = r->next;
+    r->next = NULL;
     request_signal(r, 1);
+    r = next;
+  }
   pthread_mutex_unlock(&e->pending_mu);
   return NULL;
 }
@@ -457,8 +463,12 @@ static int engine_generate(engine *e, const char *prompt, int max, double temp,
   int bad = write_all(e->in_fd, hdr, (size_t)hn) ||
             write_all(e->in_fd, prompt, n) || write_all(e->in_fd, "\n", 1);
   pthread_mutex_unlock(&e->write_mu);
-  if (bad)
+  if (bad) {
+    pthread_mutex_lock(&e->pending_mu);
+    pending_take(e, r->id);
+    pthread_mutex_unlock(&e->pending_mu);
     return -1;
+  }
   size_t emitted = 0;
   int cancel_sent = 0;
   pthread_mutex_lock(&r->mu);
@@ -1505,7 +1515,7 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
                 "failed.\"}}\n\n",
                 strlen("data: {\"error\":{\"message\":\"The inference engine "
                        "failed.\"}}\n\n"));
-    b_free(&r.data);
+    request_destroy(&r);
     b_free(&stream_ctx.pending);
     return;
   }
@@ -1678,6 +1688,8 @@ static void anthropic(server *s, int fd, jval *body) {
   int rc = generate_prompt(s, prompt.p, max, temp, top_p, -1, &r);
   b_free(&prompt);
   if (rc) {
+    if (rc == -4)
+      request_destroy(&r);
     api_error(fd, rc == -1 || rc == -2 ? 429 : 500,
               "Inference request failed.");
     return;
@@ -1860,6 +1872,8 @@ static void responses(server *s, int fd, jval *body) {
   int rc = generate_prompt(s, prompt.p, max, temp, top_p, -1, &r);
   b_free(&prompt);
   if (rc) {
+    if (rc == -4)
+      request_destroy(&r);
     b_free(&history_prompt);
     api_error(fd, rc == -1 || rc == -2 ? 429 : 500,
               "Inference request failed.");
@@ -2088,6 +2102,8 @@ static void ollama_generate(server *s, int fd, jval *body, int chat) {
   int rc = generate_prompt(s, prompt.p, max, temp, top, -1, &r);
   b_free(&prompt);
   if (rc) {
+    if (rc == -4)
+      request_destroy(&r);
     api_error(fd, 500, "inference failed");
     return;
   }

@@ -15,6 +15,13 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def setUpModule():
+    if os.name == "nt":
+        raise unittest.SkipTest("native CLI requires POSIX process APIs")
+    subprocess.run(["make", "coli-native", "tests/fake_mux_engine"],
+                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+
+
 def write_shard(path, tensors):
     offset, header, payload = 0, {}, b""
     for name, size in tensors:
@@ -29,8 +36,6 @@ def write_shard(path, tensors):
 class NativeServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(["make", "coli-native", "tests/fake_mux_engine"],
-                       cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         cls.port = listener.getsockname()[1]
@@ -315,6 +320,19 @@ class NativeServerTest(unittest.TestCase):
         self.assertLess(seen_first, .3)
         self.assertGreater(elapsed, .45)
         self.assertIn('"content":"second"', stream)
+
+    def test_zz_engine_exit_keeps_server_alive(self):
+        body = {"model": "glm-test",
+                "messages": [{"role": "user", "content": "exit-engine"}]}
+        with self.assertRaises(HTTPError) as first:
+            self.request("/v1/chat/completions", body)
+        self.assertEqual(first.exception.code, 500)
+        with self.assertRaises(HTTPError) as second:
+            self.request("/v1/chat/completions", body)
+        self.assertEqual(second.exception.code, 500)
+        with self.request("/health") as response:
+            self.assertEqual(json.load(response)["status"], "ok")
+        self.assertIsNone(self.process.poll())
 
 
 class NativePlanDoctorTest(unittest.TestCase):
