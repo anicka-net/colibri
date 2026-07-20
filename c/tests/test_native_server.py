@@ -325,6 +325,29 @@ class NativeServerTest(unittest.TestCase):
         self.assertEqual(result["content"][0]["input"], {"q": "bird"})
         self.assertEqual(result["stop_reason"], "tool_use")
 
+        with self.request("/v1/messages", {
+            "model": "glm-test",
+            "messages": [{"role": "user", "content": "native tool syntax"}],
+            "max_tokens": 8, "tools": [anthropic_tool],
+        }) as response:
+            native = json.load(response)
+        self.assertEqual(native["content"][0]["text"], "I'll look that up.")
+        self.assertEqual(native["content"][1]["type"], "tool_use")
+        self.assertEqual(native["content"][1]["name"], "lookup")
+        self.assertEqual(native["content"][1]["input"], {"q": "finch"})
+        self.assertEqual(native["stop_reason"], "tool_use")
+
+        with self.request("/v1/messages", {
+            "model": "glm-test",
+            "messages": [{"role": "user", "content": "native tool syntax"}],
+            "max_tokens": 8, "tools": [anthropic_tool], "stream": True,
+        }) as response:
+            native_stream = response.read().decode()
+        self.assertIn('"type":"tool_use"', native_stream)
+        self.assertIn('"name":"lookup"', native_stream)
+        self.assertIn('"partial_json":"{\\"q\\":\\"finch\\"}"', native_stream)
+        self.assertIn('"stop_reason":"tool_use"', native_stream)
+
         with self.request("/api/chat", {**body, "stream": False}) as response:
             result = json.load(response)
         self.assertEqual(result["message"]["tool_calls"][0]["function"]["arguments"],

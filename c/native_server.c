@@ -1198,6 +1198,150 @@ static void emit_tool_arg(buf *out, const char *raw, size_t n,
   b_json(out, value);
   free(value);
 }
+static int tool_has_param(jval *tools, const char *name, const char *key) {
+  if (!tools || tools->t != J_ARR)
+    return 0;
+  for (int i = 0; i < tools->len; i++) {
+    jval *f = tool_function(tools->kids[i]);
+    if (strcmp(jstr(f, "name", ""), name))
+      continue;
+    jval *schema = jget(f, "parameters");
+    if (!schema)
+      schema = jget(f, "input_schema");
+    jval *p = jget(schema, "properties");
+    return p && p->t == J_OBJ && jget(p, key);
+  }
+  return 0;
+}
+/* GLM occasionally uses its learned Python-like tool syntax even when the
+ * prompt requests the XML argument dialect, for example:
+ *
+ *   <tool_call>WebSearch(**query**: "NE555 datasheet")
+ *
+ * It also commonly omits </tool_call>.  Accept one such call conservatively:
+ * the name must be a tool offered by the client and every emitted argument
+ * must exist in that tool's schema.  The caller stops at the first
+ * unterminated call because text generated after the missing terminator is
+ * not a trustworthy parallel-call request. */
+static int parse_native_tool_call(const char *inner, const char *limit,
+                                  jval *tools, tool_call *c) {
+  memset(c, 0, sizeof(*c));
+  const char *p = inner;
+  while (p < limit && isspace((unsigned char)*p))
+    p++;
+  const char *ns = p;
+  while (p < limit && (isalnum((unsigned char)*p) || *p == '_' || *p == '.' ||
+                       *p == '-'))
+    p++;
+  size_t nn = (size_t)(p - ns);
+  if (!nn || nn >= sizeof(c->name))
+    return 0;
+  memcpy(c->name, ns, nn);
+  if (!find_tool(tools, c->name))
+    return 0;
+  while (p < limit && isspace((unsigned char)*p))
+    p++;
+  if (p == limit || *p != '(')
+    return 0;
+  p++;
+  b_add(&c->args, "{");
+  int argc = 0;
+  while (p < limit) {
+    while (p < limit && (isspace((unsigned char)*p) || *p == ','))
+      p++;
+    if (p == limit || *p == ')')
+      break;
+    if (p + 1 < limit && p[0] == '*' && p[1] == '*')
+      p += 2;
+    const char *ks = p;
+    while (p < limit && (isalnum((unsigned char)*p) || *p == '_' || *p == '.' ||
+                         *p == '-'))
+      p++;
+    if (p == ks)
+      break;
+    char *key = strndup(ks, (size_t)(p - ks));
+    if (p + 1 < limit && p[0] == '*' && p[1] == '*')
+      p += 2;
+    while (p < limit && isspace((unsigned char)*p))
+      p++;
+    if (p == limit || (*p != ':' && *p != '=')) {
+      free(key);
+      break;
+    }
+    p++;
+    while (p < limit && isspace((unsigned char)*p))
+      p++;
+    const char *vs = p;
+    if (p < limit && *p == '"') {
+      p++;
+      while (p < limit) {
+        if (*p == '\\' && p + 1 < limit) {
+          p += 2;
+          continue;
+        }
+        if (*p++ == '"')
+          break;
+      }
+    } else if (p < limit && (*p == '[' || *p == '{')) {
+      char open = *p++, close = open == '[' ? ']' : '}';
+      int depth = 1, quoted = 0;
+      while (p < limit && depth) {
+        if (quoted) {
+          if (*p == '\\' && p + 1 < limit)
+            p += 2;
+          else {
+            if (*p == '"')
+              quoted = 0;
+            p++;
+          }
+        } else if (*p == '"')
+          quoted = 1, p++;
+        else {
+          if (*p == open)
+            depth++;
+          else if (*p == close)
+            depth--;
+          p++;
+        }
+      }
+    } else {
+      while (p < limit && *p != ',' && *p != ')')
+        p++;
+      while (p > vs && isspace((unsigned char)p[-1]))
+        p--;
+    }
+    if (p == vs) {
+      free(key);
+      break;
+    }
+    if (tool_has_param(tools, c->name, key)) {
+      if (argc++)
+        b_add(&c->args, ",");
+      b_json(&c->args, key);
+      b_add(&c->args, ":");
+      if (*vs == '"') {
+        char *quoted = strndup(vs, (size_t)(p - vs));
+        jval *v = json_parse(quoted, NULL);
+        if (v) {
+          b_jval(&c->args, v);
+          json_free(v);
+        } else
+          emit_tool_arg(&c->args, vs + 1, (size_t)(p - vs - 2), "string");
+        free(quoted);
+      } else
+        emit_tool_arg(&c->args, vs, (size_t)(p - vs),
+                      tool_param_type(tools, c->name, key));
+    }
+    free(key);
+  }
+  b_add(&c->args, "}");
+  if (!argc) {
+    b_free(&c->args);
+    return 0;
+  }
+  snprintf(c->id, sizeof(c->id), "call_%ld_0", (long)time(NULL));
+  return 1;
+}
 static int parse_tool_calls(const char *raw, jval *tools, buf *content,
                             tool_call *calls, int max_calls) {
   const char *p = raw, *box;
@@ -1206,7 +1350,16 @@ static int parse_tool_calls(const char *raw, jval *tools, buf *content,
     b_addn(content, p, (size_t)(box - p));
     const char *inner = box + 11, *end = strstr(inner, "</tool_call>");
     if (!end) {
-      b_add(content, box);
+      const char *limit = strchr(inner, '\n');
+      const char *next = strstr(inner, "<tool_call>");
+      if (!limit || (next && next < limit))
+        limit = next;
+      if (!limit)
+        limit = inner + strlen(inner);
+      if (n < max_calls && parse_native_tool_call(inner, limit, tools, &calls[n]))
+        n++;
+      else
+        b_add(content, box);
       return n;
     }
     if (n < max_calls) {

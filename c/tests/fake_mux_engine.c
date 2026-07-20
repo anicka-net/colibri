@@ -55,6 +55,8 @@ int main(void) {
           : strstr(prompt, "check defer")
               ? (strstr(prompt, "DEFERRED_SENTINEL") ? "deferred-leaked"
                                                      : "deferred-ok")
+          : strstr(prompt, "native tool syntax")
+              ? "I'll look that up.<tool_call>lookup(**q**: \"finch\")"
           : strstr(prompt, "# Tools")
               ? "<tool_call>lookup<arg_key>q</arg_key><arg_value>bird</"
                 "arg_value></tool_call>"
