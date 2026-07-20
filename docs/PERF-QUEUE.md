@@ -17,6 +17,28 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
+### Decode selected-attention tensor-core gather (landed, 2026-07-20)
+
+The resident S=1 chain now reuses the prefill DSA tensor-core decomposition:
+gather 2,048 selected KV rows once, project all 64 heads with W4A16, run the
+score/context GEMMs with fp32 accumulation, and retain the normal chain tail.
+The output projection uses an fp16-activation/signed-int4 cached GEMV with the
+same arithmetic as the established shared-memory GEMV; direct H100 numerical
+coverage is exact at the test tolerance. `COLI_DSA_DECODE_TCGATHER=0` restores
+the scalar selected-absorption path.
+
+Paired Tekton service measurement at a 26,497-token exact KV prefix, TEMP=0,
+MTP=0, top-2048 DSA, frozen `.coli_usage`, 15 warmed one-forward requests:
+tensor-core **0.378–0.386 s/request** versus scalar **0.444–0.451 s/request**
+(~14.5% end-to-end). The selected absorb+o_proj phase fell from ~111 ms to
+~46 ms/token. Engagement was 78/78 layers with zero chain fallbacks and 100%
+expert-tier hits. A padded S=1 tensor-core output projection measured slower
+(~176 ms phase), so only the absorption decomposition uses WMMA.
+
+Implementation gotcha: timestamp-preserving deployment could leave a newer
+remote `backend_cuda.o` and silently reuse stale code. CUDA validation builds
+must use `make -B` (or remove the object) after source synchronization.
+
 ### Mux resident decode: single-session fixed; multi-session design remains
 
 Profiling a real Claude Code turn at 25,335 tokens exposed a scheduler/path

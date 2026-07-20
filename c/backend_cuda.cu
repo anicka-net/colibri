@@ -1332,6 +1332,58 @@ __global__ static void gemv_q4(float *__restrict__ y,
 
     if (lane == 0) y[row] = sum * scales[row];
 }
+/* Same signed-int4/fp16-activation arithmetic as gemv_q4, but read the input
+ * through L2 instead of staging it in dynamic shared memory.  The selected
+ * decode TC chain uses this after WMMA: Hopper rejects a subsequent dynamic-
+ * smem gemv_q4 launch in that sequence, while the input is only 32 KiB and is
+ * cache-resident. */
+__global__ static void gemv_q4_cached(float *__restrict__ y,
+        const float *__restrict__ x,const uint8_t *__restrict__ w,
+        const float *__restrict__ scales,int I,int O){
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31,row=blockIdx.x*4+warp;
+    if(row>=O)return;
+    int rb=I>>1;const uint8_t *rp=w+(size_t)row*rb;float sum=0.f;
+    for(int b=lane*4;b<rb;b+=128){
+        uint32_t p=*reinterpret_cast<const uint32_t*>(rp+b);int e=b*2;
+        sum+=__half2float(__float2half(x[e  ]))*(float)(((int)( p       &15)^8)-8);
+        sum+=__half2float(__float2half(x[e+1]))*(float)(((int)((p>> 4)&15)^8)-8);
+        sum+=__half2float(__float2half(x[e+2]))*(float)(((int)((p>> 8)&15)^8)-8);
+        sum+=__half2float(__float2half(x[e+3]))*(float)(((int)((p>>12)&15)^8)-8);
+        sum+=__half2float(__float2half(x[e+4]))*(float)(((int)((p>>16)&15)^8)-8);
+        sum+=__half2float(__float2half(x[e+5]))*(float)(((int)((p>>20)&15)^8)-8);
+        sum+=__half2float(__float2half(x[e+6]))*(float)(((int)((p>>24)&15)^8)-8);
+        sum+=__half2float(__float2half(x[e+7]))*(float)(((int)( p>>28    )^8)-8);
+    }
+    sum+=__shfl_down_sync(0xffffffff,sum,16);sum+=__shfl_down_sync(0xffffffff,sum,8);
+    sum+=__shfl_down_sync(0xffffffff,sum,4);sum+=__shfl_down_sync(0xffffffff,sum,2);
+    sum+=__shfl_down_sync(0xffffffff,sum,1);
+    if(lane==0)y[row]=sum*scales[row];
+}
+#ifdef COLI_CUDA_TEST
+extern "C" int coli_cuda_test_gemv_q4_cached(int device,const float *x,
+        const uint8_t *w,const float *scales,int I,int O,float *shared_out,
+        float *cached_out){
+    if(!x||!w||!scales||!shared_out||!cached_out||I<8||(I&7)||O<1||
+       cudaSetDevice(device)!=cudaSuccess)return 0;
+    float *dx=NULL,*ds=NULL,*da=NULL,*db=NULL;uint8_t *dw=NULL;
+    size_t xb=(size_t)I*4,wb=(size_t)O*(I/2),sb=(size_t)O*4,ob=(size_t)O*4;
+    int ok=cudaMalloc(&dx,xb)==cudaSuccess&&cudaMalloc(&dw,wb)==cudaSuccess&&
+        cudaMalloc(&ds,sb)==cudaSuccess&&cudaMalloc(&da,ob)==cudaSuccess&&
+        cudaMalloc(&db,ob)==cudaSuccess;
+    if(ok)ok=cudaMemcpy(dx,x,xb,cudaMemcpyHostToDevice)==cudaSuccess&&
+        cudaMemcpy(dw,w,wb,cudaMemcpyHostToDevice)==cudaSuccess&&
+        cudaMemcpy(ds,scales,sb,cudaMemcpyHostToDevice)==cudaSuccess;
+    if(ok){
+        gemv_q4<<<((unsigned)O+7)/8,256,(size_t)I*sizeof(__half)>>>(da,dx,dw,ds,I,O);
+        gemv_q4_cached<<<((unsigned)O+3)/4,128>>>(db,dx,dw,ds,I,O);
+        ok=cudaGetLastError()==cudaSuccess&&cudaDeviceSynchronize()==cudaSuccess&&
+           cudaMemcpy(shared_out,da,ob,cudaMemcpyDeviceToHost)==cudaSuccess&&
+           cudaMemcpy(cached_out,db,ob,cudaMemcpyDeviceToHost)==cudaSuccess;
+    }
+    if(dx)cudaFree(dx);if(dw)cudaFree(dw);if(ds)cudaFree(ds);
+    if(da)cudaFree(da);if(db)cudaFree(db);return ok;
+}
+#endif
 __global__ static void rmsnorm_kernel(float *out,
                                        const float *x,
                                        const float *__restrict__ weight,
@@ -1355,21 +1407,6 @@ __global__ static void rmsnorm_kernel(float *out,
     float rms = rsqrtf(smem_rms[0] / (float)size + eps);
     for (int i = tid; i < size; i += blockDim.x)
         out[i] = weight[i] * (x[i] * rms);
-}
-/* Tensor-core attention tail: residual add and following RMSNorm in one
- * launch.  Static reduction storage avoids another dynamic-smem launch in
- * the decode chain. */
-__global__ static void add_rmsnorm_rows(float *x,float *out,const float *add,
-        const float *weight,int S,int D,float eps){
-    int s=blockIdx.x,tid=threadIdx.x;if(s>=S)return;
-    float *xr=x+(size_t)s*D,*yr=out+(size_t)s*D;
-    const float *ar=add+(size_t)s*D;
-    __shared__ float red[256];float ss=0.f;
-    for(int i=tid;i<D;i+=blockDim.x){float v=xr[i]+ar[i];xr[i]=v;ss+=v*v;}
-    red[tid]=ss;__syncthreads();
-    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
-    float r=rsqrtf(red[0]/(float)D+eps);
-    for(int i=tid;i<D;i+=blockDim.x)yr[i]=weight[i]*xr[i]*r;
 }
 __global__ static void memcpy_f32_kernel(float *__restrict__ dst,
                                           const float *__restrict__ src, int n) {
@@ -1696,8 +1733,6 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
 static int dsa_decode_tcgather(int device,float *ctx,const float *q,
         const float *latent,const float *rope,const int *sel,int S,int topk,
         const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,int T,float scale);
-__global__ static void w4a16_nt_ld(float *y,const float *x,const uint8_t *w,
-        const float *scale,int M,int K,int N,int ldy);
 /* COLI_DBG_DSACHAIN=1: tempi cumulativi del punto di sync a metà catena
  * (drenaggio pipeline + download punteggi) e del top-k host.  Esposti con una
  * funzione, non con dati extern: il loader Windows risolve solo simboli-funzione. */
@@ -1914,9 +1949,7 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
      * blocks walking the same top-k list.  Output projection stays on the
      * exact decode GEMV below. */
     static int decode_tcg=-1;
-    /* Opt-in until the post-TC normalization tail is accepted reliably by
-     * the persistent Tekton chain (the standalone/prefill TC path is fine). */
-    if(decode_tcg<0){const char *e=getenv("COLI_DSA_DECODE_TCGATHER");decode_tcg=e?(atoi(e)!=0):0;}
+    if(decode_tcg<0){const char *e=getenv("COLI_DSA_DECODE_TCGATHER");decode_tcg=e?(atoi(e)!=0):1;}
     float *tc_ctx=NULL; int tc_ok=0;
     int tc_uniform=selm;
     for(int s=0;tc_uniform&&s<S;s++)
@@ -1927,17 +1960,6 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
             dsa->topk,kvb,H,qk_nope,qk_rope,vh,kv_lora,pos_base+S,attn_scale);
         if(tc_ok)coli_dsac_tcg_rows+=(uint64_t)S;
         else coli_dsac_tcg_fb+=(uint64_t)S;
-    }
-    if(tc_ok){
-        dim3 go((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-        w4a16_nt_ld<<<go,128>>>(aout,tc_ctx,(const uint8_t*)o_proj->weights,
-            o_proj->scales,S,H*vh,D,D);
-        if(!cuda_ok(cudaGetLastError(),"chain tc o_proj"))return 0;
-        const char *sd=getenv("COLI_DSA_TC_SYNC_DEBUG");
-        if(sd&&atoi(sd)){
-            if(!cuda_ok(cudaDeviceSynchronize(),"chain tc o_proj sync"))return 0;
-            (void)cudaGetLastError(); /* synchronize reports execution errors; discard stale API status */
-        }
     }
     /* loop 2: absorb + o_proj per row (over the selection when active) */
     for(int s=0;s<S;s++){
@@ -1963,24 +1985,21 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
             absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
                 (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
                 d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
-        if(!tc_ok){
-            gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cxrow,
-                (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
-            if(!cuda_ok(cudaGetLastError(),"chain selected o_proj"))return 0;
-        }
+        /* WMMA completion can leave a stale per-thread launch status even
+         * after every TC launch was checked.  Clear it at the stage boundary;
+         * the canonical downloads below still synchronize and report real
+         * execution failures. */
+        if(tc_ok)(void)cudaGetLastError();
+        if(tc_ok)gemv_q4_cached<<<((unsigned)D+3)/4,128>>>(aout+(size_t)s*D,cxrow,
+            (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
+        else gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cxrow,
+            (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
+        if(!cuda_ok(cudaGetLastError(),"chain selected o_proj"))return 0;
     }
     if(dbg2) cudaEventRecord(ctx->dbg_ev[2],0);
-    /* Scratch growth and the TC helpers consult the per-device allocator;
-     * reassert the chain's home context before launching its resident tail. */
-    if(!select_ctx(ctx))return 0;
-    (void)cudaGetLastError();
-    if(tc_ok)add_rmsnorm_rows<<<S,256>>>(x_dev,nrm_dev,aout,w_post,S,D,eps);
-    else{
-        add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
-        if(!cuda_ok(cudaGetLastError(),"chain selected add"))return 0;
-        for(int s=0;s<S;s++)
-            rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
-    }
+    add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
+    for(int s=0;s<S;s++)
+        rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
     if(!cuda_ok(cudaGetLastError(),"chain selected residual"))return 0;
     /* Optional fused shared expert: launched before the chain sync so it runs
      * during the downloads and the host-side gap, instead of after them. */

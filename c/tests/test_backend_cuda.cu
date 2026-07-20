@@ -29,6 +29,10 @@ static int relative_rms(const float *got,const float *want,int n,float limit){
     if(r>limit){std::fprintf(stderr,"relative RMS %.5f exceeds %.5f\n",r,limit);return 0;} return 1;
 }
 
+extern "C" int coli_cuda_test_gemv_q4_cached(int device,const float *x,
+        const uint8_t *w,const float *scales,int I,int O,float *shared_out,
+        float *cached_out);
+
 int main(int argc, char **argv) {
     int devices[COLI_CUDA_MAX_DEVICES], ndev = argc > 1 ? argc - 1 : 1;
     if (ndev > COLI_CUDA_MAX_DEVICES) return 2;
@@ -37,6 +41,17 @@ int main(int argc, char **argv) {
     if (coli_cuda_device_count() != ndev) return 1;
     int d0 = devices[0], d1 = devices[ndev > 1 ? 1 : 0];
     int integrated = coli_cuda_device_is_integrated(d0);
+    {
+        enum { I=32,O=17 };float tx[I],ts[O],a[O],b[O];uint8_t tw[O*I/2];
+        for(int i=0;i<I;i++)tx[i]=std::sin((float)(i+1)*.31f)*3.f;
+        for(int o=0;o<O;o++)ts[o]=.01f+.003f*(o%7);
+        for(int i=0;i<(int)sizeof(tw);i++){
+            int lo=((i*5+3)%16),hi=((i*7+1)%16);tw[i]=(uint8_t)(lo|(hi<<4));
+        }
+        if(!coli_cuda_test_gemv_q4_cached(d0,tx,tw,ts,I,O,a,b)||
+           !close_enough(a,b,O))return 1;
+        std::fprintf(stderr,"cached q4 GEMV parity: ok\n");
+    }
     size_t count = 99, bytes = 99;
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
