@@ -361,10 +361,18 @@ static void prof_lat(double s){ g_prof_lat[g_prof_nlat++ % PROF_LAT_CAP]=s; }
 /* snapshot for windowed reports (serve mode: one report per turn) */
 typedef struct {
     double edisk,ewait,emm,ecpu,egpu,route,p2p,attn,head;
+    double aproj,acore,aout;                    /* outer attention phase timers */
+    double dsync,dtopk,dphase[3];               /* fused DSA-chain CUDA timers */
     int64_t io,cpu_bytes; uint64_t hits,miss,ereq,n_fw,n_emit,nlat,n_p2p,cpu_rows;
     uint64_t hit_pin,hit_ecache;
+    long dsc_full,dsc_shared,dsc_reuse,dsc_fb_pre,dsc_fb_chain;
+    long dsc_pfull,dsc_pshared,dsc_pfb;
 } ProfBase;
+#ifdef COLI_CUDA
+static void prof_cuda_base(ProfBase *b);
+#endif
 static void prof_base(Model *m, ProfBase *b){
+    memset(b,0,sizeof(*b));
     b->edisk=edisk_s(); b->ewait=m->t_ewait; b->emm=m->t_emm;
     b->ecpu=m->t_ecpu; b->egpu=m->t_egpu; b->route=m->t_route; b->p2p=m->t_p2p;
     b->attn=m->t_attn; b->head=m->t_head;
@@ -373,6 +381,10 @@ static void prof_base(Model *m, ProfBase *b){
     b->hit_pin=m->hit_pin; b->hit_ecache=m->hit_ecache;
     b->n_fw=m->n_fw; b->n_emit=m->n_emit; b->nlat=g_prof_nlat; b->n_p2p=m->n_p2p;
     b->cpu_bytes=m->cpu_expert_bytes;b->cpu_rows=m->cpu_expert_rows;
+    b->aproj=m->t_aproj;b->acore=m->t_acore;b->aout=m->t_aout;
+#ifdef COLI_CUDA
+    prof_cuda_base(b);
+#endif
 }
 
 static float *falloc(int64_t n){
@@ -2658,6 +2670,13 @@ static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain;
 static long g_dsc_pfull,g_dsc_pshared,g_dsc_pfb;      /* prefill selection */
 static long g_dsc_reuse;                              /* COLI_DSA_REFRESH riusi */
 static int g_dsc_on=-1;
+static void prof_cuda_base(ProfBase *b){
+    coli_cuda_dsac_times(&b->dsync,&b->dtopk);
+    coli_cuda_dsac_phase_times(b->dphase);
+    b->dsc_full=g_dsc_full;b->dsc_shared=g_dsc_shared;b->dsc_reuse=g_dsc_reuse;
+    b->dsc_fb_pre=g_dsc_fb_pre;b->dsc_fb_chain=g_dsc_fb_chain;
+    b->dsc_pfull=g_dsc_pfull;b->dsc_pshared=g_dsc_pshared;b->dsc_pfb=g_dsc_pfb;
+}
 static void dsc_report(void){
     double ts=0,tk=0; coli_cuda_dsac_times(&ts,&tk);
     fprintf(stderr,"[DSAC] engaged: full %ld shared %ld reuse %ld | fallback: pre %ld chain %ld"
@@ -5683,6 +5702,20 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     double f_io=io_w/elapsed, f_emm=emm/elapsed, f_attn=attn/elapsed;
     fprintf(f,"[PROF] time shares: expert-I/O %.0f%% | expert-matmul %.0f%% | attention %.0f%% | lm_head %.0f%% | other %.0f%%\n",
         100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*other/elapsed);
+#ifdef COLI_CUDA
+    { double ap=m->t_aproj-b->aproj,ac=m->t_acore-b->acore,ao=m->t_aout-b->aout;
+      double ds=0,dt=0,dp[3]={0};coli_cuda_dsac_times(&ds,&dt);coli_cuda_dsac_phase_times(dp);
+      long df=g_dsc_full-b->dsc_full,dsh=g_dsc_shared-b->dsc_shared,
+           dr=g_dsc_reuse-b->dsc_reuse,dfp=g_dsc_fb_pre-b->dsc_fb_pre,
+           dfc=g_dsc_fb_chain-b->dsc_fb_chain,pf=g_dsc_pfull-b->dsc_pfull,
+           ps=g_dsc_pshared-b->dsc_pshared,pfb=g_dsc_pfb-b->dsc_pfb;
+      fprintf(f,"[PROF] attention outer: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",ap,ac,ao);
+      fprintf(f,"[PROF] DSA engagement: decode full %ld shared %ld reuse %ld | fallback pre %ld chain %ld | prefill full %ld shared %ld fallback %ld\n",
+          df,dsh,dr,dfp,dfc,pf,ps,pfb);
+      fprintf(f,"[PROF] DSA chain: proj+KV+score %.3fs | sync+score-download %.3fs | host top-k %.3fs | selected absorb+o_proj %.3fs | tail %.3fs%s\n",
+          dp[0]-b->dphase[0],ds-b->dsync,dt-b->dtopk,dp[1]-b->dphase[1],dp[2]-b->dphase[2],
+          nfw?" (request deltas)":""); }
+#endif
     double slow=ecpu>egpu?ecpu:egpu,fast=ecpu<egpu?ecpu:egpu;
     fprintf(f,"[PROF] P0 execution: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | tier straggler %.2fx | "
               "router %.3fs | residual P2P %.3fs (%llu hop, %.3f ms/hop) | orchestration %.3fs\n",
