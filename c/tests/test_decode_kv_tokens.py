@@ -2,6 +2,7 @@ import os
 import shlex
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,7 +46,7 @@ class DecodeKvTokensTest(unittest.TestCase):
         self.write_checkpoint(path, 5)
         run = subprocess.run(
             [self.binary, "unused-tokenizer", path, "0", "5"],
-            text=True, capture_output=True,
+            universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.assertEqual(run.returncode, 1)
         self.assertIn("short token checkpoint", run.stderr)
@@ -55,13 +56,15 @@ class DecodeKvTokensTest(unittest.TestCase):
         self.write_checkpoint(path, 0, 40)
         run = subprocess.run(
             [self.binary, "unused-tokenizer", path, "", "0"],
-            text=True, capture_output=True,
+            universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.assertEqual(run.returncode, 1)
         self.assertIn("invalid token range", run.stderr)
 
-    @unittest.skipUnless(resource and hasattr(resource, "RLIMIT_AS"),
-                         "requires RLIMIT_AS")
+    @unittest.skipUnless(
+        resource and hasattr(resource, "RLIMIT_AS") and sys.platform != "darwin",
+        "requires a usable RLIMIT_AS",
+    )
     def test_reports_id_allocation_failure(self):
         count = 8_000_000
         path = Path(self.tmp.name) / "large.tok"
@@ -73,7 +76,8 @@ class DecodeKvTokensTest(unittest.TestCase):
 
         run = subprocess.run(
             [self.binary, "unused-tokenizer", path, "0", str(count)],
-            text=True, capture_output=True, preexec_fn=limit_address_space,
+            universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=limit_address_space,
         )
         self.assertEqual(run.returncode, 1)
         self.assertIn("out of memory reading", run.stderr)
