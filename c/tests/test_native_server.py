@@ -450,6 +450,86 @@ class NativeServerTest(unittest.TestCase):
         self.assertGreater(time.monotonic() - started, .45)
         self.assertIn("event: message_stop", remainder)
 
+    def test_tool_streams_incrementally_across_fragmented_markers(self):
+        anthropic_tool = {"name": "lookup", "input_schema": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}
+        started = time.monotonic()
+        with self.request("/v1/messages", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "fragmented tool"}], "max_tokens": 16,
+            "thinking": {"type": "disabled"}, "tools": [anthropic_tool],
+            "stream": True,
+        }) as response:
+            first = response.readline().decode()
+            response.readline()
+            response.readline()
+            first_delta = response.readline().decode()
+            latency = time.monotonic() - started
+            rest = response.read().decode()
+        stream = first + first_delta + rest
+        self.assertLess(latency, .3)
+        self.assertIn('"text":"Before "', stream)
+        self.assertIn('"type":"tool_use"', stream)
+        self.assertIn('"partial_json":"{\\"q\\":\\"bird\\"}"', stream)
+        self.assertNotIn("<tool_", stream)
+        self.assertIn('"text":" After"', stream)
+
+        openai_tool = {"type": "function", "function": {"name": "lookup",
+            "parameters": {"type": "object", "properties": {
+                "q": {"type": "string"}}}}}
+        with self.request("/v1/chat/completions", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "fragmented tool"}], "max_tokens": 16,
+            "tools": [openai_tool], "stream": True,
+            "reasoning_effort": "none",
+        }) as response:
+            stream = response.read().decode()
+        self.assertIn('"content":"Before "', stream)
+        self.assertIn('"tool_calls"', stream)
+        self.assertIn('"arguments":"{\\"q\\":\\"bird\\"}"', stream)
+        self.assertNotIn("<tool_", stream)
+
+        started = time.monotonic()
+        with self.request("/v1/responses", {
+            "model": "glm-test", "input": "fragmented tool",
+            "max_output_tokens": 16, "tools": [openai_tool],
+            "stream": True,
+        }) as response:
+            first = response.readline().decode()
+            response.readline()
+            first_delta = response.readline().decode()
+            latency = time.monotonic() - started
+            rest = response.read().decode()
+        stream = first + first_delta + rest
+        self.assertLess(latency, .3)
+        self.assertIn('"delta":"Before "', stream)
+        self.assertIn('"type":"response.function_call_arguments.delta"',
+                      stream)
+        self.assertIn('"delta":"{\\"q\\":\\"bird\\"}"', stream)
+        self.assertNotIn("<tool_", stream)
+
+        with self.request("/api/chat", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "fragmented tool"}], "tools": [openai_tool],
+            "stream": True, "think": False,
+        }) as response:
+            events = [json.loads(line) for line in response if line.strip()]
+        self.assertEqual(events[0]["message"]["content"], "Before ")
+        calls = [e["message"]["tool_calls"] for e in events
+                 if e.get("message", {}).get("tool_calls")]
+        self.assertEqual(calls[0][0]["function"]["arguments"], {"q": "bird"})
+        self.assertTrue(events[-1]["done"])
+
+    def test_anthropic_stream_retains_split_utf8_tail(self):
+        with self.request("/v1/messages", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "split utf8"}], "max_tokens": 4,
+            "stream": True,
+        }) as response:
+            stream = response.read().decode("utf-8")
+        self.assertIn('"text":"é"', stream)
+        self.assertNotIn("�", stream)
+
 
 class NativePlanDoctorTest(unittest.TestCase):
     def setUp(self):

@@ -1417,6 +1417,164 @@ static void free_tool_calls(tool_call *calls, int n) {
     b_free(&calls[i].args);
 }
 
+typedef enum { SEM_REASONING, SEM_TEXT, SEM_TOOL } semantic_kind;
+typedef int (*semantic_emit_fn)(void *opaque, semantic_kind kind,
+                                const char *data, size_t n,
+                                const tool_call *call);
+typedef struct {
+  int thinking, failed, tool_count;
+  jval *tools;
+  buf pending;
+  semantic_emit_fn emit;
+  void *opaque;
+} semantic_stream;
+
+static void semantic_consume(semantic_stream *s, size_t n) {
+  if (n >= s->pending.n) {
+    b_free(&s->pending);
+    return;
+  }
+  memmove(s->pending.p, s->pending.p + n, s->pending.n - n);
+  s->pending.n -= n;
+  s->pending.p[s->pending.n] = 0;
+}
+static size_t semantic_utf8_prefix(const char *p, size_t n) {
+  size_t i = 0;
+  while (i < n) {
+    unsigned char c = (unsigned char)p[i];
+    size_t need = c < 0x80 ? 1 : (c & 0xe0) == 0xc0 ? 2
+                              : (c & 0xf0) == 0xe0   ? 3
+                              : (c & 0xf8) == 0xf0   ? 4
+                                                     : 1;
+    if (i + need > n)
+      break;
+    int valid = 1;
+    for (size_t j = 1; j < need; j++)
+      if (((unsigned char)p[i + j] & 0xc0) != 0x80)
+        valid = 0;
+    if (!valid)
+      need = 1;
+    i += need;
+  }
+  return i;
+}
+static int semantic_emit_bytes(semantic_stream *s, semantic_kind kind,
+                               size_t n) {
+  if (!n)
+    return 0;
+  n = semantic_utf8_prefix(s->pending.p, n);
+  if (!n)
+    return 0;
+  if (s->emit(s->opaque, kind, s->pending.p, n, NULL)) {
+    s->failed = 1;
+    return 1;
+  }
+  semantic_consume(s, n);
+  return 0;
+}
+static size_t semantic_marker_keep(const buf *pending, const char *marker) {
+  size_t ml = strlen(marker), max = pending->n < ml - 1 ? pending->n : ml - 1;
+  for (size_t k = max; k; k--)
+    if (!memcmp(pending->p + pending->n - k, marker, k))
+      return k;
+  return 0;
+}
+/* Incremental GLM output tokenizer. It keeps only a marker-length suffix of
+ * ordinary text, so XML delimiters may be split across engine DATA frames.
+ * Completed tool calls are parsed by the same schema-aware parser used for
+ * non-streaming responses; unterminated native calls are handled at finish. */
+static int semantic_feed(semantic_stream *s, const char *data, size_t n) {
+  static const char think_end[] = "</think>";
+  static const char tool_open[] = "<tool_call>";
+  static const char tool_end[] = "</tool_call>";
+  if (s->failed)
+    return 1;
+  b_addn(&s->pending, data, n);
+  for (;;) {
+    if (s->thinking) {
+      char *end = strstr(s->pending.p ? s->pending.p : "", think_end);
+      if (!end) {
+        size_t keep = semantic_marker_keep(&s->pending, think_end);
+        return s->pending.n > keep
+                   ? semantic_emit_bytes(s, SEM_REASONING, s->pending.n - keep)
+                   : 0;
+      }
+      size_t before = (size_t)(end - s->pending.p);
+      if (semantic_emit_bytes(s, SEM_REASONING, before))
+        return 1;
+      semantic_consume(s, sizeof(think_end) - 1);
+      s->thinking = 0;
+      continue;
+    }
+    if (s->pending.n >= 7 && !memcmp(s->pending.p, "<think>", 7)) {
+      semantic_consume(s, 7);
+      continue;
+    }
+    char *open = s->tools ? strstr(s->pending.p ? s->pending.p : "", tool_open)
+                          : NULL;
+    if (!open) {
+      size_t keep = s->tools ? semantic_marker_keep(&s->pending, tool_open) : 0;
+      return s->pending.n > keep
+                 ? semantic_emit_bytes(s, SEM_TEXT, s->pending.n - keep)
+                 : 0;
+    }
+    size_t before = (size_t)(open - s->pending.p);
+    if (semantic_emit_bytes(s, SEM_TEXT, before))
+      return 1;
+    char *end = strstr(s->pending.p + sizeof(tool_open) - 1, tool_end);
+    if (!end)
+      return 0;
+    size_t call_bytes = (size_t)(end - s->pending.p) + sizeof(tool_end) - 1;
+    char *raw = strndup(s->pending.p, call_bytes);
+    tool_call calls[16];
+    buf ignored = {0};
+    int count = parse_tool_calls(raw, s->tools, &ignored, calls, 16);
+    b_free(&ignored);
+    free(raw);
+    if (!count) {
+      if (semantic_emit_bytes(s, SEM_TEXT, call_bytes))
+        return 1;
+    } else {
+      for (int i = 0; i < count; i++) {
+        if (s->emit(s->opaque, SEM_TOOL, NULL, 0, &calls[i]))
+          s->failed = 1;
+        else
+          s->tool_count++;
+      }
+      free_tool_calls(calls, count);
+      semantic_consume(s, call_bytes);
+      if (s->failed)
+        return 1;
+    }
+  }
+}
+static int semantic_finish(semantic_stream *s) {
+  if (s->failed)
+    return 1;
+  if (s->thinking)
+    return semantic_emit_bytes(s, SEM_REASONING, s->pending.n);
+  if (s->tools && s->pending.n &&
+      strstr(s->pending.p, "<tool_call>") == s->pending.p) {
+    tool_call calls[16];
+    buf ignored = {0};
+    int count = parse_tool_calls(s->pending.p, s->tools, &ignored, calls, 16);
+    b_free(&ignored);
+    if (count) {
+      for (int i = 0; i < count; i++) {
+        if (s->emit(s->opaque, SEM_TOOL, NULL, 0, &calls[i]))
+          s->failed = 1;
+        else
+          s->tool_count++;
+      }
+      free_tool_calls(calls, count);
+      b_free(&s->pending);
+      return s->failed;
+    }
+  }
+  return semantic_emit_bytes(s, SEM_TEXT, s->pending.n);
+}
+static void semantic_free(semantic_stream *s) { b_free(&s->pending); }
+
 static int render_anthropic(buf *out, jval *body, int thinking) {
   b_add(out, "[gMASK]<sop>");
   jval *system = jget(body, "system");
@@ -1536,9 +1694,9 @@ static int render_responses(buf *out, jval *body, int thinking) {
 }
 
 typedef struct {
-  int fd, chat, thinking, tools, after_think, failed;
+  int fd, chat, failed;
   const char *id, *model;
-  buf pending;
+  semantic_stream semantic;
 } openai_stream;
 static int openai_delta(openai_stream *c, const char *field, const char *text,
                         size_t n) {
@@ -1568,29 +1726,48 @@ static int openai_delta(openai_stream *c, const char *field, const char *text,
     c->failed = 1;
   return rc;
 }
-static int openai_on_data(const char *data, size_t n, void *opaque) {
+static int openai_tool_delta(openai_stream *c, const tool_call *call,
+                             int index) {
+  buf event = {0};
+  b_add(&event, "data: {\"id\":");
+  b_json(&event, c->id);
+  b_printf(&event,
+           ",\"object\":\"chat.completion.chunk\",\"created\":%lld,\"model\":",
+           (long long)time(NULL));
+  b_json(&event, c->model);
+  b_printf(&event,
+           ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{"
+           "\"index\":%d,\"id\":",
+           index);
+  b_json(&event, call->id);
+  b_add(&event, ",\"type\":\"function\",\"function\":{\"name\":");
+  b_json(&event, call->name);
+  b_add(&event, ",\"arguments\":");
+  b_json(&event, call->args.p ? call->args.p : "{}");
+  b_add(&event,
+        "}}]},\"logprobs\":null,\"finish_reason\":null}]}\n\n");
+  int rc = write_all(c->fd, event.p, event.n);
+  b_free(&event);
+  if (rc)
+    c->failed = 1;
+  return rc;
+}
+static int openai_semantic_emit(void *opaque, semantic_kind kind,
+                                const char *data, size_t n,
+                                const tool_call *call) {
   openai_stream *c = opaque;
   if (c->failed)
     return 1;
-  if (c->tools)
-    return 0;
-  if (!c->thinking)
-    return openai_delta(c, c->chat ? "content" : "text", data, n);
-  b_addn(&c->pending, data, n);
-  char *marker = strstr(c->pending.p, "</think>");
-  if (!marker)
-    return 0;
-  size_t before = (size_t)(marker - c->pending.p);
-  if (before && openai_delta(c, "reasoning_content", c->pending.p, before))
-    return 1;
-  size_t skip = before + 8;
-  if (c->pending.n > skip &&
-      openai_delta(c, "content", c->pending.p + skip, c->pending.n - skip))
-    return 1;
-  b_free(&c->pending);
-  c->thinking = 0;
-  c->after_think = 1;
-  return 0;
+  if (kind == SEM_TOOL)
+    return c->chat ? openai_tool_delta(c, call, c->semantic.tool_count) : 0;
+  return openai_delta(c,
+                      kind == SEM_REASONING ? "reasoning_content"
+                                            : (c->chat ? "content" : "text"),
+                      data, n);
+}
+static int openai_on_data(const char *data, size_t n, void *opaque) {
+  openai_stream *c = opaque;
+  return semantic_feed(&c->semantic, data, n);
 }
 
 static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
@@ -1725,10 +1902,13 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
            (long long)time(NULL), (unsigned long)pthread_self());
   openai_stream stream_ctx = {.fd = fd,
                               .chat = chat,
-                              .thinking = thinking,
-                              .tools = tools && tools->t == J_ARR && tools->len,
                               .id = rid,
                               .model = s->c.model_id};
+  stream_ctx.semantic.thinking = thinking;
+  stream_ctx.semantic.tools =
+      tools && tools->t == J_ARR && tools->len ? tools : NULL;
+  stream_ctx.semantic.emit = openai_semantic_emit;
+  stream_ctx.semantic.opaque = &stream_ctx;
   if (stream) {
     if (send_stream_head(fd, "text/event-stream")) {
       b_free(&prompt);
@@ -1774,7 +1954,7 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
                 strlen("data: {\"error\":{\"message\":\"The inference engine "
                        "failed.\"}}\n\n"));
     request_destroy(&r);
-    b_free(&stream_ctx.pending);
+    semantic_free(&stream_ctx.semantic);
     return;
   }
   tool_call calls[16];
@@ -1788,6 +1968,7 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
   buf reasoning = {0}, answer = {0};
   split_reasoning(visible.p ? visible.p : "", thinking, &reasoning, &answer);
   if (stream) {
+    semantic_finish(&stream_ctx.semantic);
     buf payload = {0}, wire = {0};
     b_add(&payload, "{\"id\":");
     b_json(&payload, rid);
@@ -1797,21 +1978,6 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
     b_json(&payload, s->c.model_id);
     if (chat) {
       b_add(&payload, ",\"choices\":[{\"index\":0,\"delta\":{");
-      if (call_n) {
-        b_add(&payload, "\"tool_calls\":[");
-        for (int i = 0; i < call_n; i++) {
-          if (i)
-            b_add(&payload, ",");
-          b_printf(&payload, "{\"index\":%d,\"id\":", i);
-          b_json(&payload, calls[i].id);
-          b_add(&payload, ",\"type\":\"function\",\"function\":{\"name\":");
-          b_json(&payload, calls[i].name);
-          b_add(&payload, ",\"arguments\":");
-          b_json(&payload, calls[i].args.p);
-          b_add(&payload, "}}");
-        }
-        b_add(&payload, "]");
-      }
       b_printf(&payload, "},\"logprobs\":null,\"finish_reason\":\"%s\"}]}",
                call_n             ? "tool_calls"
                : r.length_limited ? "length"
@@ -1822,9 +1988,6 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
       b_printf(&payload, ",\"logprobs\":null,\"finish_reason\":\"%s\"}]}",
                r.length_limited ? "length" : "stop");
     }
-    if (thinking && stream_ctx.pending.n && !stream_ctx.failed)
-      openai_delta(&stream_ctx, "reasoning_content", stream_ctx.pending.p,
-                   stream_ctx.pending.n);
     b_add(&wire, "data: ");
     b_addn(&wire, payload.p, payload.n);
     b_add(&wire, "\n\ndata: [DONE]\n\n");
@@ -1890,7 +2053,7 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
   b_free(&visible);
   b_free(&reasoning);
   b_free(&answer);
-  b_free(&stream_ctx.pending);
+  semantic_free(&stream_ctx.semantic);
   free_tool_calls(calls, call_n);
   request_destroy(&r);
 }
@@ -1924,7 +2087,8 @@ static int protocol_options(server *s, jval *body, int anthropic, int *maximum,
 }
 
 typedef struct {
-  int fd, index, started, failed;
+  int fd, index, next_index, block_kind, failed;
+  semantic_stream semantic;
 } anthropic_stream;
 
 static int anthropic_event(int fd, const char *name, buf *payload) {
@@ -1939,19 +2103,68 @@ static int anthropic_event(int fd, const char *name, buf *payload) {
   return rc;
 }
 
-static int anthropic_text_data(const char *data, size_t n, void *opaque) {
+static int anthropic_close_block(anthropic_stream *stream) {
+  if (!stream->block_kind)
+    return 0;
+  buf stop = {0};
+  b_printf(&stop, "{\"type\":\"content_block_stop\",\"index\":%d}",
+           stream->index);
+  stream->failed = anthropic_event(stream->fd, "content_block_stop", &stop);
+  b_free(&stop);
+  stream->block_kind = 0;
+  return stream->failed;
+}
+static int anthropic_semantic_emit(void *opaque, semantic_kind kind,
+                                   const char *data, size_t n,
+                                   const tool_call *call) {
   anthropic_stream *stream = opaque;
   if (stream->failed)
     return 1;
-  if (!stream->started) {
+  int wanted = kind == SEM_REASONING ? 1 : kind == SEM_TEXT ? 2 : 3;
+  if (kind == SEM_TOOL) {
+    if (anthropic_close_block(stream))
+      return 1;
+    stream->index = stream->next_index++;
     buf start = {0};
     b_printf(&start,
              "{\"type\":\"content_block_start\",\"index\":%d,"
-             "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+             "\"content_block\":{\"type\":\"tool_use\",\"id\":",
              stream->index);
+    b_json(&start, call->id);
+    b_add(&start, ",\"name\":");
+    b_json(&start, call->name);
+    b_add(&start, ",\"input\":{}}}");
     stream->failed = anthropic_event(stream->fd, "content_block_start", &start);
     b_free(&start);
-    stream->started = 1;
+    if (stream->failed)
+      return 1;
+    buf delta = {0};
+    b_printf(&delta,
+             "{\"type\":\"content_block_delta\",\"index\":%d,"
+             "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
+             stream->index);
+    b_json(&delta, call->args.p ? call->args.p : "{}");
+    b_add(&delta, "}}");
+    stream->failed = anthropic_event(stream->fd, "content_block_delta", &delta);
+    b_free(&delta);
+    stream->block_kind = 3;
+    return anthropic_close_block(stream);
+  }
+  if (stream->block_kind != wanted) {
+    if (anthropic_close_block(stream))
+      return 1;
+    stream->index = stream->next_index++;
+    buf start = {0};
+    b_printf(&start,
+             "{\"type\":\"content_block_start\",\"index\":%d,"
+             "\"content_block\":{\"type\":\"%s\",",
+             stream->index, kind == SEM_REASONING ? "thinking" : "text");
+    b_add(&start, kind == SEM_REASONING
+                      ? "\"thinking\":\"\",\"signature\":\"\"}}"
+                      : "\"text\":\"\"}}");
+    stream->failed = anthropic_event(stream->fd, "content_block_start", &start);
+    b_free(&start);
+    stream->block_kind = wanted;
     if (stream->failed)
       return 1;
   }
@@ -1959,14 +2172,19 @@ static int anthropic_text_data(const char *data, size_t n, void *opaque) {
   buf delta = {0};
   b_printf(&delta,
            "{\"type\":\"content_block_delta\",\"index\":%d,"
-           "\"delta\":{\"type\":\"text_delta\",\"text\":",
-           stream->index);
+           "\"delta\":{\"type\":\"%s\",\"%s\":",
+           stream->index, kind == SEM_REASONING ? "thinking_delta" : "text_delta",
+           kind == SEM_REASONING ? "thinking" : "text");
   b_json(&delta, copy);
   b_add(&delta, "}}");
   stream->failed = anthropic_event(stream->fd, "content_block_delta", &delta);
   b_free(&delta);
   free(copy);
   return stream->failed;
+}
+static int anthropic_on_data(const char *data, size_t n, void *opaque) {
+  anthropic_stream *stream = opaque;
+  return semantic_feed(&stream->semantic, data, n);
 }
 
 static void anthropic(server *s, int fd, jval *body) {
@@ -1994,7 +2212,11 @@ static void anthropic(server *s, int fd, jval *body) {
   char id[80];
   snprintf(id, sizeof(id), "msg_%lld_%lu", (long long)time(NULL),
            (unsigned long)pthread_self());
-  anthropic_stream live = {.fd = fd, .index = 0};
+  anthropic_stream live = {.fd = fd};
+  live.semantic.thinking = thinking;
+  live.semantic.tools = has_tools ? tools : NULL;
+  live.semantic.emit = anthropic_semantic_emit;
+  live.semantic.opaque = &live;
   if (stream) {
     if (send_stream_head(fd, "text/event-stream")) {
       b_free(&prompt);
@@ -2019,8 +2241,7 @@ static void anthropic(server *s, int fd, jval *body) {
   request r;
   int rc = generate_prompt_cb(
       s, prompt.p, max, temp, top_p, -1, &r,
-      stream && !thinking && !has_tools ? anthropic_text_data : NULL,
-      stream && !thinking && !has_tools ? &live : NULL);
+      stream ? anthropic_on_data : NULL, stream ? &live : NULL);
   b_free(&prompt);
   if (rc) {
     if (rc == -4)
@@ -2036,6 +2257,7 @@ static void anthropic(server *s, int fd, jval *body) {
       anthropic_event(fd, "error", &error);
       b_free(&error);
     }
+    semantic_free(&live.semantic);
     return;
   }
   tool_call calls[16];
@@ -2092,61 +2314,9 @@ static void anthropic(server *s, int fd, jval *body) {
   if (!stream)
     send_json(fd, 200, &out);
   else {
+    semantic_finish(&live.semantic);
+    anthropic_close_block(&live);
     buf wire = {0};
-    if (reasoning.n) {
-      b_add(&wire, "event: content_block_start\ndata: "
-                   "{\"type\":\"content_block_start\",\"index\":0,"
-                   "\"content_block\":{\"type\":\"thinking\","
-                   "\"thinking\":\"\",\"signature\":\"\"}}\n\n"
-                   "event: content_block_delta\ndata: "
-                   "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"
-                   "\"type\":\"thinking_delta\",\"thinking\":");
-      b_json(&wire, reasoning.p);
-      b_add(&wire, "}}\n\nevent: content_block_stop\ndata: "
-                   "{\"type\":\"content_block_stop\",\"index\":0}\n\n");
-    }
-    if (content.n && !(live.started && !has_tools)) {
-      int index = reasoning.n ? 1 : 0;
-      b_printf(&wire,
-               "event: content_block_start\ndata: {\"type\":"
-               "\"content_block_start\",\"index\":%d,\"content_block\":{"
-               "\"type\":\"text\",\"text\":\"\"}}\n\n"
-               "event: content_block_delta\ndata: {\"type\":"
-               "\"content_block_delta\",\"index\":%d,\"delta\":{"
-               "\"type\":\"text_delta\",\"text\":",
-               index, index);
-      b_json(&wire, content.p);
-      b_printf(&wire,
-               "}}\n\nevent: content_block_stop\ndata: {\"type\":"
-               "\"content_block_stop\",\"index\":%d}\n\n",
-               index);
-    } else if (live.started && !has_tools) {
-      b_printf(&wire,
-               "event: content_block_stop\ndata: {\"type\":"
-               "\"content_block_stop\",\"index\":%d}\n\n",
-               live.index);
-    }
-    for (int i = 0; i < call_n; i++) {
-      int index = (reasoning.n ? 1 : 0) + (content.n ? 1 : 0) + i;
-      b_add(&wire, "event: content_block_start\ndata: "
-                   "{\"type\":\"content_block_start\",\"index\":");
-      b_printf(&wire,
-               "%d,\"content_block\":{\"type\":\"tool_use\",\"id\":", index);
-      b_json(&wire, calls[i].id);
-      b_add(&wire, ",\"name\":");
-      b_json(&wire, calls[i].name);
-      b_add(&wire, ",\"input\":{}}}\n\nevent: content_block_delta\ndata: "
-                   "{\"type\":\"content_block_delta\",\"index\":");
-      b_printf(&wire,
-               "%d,\"delta\":{\"type\":\"input_json_delta\","
-               "\"partial_json\":",
-               index);
-      b_json(&wire, calls[i].args.p);
-      b_printf(&wire,
-               "}}\n\nevent: content_block_stop\ndata: {\"type\":"
-               "\"content_block_stop\",\"index\":%d}\n\n",
-               index);
-    }
     b_printf(&wire,
              "event: message_delta\ndata: {\"type\":\"message_delta\","
              "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
@@ -2162,6 +2332,7 @@ static void anthropic(server *s, int fd, jval *body) {
       write_all(fd, wire.p, wire.n);
     b_free(&wire);
   }
+  semantic_free(&live.semantic);
   b_free(&out);
   b_free(&visible);
   b_free(&reasoning);
@@ -2191,6 +2362,56 @@ static void anthropic_count_tokens(server *s, int fd, jval *body) {
             "x-colibri-token-count: estimated\r\n");
   b_free(&out);
   b_free(&prompt);
+}
+
+typedef struct {
+  int fd, failed;
+  semantic_stream semantic;
+} responses_stream;
+
+static int responses_event(responses_stream *stream, buf *payload) {
+  buf wire = {0};
+  b_add(&wire, "data: ");
+  b_addn(&wire, payload->p, payload->n);
+  b_add(&wire, "\n\n");
+  stream->failed = write_all(stream->fd, wire.p, wire.n) != 0;
+  b_free(&wire);
+  return stream->failed;
+}
+
+static int responses_semantic_emit(void *opaque, semantic_kind kind,
+                                   const char *data, size_t n,
+                                   const tool_call *call) {
+  responses_stream *stream = opaque;
+  if (stream->failed)
+    return 1;
+  buf event = {0};
+  if (kind == SEM_TOOL) {
+    b_add(&event,
+          "{\"type\":\"response.function_call_arguments.delta\",\"delta\":");
+    b_json(&event, call->args.p ? call->args.p : "{}");
+    b_add(&event, ",\"name\":");
+    b_json(&event, call->name);
+    b_add(&event, ",\"call_id\":");
+    b_json(&event, call->id);
+    b_add(&event, "}");
+  } else {
+    b_add(&event, kind == SEM_REASONING
+                      ? "{\"type\":\"response.reasoning_text.delta\",\"delta\":"
+                      : "{\"type\":\"response.output_text.delta\",\"delta\":");
+    char *copy = strndup(data, n);
+    b_json(&event, copy);
+    free(copy);
+    b_add(&event, "}");
+  }
+  int rc = responses_event(stream, &event);
+  b_free(&event);
+  return rc;
+}
+
+static int responses_on_data(const char *data, size_t n, void *opaque) {
+  responses_stream *stream = opaque;
+  return semantic_feed(&stream->semantic, data, n);
 }
 
 static void responses(server *s, int fd, jval *body) {
@@ -2240,18 +2461,56 @@ static void responses(server *s, int fd, jval *body) {
   buf history_prompt = {0};
   b_add(&history_prompt, prompt.p);
   strip_tool_preamble(&history_prompt);
+  jval *tools = jget(body, "tools");
+  int stream = jbool(body, "stream", 0);
+  char id[80], oid[80];
+  snprintf(id, sizeof(id), "resp_%lld_%lu", (long long)time(NULL),
+           (unsigned long)pthread_self());
+  snprintf(oid, sizeof(oid), "msg_%lld_%lu", (long long)time(NULL),
+           (unsigned long)pthread_self());
+  responses_stream live = {.fd = fd};
+  live.semantic.thinking = thinking;
+  live.semantic.tools = tools && tools->t == J_ARR && tools->len ? tools : NULL;
+  live.semantic.emit = responses_semantic_emit;
+  live.semantic.opaque = &live;
+  if (stream) {
+    if (send_stream_head(fd, "text/event-stream")) {
+      b_free(&prompt);
+      b_free(&history_prompt);
+      return;
+    }
+    buf created = {0};
+    b_add(&created, "{\"type\":\"response.created\",\"response\":{\"id\":");
+    b_json(&created, id);
+    b_printf(&created,
+             ",\"object\":\"response\",\"created_at\":%lld,\"status\":"
+             "\"in_progress\",\"model\":",
+             (long long)time(NULL));
+    b_json(&created, s->c.model_id);
+    b_add(&created, ",\"output\":[]}}");
+    responses_event(&live, &created);
+    b_free(&created);
+  }
   request r;
-  int rc = generate_prompt(s, prompt.p, max, temp, top_p, -1, &r);
+  int rc = generate_prompt_cb(s, prompt.p, max, temp, top_p, -1, &r,
+                              stream ? responses_on_data : NULL,
+                              stream ? &live : NULL);
   b_free(&prompt);
   if (rc) {
     if (rc == -4)
       request_destroy(&r);
     b_free(&history_prompt);
-    api_error(fd, rc == -1 || rc == -2 ? 429 : 500,
-              "Inference request failed.");
+    if (!stream)
+      api_error(fd, rc == -1 || rc == -2 ? 429 : 500,
+                "Inference request failed.");
+    else if (!live.failed)
+      write_all(fd, "data: {\"type\":\"error\",\"error\":{\"message\":"
+                    "\"Inference request failed.\"}}\n\n",
+                strlen("data: {\"type\":\"error\",\"error\":{\"message\":"
+                       "\"Inference request failed.\"}}\n\n"));
+    semantic_free(&live.semantic);
     return;
   }
-  jval *tools = jget(body, "tools");
   tool_call calls[16];
   buf visible = {0};
   int call_n = tools && tools->t == J_ARR && tools->len
@@ -2262,9 +2521,6 @@ static void responses(server *s, int fd, jval *body) {
     b_add(&visible, r.data.p ? r.data.p : "");
   buf reasoning = {0}, content = {0};
   split_reasoning(visible.p ? visible.p : "", thinking, &reasoning, &content);
-  char id[80], oid[80];
-  snprintf(id, sizeof(id), "resp_%llu", r.id);
-  snprintf(oid, sizeof(oid), "msg_%llu", r.id);
   buf out = {0};
   b_add(&out, "{\"id\":");
   b_json(&out, id);
@@ -2301,28 +2557,19 @@ static void responses(server *s, int fd, jval *body) {
   b_printf(&out, "%d,\"output_tokens\":%d,\"total_tokens\":%d},\"error\":null}",
            r.prompt_tokens, r.completion_tokens,
            r.prompt_tokens + r.completion_tokens);
-  if (!jbool(body, "stream", 0))
+  if (!stream)
     send_json(fd, 200, &out);
   else {
-    buf wire = {0};
-    b_add(&wire, "data: {\"type\":\"response.created\",\"response\":");
-    b_addn(&wire, out.p, out.n);
-    if (call_n) {
-      b_add(&wire,
-            "}\n\ndata: "
-            "{\"type\":\"response.function_call_arguments.delta\",\"delta\":");
-      b_json(&wire, calls[0].args.p);
-    } else {
-      b_add(&wire,
-            "}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":");
-      b_json(&wire, content.p ? content.p : "");
-    }
-    b_add(&wire, "}\n\ndata: {\"type\":\"response.completed\",\"response\":");
-    b_addn(&wire, out.p, out.n);
-    b_add(&wire, "}\n\ndata: [DONE]\n\n");
-    send_body(fd, 200, "text/event-stream", wire.p, wire.n,
-              "Cache-Control: no-cache\r\n");
-    b_free(&wire);
+    semantic_finish(&live.semantic);
+    buf completed = {0};
+    b_add(&completed, "{\"type\":\"response.completed\",\"response\":");
+    b_addn(&completed, out.p, out.n);
+    b_add(&completed, "}");
+    if (!live.failed)
+      responses_event(&live, &completed);
+    if (!live.failed)
+      write_all(fd, "data: [DONE]\n\n", strlen("data: [DONE]\n\n"));
+    b_free(&completed);
   }
   b_free(&out);
   b_add(&history_prompt, r.data.p ? r.data.p : "");
@@ -2332,6 +2579,7 @@ static void responses(server *s, int fd, jval *body) {
   b_free(&reasoning);
   b_free(&content);
   free_tool_calls(calls, call_n);
+  semantic_free(&live.semantic);
   request_destroy(&r);
 }
 
@@ -2445,6 +2693,52 @@ static int static_file(server *s, int fd, const char *url) {
   return 1;
 }
 
+typedef struct {
+  int fd, chat, failed;
+  const char *model;
+  semantic_stream semantic;
+} ollama_stream;
+static int ollama_semantic_emit(void *opaque, semantic_kind kind,
+                                const char *data, size_t n,
+                                const tool_call *call) {
+  ollama_stream *s = opaque;
+  if (s->failed)
+    return 1;
+  buf out = {0};
+  b_add(&out, "{\"model\":");
+  b_json(&out, s->model);
+  b_add(&out, ",\"created_at\":\"1970-01-01T00:00:00Z\",");
+  if (s->chat) {
+    b_add(&out, "\"message\":{\"role\":\"assistant\",");
+    if (kind == SEM_TOOL) {
+      b_add(&out, "\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":");
+      b_json(&out, call->name);
+      b_add(&out, ",\"arguments\":");
+      b_add(&out, call->args.p ? call->args.p : "{}");
+      b_add(&out, "}}]}");
+    } else {
+      b_add(&out, kind == SEM_REASONING ? "\"thinking\":" : "\"content\":");
+      char *copy = strndup(data, n);
+      b_json(&out, copy);
+      free(copy);
+      b_add(&out, "}");
+    }
+  } else {
+    b_add(&out, "\"response\":");
+    char *copy = strndup(data ? data : "", n);
+    b_json(&out, copy);
+    free(copy);
+  }
+  b_add(&out, ",\"done\":false}\n");
+  s->failed = write_all(s->fd, out.p, out.n) != 0;
+  b_free(&out);
+  return s->failed;
+}
+static int ollama_on_data(const char *data, size_t n, void *opaque) {
+  ollama_stream *s = opaque;
+  return semantic_feed(&s->semantic, data, n);
+}
+
 static void ollama_generate(server *s, int fd, jval *body, int chat) {
   const char *model = jstr(body, "model", s->c.model_id);
   if (!model_allowed(s, model)) {
@@ -2470,16 +2764,31 @@ static void ollama_generate(server *s, int fd, jval *body, int chat) {
     api_error(fd, 400, "invalid Ollama request");
     return;
   }
+  jval *tools = jget(body, "tools");
+  int stream = jbool(body, "stream", 1);
+  ollama_stream live = {.fd = fd, .chat = chat, .model = s->c.model_id};
+  live.semantic.thinking = jbool(body, "think", 0);
+  live.semantic.tools =
+      chat && tools && tools->t == J_ARR && tools->len ? tools : NULL;
+  live.semantic.emit = ollama_semantic_emit;
+  live.semantic.opaque = &live;
+  if (stream && send_stream_head(fd, "application/x-ndjson")) {
+    b_free(&prompt);
+    return;
+  }
   request r;
-  int rc = generate_prompt(s, prompt.p, max, temp, top, -1, &r);
+  int rc = generate_prompt_cb(s, prompt.p, max, temp, top, -1, &r,
+                              stream ? ollama_on_data : NULL,
+                              stream ? &live : NULL);
   b_free(&prompt);
   if (rc) {
     if (rc == -4)
       request_destroy(&r);
-    api_error(fd, 500, "inference failed");
+    if (!stream)
+      api_error(fd, 500, "inference failed");
+    semantic_free(&live.semantic);
     return;
   }
-  jval *tools = jget(body, "tools");
   tool_call calls[16];
   buf visible = {0};
   int call_n = chat && tools && tools->t == J_ARR && tools->len
@@ -2488,14 +2797,16 @@ static void ollama_generate(server *s, int fd, jval *body, int chat) {
                    : 0;
   if (!chat || !tools || tools->t != J_ARR || !tools->len)
     b_add(&visible, r.data.p ? r.data.p : "");
+  if (stream)
+    semantic_finish(&live.semantic);
   buf out = {0};
   b_add(&out, "{\"model\":");
   b_json(&out, s->c.model_id);
   b_add(&out, ",\"created_at\":\"1970-01-01T00:00:00Z\",");
   if (chat) {
     b_add(&out, "\"message\":{\"role\":\"assistant\",\"content\":");
-    b_json(&out, visible.p ? visible.p : "");
-    if (call_n) {
+    b_json(&out, stream ? "" : (visible.p ? visible.p : ""));
+    if (call_n && !stream) {
       b_add(&out, ",\"tool_calls\":[");
       for (int i = 0; i < call_n; i++) {
         if (i)
@@ -2511,7 +2822,7 @@ static void ollama_generate(server *s, int fd, jval *body, int chat) {
     b_add(&out, "},");
   } else {
     b_add(&out, "\"response\":");
-    b_json(&out, visible.p ? visible.p : "");
+    b_json(&out, stream ? "" : (visible.p ? visible.p : ""));
     b_add(&out, ",");
   }
   b_printf(&out,
@@ -2519,15 +2830,17 @@ static void ollama_generate(server *s, int fd, jval *body, int chat) {
            "\"eval_count\":%d}",
            r.length_limited ? "length" : "stop", r.prompt_tokens,
            r.completion_tokens);
-  if (!jbool(body, "stream", 1))
+  if (!stream)
     send_json(fd, 200, &out);
   else {
     b_add(&out, "\n");
-    send_body(fd, 200, "application/x-ndjson", out.p, out.n, NULL);
+    if (!live.failed)
+      write_all(fd, out.p, out.n);
   }
   b_free(&out);
   b_free(&visible);
   free_tool_calls(calls, call_n);
+  semantic_free(&live.semantic);
   request_destroy(&r);
 }
 

@@ -41,6 +41,12 @@ error envelopes and both `x-api-key` and Bearer authentication. Administrative
 APIs such as batches, files, billing and organizations are intentionally not
 implemented.
 
+Streaming is incremental even when thinking or tools are enabled. The gateway
+retains only incomplete UTF-8 sequences and possible `</think>`/`<tool_call>`
+marker prefixes; ordinary text is sent as it arrives. Completed tool calls are
+translated to Anthropic `tool_use` + `input_json_delta`, OpenAI `tool_calls`, or
+Ollama tool-call NDJSON events without exposing GLM's internal XML syntax.
+
 Point Claude Code at the server and select Colibri's advertised model id:
 
 ```bash

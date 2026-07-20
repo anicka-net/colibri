@@ -69,7 +69,21 @@ int main(void) {
               ? "Reasoning</think>Answer"
           : strstr(prompt, "hello") ? "Hello from C"
                                     : "OK";
-      if (strstr(prompt, "slow")) {
+      if (strstr(prompt, "split utf8")) {
+        printf("DATA %llu 1\n\xc3\n", id);
+        printf("DATA %llu 1\n\xa9\n", id);
+        reply = NULL;
+      } else if (strstr(prompt, "fragmented tool")) {
+        const char *parts[] = {
+            "Before ", "<tool_", "call>lookup<arg_key>q</arg_key><arg_",
+            "value>bird</arg_value></tool_call>", " After"};
+        for (int i = 0; i < 5; i++) {
+          printf("DATA %llu %zu\n%s\n", id, strlen(parts[i]), parts[i]);
+          if (i == 0)
+            usleep(500000);
+        }
+        reply = NULL;
+      } else if (strstr(prompt, "slow")) {
         printf("DATA %llu 5\nfirst\n", id);
         usleep(500000);
         printf("DATA %llu 6\nsecond\n", id);
