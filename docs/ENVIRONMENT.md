@@ -155,10 +155,11 @@ appear in `glm.c`. Development-only Python tools do not participate at runtime.
 | Variable | Default | Effect |
 |---|---|---|
 | `COLI_DEBUG` | `0` (off) | Tee the engine transaction to stderr, by level. **`1`** = decoded model output stream only (byte-by-byte, on both the tool-call and plain paths). **`2`** = both sides — the fully-rendered prompt the engine received *and* the output, bracketed and correlated by request id, so stderr reads as the whole conversation. Invaluable for seeing what the model received vs. emitted during an OpenCode session. |
+| `COLI_DEBUG_HTTP` | `0` (off) | Log redacted HTTP request metadata and API errors: method, path, model, body size, stream mode, message/tool counts, status, and request id. Authorization values and prompt content are never logged. |
 | `COLI_TOOL_SALVAGE` | `0` (off) | Opt-in de-mangler: reconstruct a malformed int4 tool call by mapping its lone payload onto the tool's primary parameter. Never rewrites well-formed output; recommended for int4 deployments. |
 | `COLI_THINK` | `0` (off) | Make thinking the default when the client sends *neither* `reasoning_effort` nor `enable_thinking`. Any explicit client value still wins. |
 | `COLI_MODEL` | unset | Default model directory (fallback for `--model`). |
-| `COLI_MODEL_ID` | `glm-5.2-colibri` | Model id reported by the API. |
+| `COLI_MODEL_ID` | `glm-5.2` | Model id reported by the API. |
 | `COLI_API_KEY` | unset | Required bearer token for the server. |
 | `COLI_MAX_QUEUE` | `8` | Max queued requests. |
 | `COLI_QUEUE_TIMEOUT` | `300` | Seconds a request may wait in the queue. |

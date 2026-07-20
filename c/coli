@@ -928,7 +928,7 @@ def main():
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
-    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
+    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2"))
     ps.add_argument("--model-alias",action="append",default=[])
     ps.add_argument("--hidden-model-alias",action="append",default=[])
     ps.add_argument("--default-thinking",action="store_true",
@@ -946,7 +946,7 @@ def main():
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
-                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
+                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2"))),
                    ("--model-alias",dict(action="append",default=[])),
                    ("--hidden-model-alias",dict(action="append",default=[])),
                    ("--default-thinking",dict(action="store_true",

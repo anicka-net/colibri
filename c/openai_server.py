@@ -2030,7 +2030,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
+def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2", api_key=None,
           cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, expert_bits=8, dense_bits=None,
           model_aliases=(), hidden_model_aliases=(), context_length=None,
@@ -2078,7 +2078,7 @@ def main():
     parser.add_argument("--engine", default=str(HERE / "glm"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2"))
     parser.add_argument("--model-alias", action="append", default=[])
     parser.add_argument("--hidden-model-alias", action="append", default=[])
     parser.add_argument("--default-thinking", action="store_true",

@@ -56,7 +56,7 @@ export default function App() {
   })
   const [apiKey, setApiKey] = useState("")
   const [models, setModels] = useState<string[]>([])
-  const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2-colibri"))
+  const [model, setModel] = useState(() => stored(localStorage, "colibri.model", "glm-5.2"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(512)
   const [thinking, setThinking] = useState(false)
