@@ -230,6 +230,11 @@ static _Thread_local char response_origin[512];
 static _Thread_local char response_path[1024];
 static _Thread_local char response_request_id[96];
 
+static int http_debug_enabled(void) {
+  const char *value = getenv("COLI_DEBUG_HTTP");
+  return value && *value && strcmp(value, "0");
+}
+
 static ssize_t write_all(int fd, const void *p, size_t n) {
   const char *s = p;
   while (n) {
@@ -632,6 +637,9 @@ static int send_json(int fd, int status, buf *b) {
                    b->p ? b->n : 2, NULL);
 }
 static void api_error(int fd, int status, const char *message) {
+  if (http_debug_enabled())
+    fprintf(stderr, "[http] id=%s path=%s status=%d error=%s\n",
+            response_request_id, response_path, status, message);
   buf b = {0};
   if (!strncmp(response_path, "/v1/messages", 12)) {
     b_add(&b, "{\"type\":\"error\",\"error\":{\"type\":\"");
@@ -2173,6 +2181,12 @@ static void *client_main(void *arg) {
     api_error(fd, pr == -2 ? 400 : 400, "Invalid HTTP request.");
     goto done;
   }
+  if (http_debug_enabled())
+    fprintf(stderr,
+            "[http] id=%s method=%s path=%s bytes=%zu auth=%s origin=%s\n",
+            response_request_id, r.method, r.path, r.content_length,
+            r.authorization[0] || r.api_key[0] ? "present" : "absent",
+            r.origin[0] ? r.origin : "-");
   if (cors_allowed(s, r.origin))
     snprintf(response_origin, sizeof(response_origin), "%s", r.origin);
   snprintf(response_path, sizeof(response_path), "%s", r.path);
@@ -2223,6 +2237,15 @@ static void *client_main(void *arg) {
     api_error(fd, 400, "Request body must be a JSON object.");
     json_free(body);
     goto done;
+  }
+  if (http_debug_enabled()) {
+    jval *messages = jget(body, "messages"), *tools = jget(body, "tools");
+    fprintf(stderr,
+            "[http] id=%s request model=%s stream=%s messages=%d tools=%d\n",
+            response_request_id, jstr(body, "model", "(default)"),
+            jbool(body, "stream", 0) ? "true" : "false",
+            messages && messages->t == J_ARR ? messages->len : 0,
+            tools && tools->t == J_ARR ? tools->len : 0);
   }
   if (!strcmp(r.path, "/v1/chat/completions"))
     completion(s, fd, &r, body, 1);

@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
     web_buf[0] = 0;
   const char *model = envs("COLI_MODEL", "/home/vincenzo/glm52_i4"),
              *engine = envs("COLI_ENGINE", engine_buf), *host = "127.0.0.1",
-             *model_id = envs("COLI_MODEL_ID", "glm-5.2-colibri"),
+             *model_id = envs("COLI_MODEL_ID", "glm-5.2"),
              *api_key = getenv("COLI_API_KEY"),
              *web_root = envs("COLI_WEB_ROOT", web_buf);
   int port = 8000, cap = 8, ngen = 1024, ctx = envi("COLI_CONTEXT_LENGTH", 0),
