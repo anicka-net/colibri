@@ -367,6 +367,7 @@ typedef struct {
     uint64_t hit_pin,hit_ecache;
     long dsc_full,dsc_shared,dsc_reuse,dsc_fb_pre,dsc_fb_chain;
     long dsc_pfull,dsc_pshared,dsc_pfb;
+    long pipe_dense_ok,pipe_dense_fb;
 } ProfBase;
 #ifdef COLI_CUDA
 static void prof_cuda_base(ProfBase *b);
@@ -1677,6 +1678,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
+#ifdef COLI_CUDA
+            /* The resident layer path keeps the residual on kv_b's home GPU.
+             * Dense MLP tensors must follow it just like sparse shared-expert
+             * tensors; round-robin placement would otherwise force a fallback. */
+            qt_cuda_colocate(&l->gate_proj,&l->kv_b);
+            qt_cuda_colocate(&l->up_proj,&l->kv_b);
+            qt_cuda_colocate(&l->down_proj,&l->kv_b);
+#endif
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
@@ -2669,6 +2678,7 @@ static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln
 static long g_dsc_full,g_dsc_shared,g_dsc_fb_pre,g_dsc_fb_chain;
 static long g_dsc_pfull,g_dsc_pshared,g_dsc_pfb;      /* prefill selection */
 static long g_dsc_reuse;                              /* COLI_DSA_REFRESH riusi */
+static long g_pipe_dense_ok,g_pipe_dense_fb;           /* resident dense-layer path */
 static int g_dsc_on=-1;
 static void prof_cuda_base(ProfBase *b){
     coli_cuda_dsac_times(&b->dsync,&b->dtopk);
@@ -2676,6 +2686,7 @@ static void prof_cuda_base(ProfBase *b){
     b->dsc_full=g_dsc_full;b->dsc_shared=g_dsc_shared;b->dsc_reuse=g_dsc_reuse;
     b->dsc_fb_pre=g_dsc_fb_pre;b->dsc_fb_chain=g_dsc_fb_chain;
     b->dsc_pfull=g_dsc_pfull;b->dsc_pshared=g_dsc_pshared;b->dsc_pfb=g_dsc_pfb;
+    b->pipe_dense_ok=g_pipe_dense_ok;b->pipe_dense_fb=g_pipe_dense_fb;
 }
 static void dsc_report(void){
     double ts=0,tk=0; coli_cuda_dsac_times(&ts,&tk);
@@ -4437,26 +4448,30 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
 #ifdef COLI_CUDA
-/* Inc.2a — intero layer SPARSO residente sul device del layer. x_dev entra e resta;
- * lasciano il device solo: nrm post-attention (router + expert CPU + gather dei
- * gruppi), i nuovi record KV, e la nrm pre-attention sui layer con indexer DSA.
+/* Inc.2a — intero layer residente sul device del layer. x_dev entra e resta.
+ * I layer sparsi scaricano la nrm post-attention per router/expert CPU; i layer
+ * densi eseguono anche gate/up/down sul device. Entrambi mantengono KV e
+ * residuo residenti e scaricano solo i record host-canonici richiesti.
  * Ritorna 0 su errore: il chiamante ripristina lo snapshot e rifa' il layer su CPU. */
-static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, int pos_base,
-                             float *nrm_host, float *out_host){
+static int pipe_layer_cuda(Model *m, Layer *l, int li, float *x_dev, int S, int pos_base,
+                           float *nrm_host, float *out_host){
     Cfg *c=&m->c; int D=c->hidden, dev=l->kv_b.cuda_device;
-    int sI=c->moe_inter*c->n_shared;
+    int sI=c->moe_inter*c->n_shared, mlpI=l->sparse?sI:c->dense_inter;
     size_t xb=(size_t)S*D*4;
-    if(!l->sh_gate.cuda_eligible||!l->sh_up.cuda_eligible||!l->sh_down.cuda_eligible||
-       !qt_cuda_upload(&l->sh_gate)||!qt_cuda_upload(&l->sh_up)||!qt_cuda_upload(&l->sh_down)||
-       l->sh_gate.cuda_device!=dev||l->sh_up.cuda_device!=dev||l->sh_down.cuda_device!=dev) return 0;
+    QT *mg=l->sparse?&l->sh_gate:&l->gate_proj;
+    QT *mu=l->sparse?&l->sh_up:&l->up_proj;
+    QT *md=l->sparse?&l->sh_down:&l->down_proj;
+    if(!mg->cuda_eligible||!mu->cuda_eligible||!md->cuda_eligible||
+       !qt_cuda_upload(mg)||!qt_cuda_upload(mu)||!qt_cuda_upload(md)||
+       mg->cuda_device!=dev||mu->cuda_device!=dev||md->cuda_device!=dev) return 0;
     int chain_pre_logits=0, chain_did_shared=0;
     if(g_fuse_shared<0){ const char *e=getenv("COLI_FUSE_SHARED"); g_fuse_shared=e&&atoi(e); }
     float *w_in =coli_cuda_pipe_scratch(dev,8,(size_t)D*4);
     float *w_post=coli_cuda_pipe_scratch(dev,9,(size_t)D*4);
     float *nrm_d=coli_cuda_pipe_scratch(dev,10,xb);
     float *y_d  =coli_cuda_pipe_scratch(dev,11,xb);
-    float *sg_d =coli_cuda_pipe_scratch(dev,12,(size_t)S*sI*4);
-    float *su_d =coli_cuda_pipe_scratch(dev,13,(size_t)S*sI*4);
+    float *sg_d =coli_cuda_pipe_scratch(dev,12,(size_t)S*mlpI*4);
+    float *su_d =coli_cuda_pipe_scratch(dev,13,(size_t)S*mlpI*4);
     float *snap =coli_cuda_pipe_scratch(dev,14,xb);
     if(!w_in||!w_post||!nrm_d||!y_d||!sg_d||!su_d||!snap) return 0;
     if(!coli_cuda_pipe_peer_copy(dev,snap,dev,x_dev,xb)) return 0;   /* snapshot per il fallback */
@@ -4556,13 +4571,15 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(S<=4 && li<c->n_layers &&
        (sel_active || !(dsa_idx_layer && (g_dsa_force || m->kv_start[li]!=0))) &&
        kv_dev_sync(m,l,m->kv,li,pos_base)){
-        size_t scores_n=(size_t)S*c->n_experts;
-        if(scores_n>chain_scores_cap){
-            float *p=realloc(chain_scores,scores_n*sizeof(float));
-            if(!p) return 0;
-            chain_scores=p; chain_scores_cap=scores_n;
+        if(l->sparse){
+            size_t scores_n=(size_t)S*c->n_experts;
+            if(scores_n>chain_scores_cap){
+                float *p=realloc(chain_scores,scores_n*sizeof(float));
+                if(!p) return 0;
+                chain_scores=p; chain_scores_cap=scores_n;
+            }
+            chain_scores[0]=NAN;              /* missing router cache -> CPU routing fallback */
         }
-        chain_scores[0]=NAN;                  /* missing router cache -> CPU routing fallback */
         if(dsa_idx_layer){
             size_t xn_n=(size_t)S*D;
             if(xn_n>chain_xn_cap){
@@ -4581,11 +4598,11 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                m->kv->cuda_Lc[li],m->kv->cuda_Rc[li],
                D,c->n_heads,c->q_lora,kvl,c->qk_nope,R,c->v_head,
                S,pos_base,m->kv_start[li],c->eps,c->theta,c->attn_scale,
-               pipe_ln_cache(dev,li,4,l->router,(size_t)c->n_experts*D),
-               c->n_experts,chain_scores,
-               g_fuse_shared?l->sh_gate.cuda:NULL,
-               g_fuse_shared?l->sh_up.cuda:NULL,
-               g_fuse_shared?l->sh_down.cuda:NULL,sI,
+               l->sparse?pipe_ln_cache(dev,li,4,l->router,(size_t)c->n_experts*D):NULL,
+               l->sparse?c->n_experts:0,l->sparse?chain_scores:NULL,
+               l->sparse&&g_fuse_shared?l->sh_gate.cuda:NULL,
+               l->sparse&&g_fuse_shared?l->sh_up.cuda:NULL,
+               l->sparse&&g_fuse_shared?l->sh_down.cuda:NULL,l->sparse?sI:0,
                dsa_idx_layer?chain_xn:NULL,pdsa)){
             m->kv->cuda_valid[li]=pos_base+S;
             if(g_dsc_on&&sel_active){ if(!dsa_idx_layer)g_dsc_shared++;
@@ -4606,8 +4623,9 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
                     }else g_dsa_rc_n[li]=0;
                 }
             }
-            if(!isnan(chain_scores[0])) chain_pre_logits=1;
-            if(g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda) chain_did_shared=1;
+            if(l->sparse&&!isnan(chain_scores[0])) chain_pre_logits=1;
+            if(l->sparse&&g_fuse_shared&&l->sh_gate.cuda&&l->sh_up.cuda&&l->sh_down.cuda)
+                chain_did_shared=1;
             if(dsa_idx_layer&&!chain_did_sel){   /* index keys for future top-k selection */
                 for(int s=0;s<S;s++){ int pos=pos_base+s;
                     float *kd=m->Ic[li]+(int64_t)pos*c->index_hd;
@@ -4646,6 +4664,18 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(!coli_cuda_pipe_download(dev,nrm_d,nrm_host,xb)) return 0;
     m->t_attn+=now_s()-ta;
 attn_done:;
+    if(!l->sparse){
+        /* Dense SwiGLU stays entirely on the layer home GPU.  pipe_gemm uses
+         * exact GEMV for decode and the existing W4A16 tiles for append/prefill. */
+        double te=now_s();
+        if(!coli_cuda_pipe_gemm(l->gate_proj.cuda,sg_d,nrm_d,S) ||
+           !coli_cuda_pipe_gemm(l->up_proj.cuda,su_d,nrm_d,S) ||
+           !coli_cuda_pipe_silu_mul(dev,sg_d,su_d,(size_t)S*c->dense_inter) ||
+           !coli_cuda_pipe_gemm(l->down_proj.cuda,y_d,sg_d,S) ||
+           !coli_cuda_pipe_add(dev,x_dev,y_d,(size_t)S*D)) return 0;
+        m->t_emm+=now_s()-te;
+        return 1;
+    }
     /* OVERLAP: issue the shared expert on the GPU BEFORE moe() runs on the CPU.
      * The shared expert reads nrm_d (valid after the download above) and writes its
      * residual into x_dev (async). While the GPU computes this, the CPU enters moe()
@@ -4821,7 +4851,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
 #ifdef COLI_CUDA
         Layer *l=&m->L[i];
-        if(pipe2 && l->sparse && i<c->n_layers &&
+        if(pipe2 && i<c->n_layers &&
            l->q_a.cuda_eligible&&l->q_b.cuda_eligible&&l->kv_a.cuda_eligible&&
            l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->q_a)&&qt_cuda_upload(&l->q_b)&&qt_cuda_upload(&l->kv_a)&&
@@ -4840,7 +4870,9 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                 else dst=x_dev;
                 if(ok){
                     x_dev=dst; x_dev_on=dev;
-                    if(pipe_layer_sparse(m,l,i,x_dev,S,pos_base,nrm,tmp)){
+                    int pok=pipe_layer_cuda(m,l,i,x_dev,S,pos_base,nrm,tmp);
+                    if(!l->sparse){ if(pok)g_pipe_dense_ok++; else g_pipe_dense_fb++; }
+                    if(pok){
                         if(g_xcrc && S>=8){   /* probe anche sotto PIPE2 (il tail del loop e' saltato) */
                             static float *cb=NULL; static size_t cc=0;
                             if(cc<xb){ free(cb); cb=malloc(xb); cc=xb; }
@@ -5725,6 +5757,8 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
       fprintf(f,"[PROF] DSA chain: proj+KV+score %.3fs | sync+score-download %.3fs | host top-k %.3fs | selected absorb+o_proj %.3fs | tail %.3fs%s\n",
           dp[0]-b->dphase[0],ds-b->dsync,dt-b->dtopk,dp[1]-b->dphase[1],dp[2]-b->dphase[2],
           nfw?" (request deltas)":""); }
+    { long dok=g_pipe_dense_ok-b->pipe_dense_ok,dfb=g_pipe_dense_fb-b->pipe_dense_fb;
+      fprintf(f,"[PROF] resident dense layers: %ld engaged | %ld fallback\n",dok,dfb); }
 #endif
     double slow=ecpu>egpu?ecpu:egpu,fast=ecpu<egpu?ecpu:egpu;
     fprintf(f,"[PROF] P0 execution: routed CPU %.3fs / %.2f GB/s (%llu row) | routed GPU critical %.3fs | tier straggler %.2fx | "
@@ -7613,9 +7647,8 @@ static double cuda_ic_shadow_bytes_for(int full, int index_hd, int max_ctx, int 
     return (double)slots*full*max_ctx*index_hd*4.0;
 }
 
-static int cuda_ic_shadow_layer_eligible(int full, int sparse, int resident_eligible,
-                                         int integrated){
-    return full && sparse && resident_eligible && integrated;
+static int cuda_ic_shadow_layer_eligible(int full, int resident_eligible, int integrated){
+    return full && resident_eligible && integrated;
 }
 
 static double cuda_expert_ram_bytes(Model *m){
@@ -7651,14 +7684,16 @@ static double cuda_ic_shadow_bytes(Model *m, int max_ctx){
                  l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
                  l->q_a.cuda_device==dev&&l->q_b.cuda_device==dev&&
                  l->kv_a.cuda_device==dev&&l->o.cuda_device==dev;
-        int shared=l->sh_gate.cuda_eligible&&l->sh_up.cuda_eligible&&
-                   l->sh_down.cuda_eligible&&l->sh_gate.cuda_device==dev&&
-                   l->sh_up.cuda_device==dev&&l->sh_down.cuda_device==dev;
+        QT *mg=l->sparse?&l->sh_gate:&l->gate_proj;
+        QT *mu=l->sparse?&l->sh_up:&l->up_proj;
+        QT *md=l->sparse?&l->sh_down:&l->down_proj;
+        int mlp=mg->cuda_eligible&&mu->cuda_eligible&&md->cuda_eligible&&
+                mg->cuda_device==dev&&mu->cuda_device==dev&&md->cuda_device==dev;
         QT *wq=&m->ix_wq[i],*wk=&m->ix_wk[i],*wp=&m->ix_wp[i];
         int index=wq->cuda_eligible&&wk->cuda_eligible&&wp->cuda_eligible&&
                   wq->cuda_device==dev&&wk->cuda_device==dev&&wp->cuda_device==dev;
-        full+=cuda_ic_shadow_layer_eligible(m->c.idx_type[i],l->sparse,
-            attn&&shared&&index,coli_cuda_device_is_integrated(dev));
+        full+=cuda_ic_shadow_layer_eligible(m->c.idx_type[i],attn&&mlp&&index,
+            coli_cuda_device_is_integrated(dev));
     }
     int slots=kv_slot_count(); if(slots<1||slots>16) slots=1;
     return cuda_ic_shadow_bytes_for(full,m->c.index_hd,max_ctx,slots);

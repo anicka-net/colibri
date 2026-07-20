@@ -131,6 +131,26 @@ int main(int argc, char **argv) {
     }
     if(!close_enough(device_accum,zero,8))return 1;
     std::fprintf(stderr,"device group ordering: ok\n");
+
+    /* Resident dense-layer MLP composition: gate/up -> SwiGLU -> down ->
+       residual add, using the same pipe primitives as pipe_layer_cuda(). */
+    float *dgate=(float*)coli_cuda_pipe_alloc(d0,4*sizeof(float));
+    float *dup=(float*)coli_cuda_pipe_alloc(d0,4*sizeof(float));
+    float dense_got[8],dense_want[8];
+    if(!dgate||!dup){std::fprintf(stderr,"dense pipe allocation failed\n");return 1;}
+    if(!coli_cuda_pipe_upload(d0,dout,zero,sizeof(zero))||
+       !coli_cuda_pipe_gemm(tg,dgate,dx,2)||
+       !coli_cuda_pipe_gemm(tu,dup,dx,2)||
+       !coli_cuda_pipe_silu_mul(d0,dgate,dup,4)||
+       !coli_cuda_pipe_gemm(td,dout,dgate,2)||
+       !coli_cuda_pipe_add(d0,dout,dx,8)||
+       !coli_cuda_pipe_download(d0,dout,dense_got,sizeof(dense_got))){
+        std::fprintf(stderr,"dense pipe composition failed\n");return 1;
+    }
+    for(int i=0;i<8;i++)dense_want[i]=want_expert[i]+x[i];
+    if(!close_enough(dense_got,dense_want,8))return 1;
+    std::fprintf(stderr,"resident dense MLP composition: ok\n");
+    coli_cuda_pipe_free(d0,dgate);coli_cuda_pipe_free(d0,dup);
     coli_cuda_pipe_free(d0,dx);coli_cuda_pipe_free(d0,dout);
 
     const int8_t q8d[8]={1,0, 0,1, 1,1, 1,-1};const float s8d[4]={1,1,1,1};
