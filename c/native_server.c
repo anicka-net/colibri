@@ -784,13 +784,16 @@ static int render_content(buf *out, jval *v) {
 static const char *strip_anthropic_headers(const char *s) {
   if (!s)
     return "";
-  if (!strncasecmp(s, "x-anthropic-billing-header:", 27)) {
-    const char *cch = strstr(s + 27, "cch=");
-    const char *end = cch ? strchr(cch, ';') : NULL;
-    if (end)
-      s = end + 1;
-  }
+  if (strncasecmp(s, "x-anthropic-billing-header:", 27))
+    return s;
+  const char *cch = strstr(s + 27, "cch=");
+  const char *end = cch ? strchr(cch, ';') : NULL;
+  if (!end)
+    return s;
+  s = end + 1;
   for (;;) {
+    while (*s == '\r' || *s == '\n')
+      s++;
     const char *colon = strchr(s, ':'), *newline = strchr(s, '\n');
     if (!colon || !newline || colon > newline)
       break;
@@ -823,7 +826,7 @@ static int render_anthropic_system(buf *out, jval *v) {
         (strcmp(t->str, "text") && strcmp(t->str, "input_text")) || !x ||
         x->t != J_STR)
       return -1;
-    b_add(out, strip_anthropic_headers(x->str));
+    b_add(out, i == 0 ? strip_anthropic_headers(x->str) : x->str);
   }
   return 0;
 }

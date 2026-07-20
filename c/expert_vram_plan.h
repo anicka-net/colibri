@@ -12,4 +12,8 @@ static inline double coli_vram_device_budget(double total_budget,
     return share < safe_device ? share : safe_device;
 }
 
+static inline double coli_vram_ram_charge(double bytes, int integrated) {
+    return bytes > 0 && integrated ? bytes : 0;
+}
+
 #endif

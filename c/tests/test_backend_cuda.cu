@@ -98,12 +98,39 @@ int main(int argc, char **argv) {
     float *dx=(float*)coli_cuda_pipe_alloc(d0,sizeof(x));
     float *dout=(float*)coli_cuda_pipe_alloc(d0,sizeof(x));
     float zero[8]={0},device_accum[8],want_accum[8];int tok2[2]={0,1};float wt2[2]={.5f,.25f};
-    if(!dx||!dout||!coli_cuda_pipe_upload(d0,dx,x,sizeof(x))||
-       !coli_cuda_pipe_upload(d0,dout,zero,sizeof(zero))||
-       coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,dx,wt2,tok2,2,0,1,dout)!=2||
-       !coli_cuda_pipe_download(d0,dout,device_accum,sizeof(device_accum)))return 1;
+    if(!dx||!dout){std::fprintf(stderr,"device path allocation failed\n");return 1;}
+    if(!coli_cuda_pipe_upload(d0,dx,x,sizeof(x))||
+       !coli_cuda_pipe_upload(d0,dout,zero,sizeof(zero))){
+        std::fprintf(stderr,"device path upload failed\n");return 1;
+    }
+    int device_group_rc=coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,
+                                                dx,wt2,tok2,2,0,1,dout);
+    if(device_group_rc!=2){
+        std::fprintf(stderr,"device path group returned %d\n",device_group_rc);return 1;
+    }
+    if(!coli_cuda_pipe_download(d0,dout,device_accum,sizeof(device_accum))){
+        std::fprintf(stderr,"device path download failed\n");return 1;
+    }
     for(int i=0;i<4;i++){want_accum[i]=want_expert[i]*.5f;want_accum[4+i]=want_expert[4+i]*.25f;}
     if(!close_enough(device_accum,want_accum,8))return 1;
+    if(!coli_cuda_pipe_upload(d0,dout,zero,sizeof(zero))){
+        std::fprintf(stderr,"device ordering setup upload failed\n");return 1;
+    }
+    for(int i=0;i<64;i++)
+        if(coli_cuda_expert_group(gates,ups,downs,group_rows,2,grouped,dx,
+                                  wt2,tok2,2,0,1,dout)!=2){
+            std::fprintf(stderr,"device ordering group %d failed\n",i);return 1;
+        }
+    cudaError_t order_err=cudaMemsetAsync(dout,0,sizeof(zero),0);
+    if(order_err==cudaSuccess)order_err=cudaDeviceSynchronize();
+    if(order_err!=cudaSuccess){
+        std::fprintf(stderr,"device ordering sync failed: %s\n",cudaGetErrorString(order_err));return 1;
+    }
+    if(!coli_cuda_pipe_download(d0,dout,device_accum,sizeof(device_accum))){
+        std::fprintf(stderr,"device ordering download failed\n");return 1;
+    }
+    if(!close_enough(device_accum,zero,8))return 1;
+    std::fprintf(stderr,"device group ordering: ok\n");
     coli_cuda_pipe_free(d0,dx);coli_cuda_pipe_free(d0,dout);
 
     const int8_t q8d[8]={1,0, 0,1, 1,1, 1,-1};const float s8d[4]={1,1,1,1};

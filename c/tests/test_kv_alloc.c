@@ -8,6 +8,20 @@
 #include "../glm.c"
 #undef main
 
+typedef struct {
+    Model *m;
+    _Atomic int started;
+    _Atomic int done;
+} RepinProbe;
+
+static void *repin_probe(void *arg){
+    RepinProbe *p=arg;
+    atomic_store_explicit(&p->started,1,memory_order_release);
+    repin_adapt(p->m,1);
+    atomic_store_explicit(&p->done,1,memory_order_release);
+    return NULL;
+}
+
 int main(void){
     static Model m;
     m.c.n_layers=2; m.c.kv_lora=8; m.c.qk_rope=4;
@@ -52,6 +66,17 @@ int main(void){
     rss_guard_apply(&m,3.0,1.0);
     assert(m.ecap==1 && m.ecn[0]==1 && m.ecache[0][0].eid==11);
     assert(g_rss_cap_ceiling==1);
+    Model repin_model={0}; RepinProbe probe={&repin_model,0,0}; pthread_t thread;
+    pthread_mutex_lock(&g_pilot_mx);
+    assert(!pthread_create(&thread,NULL,repin_probe,&probe));
+    while(!atomic_load_explicit(&probe.started,memory_order_acquire)) usleep(100);
+    usleep(20000);
+    assert(!atomic_load_explicit(&probe.done,memory_order_acquire));
+    pthread_mutex_unlock(&g_pilot_mx);
+    assert(!pthread_join(thread,NULL));
+    assert(atomic_load_explicit(&probe.done,memory_order_acquire));
+    assert(!pthread_mutex_trylock(&g_pilot_mx));
+    pthread_mutex_unlock(&g_pilot_mx);
     expert_lru_release(&m.ecache[0][0]);
     free(m.ecache[0]); free(m.ecache); free(m.ecn);
     printf("OK kv_alloc re-allocation\n");

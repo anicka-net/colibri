@@ -132,6 +132,22 @@ class NativeServerTest(unittest.TestCase):
             result = json.load(response)
         self.assertEqual(result["content"][0]["text"], "headers-stripped")
 
+    def test_anthropic_authored_system_text_is_preserved(self):
+        body = {
+            "model": "glm-test",
+            "system": [
+                {"type": "text",
+                 "text": "Authorization: keep this\ncheck authored system"},
+                {"type": "text",
+                 "text": "x-user-authored: keep this\nsecond block"},
+            ],
+            "messages": [{"role": "user", "content": "verify system"}],
+            "max_tokens": 8,
+        }
+        with self.request("/v1/messages", body) as response:
+            result = json.load(response)
+        self.assertEqual(result["content"][0]["text"], "system-preserved")
+
     def test_private_pidfile_and_stop_dry_run(self):
         pidfile = Path(self.runtime_tmp.name) / f"colibri-serve-{self.port}.pid"
         self.assertTrue(pidfile.is_file())

@@ -47,6 +47,11 @@ int main(void) {
           strstr(prompt, "check headers")
               ? (strstr(prompt, "x-anthropic-") ? "headers-leaked"
                                                    : "headers-stripped")
+          : strstr(prompt, "check authored system")
+              ? (strstr(prompt, "Authorization: keep this") &&
+                         strstr(prompt, "x-user-authored: keep this")
+                     ? "system-preserved"
+                     : "system-lost")
           : strstr(prompt, "show bind") ? bind_reply
           : strstr(prompt, "show ctx") ? ctx_reply
           : strstr(prompt, "check reference")

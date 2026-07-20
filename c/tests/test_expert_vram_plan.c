@@ -14,6 +14,9 @@ int main(void) {
     CHECK(fabs(a - 48e9) < 1.0);
     CHECK(fabs(b - 72e9) < 1.0);
     CHECK(coli_vram_device_budget(10, 0, 10) == 0);
+    CHECK(coli_vram_ram_charge(30e9, 1) == 30e9);
+    CHECK(coli_vram_ram_charge(30e9, 0) == 0);
+    CHECK(coli_vram_ram_charge(-1, 1) == 0);
     puts("expert VRAM per-device budget: ok");
     return 0;
 }
