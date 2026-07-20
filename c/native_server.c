@@ -2206,6 +2206,11 @@ static void *client_main(void *arg) {
   if (cors_allowed(s, r.origin))
     snprintf(response_origin, sizeof(response_origin), "%s", r.origin);
   snprintf(response_path, sizeof(response_path), "%s", r.path);
+  /* HTTP request targets may carry query parameters.  Routing is based on the
+   * path component; Anthropic clients currently append ?beta=true. */
+  char *query = strchr(r.path, '?');
+  if (query)
+    *query = 0;
   if (!auth_ok(s, &r)) {
     api_error(fd, 401, "Invalid or missing API key.");
     goto done;
@@ -2215,6 +2220,14 @@ static void *client_main(void *arg) {
               "Access-Control-Allow-Methods: GET, POST, "
               "OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, "
               "Content-Type, x-api-key, anthropic-version, anthropic-beta\r\n");
+    goto done;
+  }
+  if (!strcmp(r.method, "HEAD")) {
+    if (!strcmp(r.path, "/") || !strcmp(r.path, "/v1/models") ||
+        !strncmp(r.path, "/v1/models/", 11))
+      send_body(fd, 200, "text/plain", "", 0, NULL);
+    else
+      api_error(fd, 404, "Not found.");
     goto done;
   }
   if (!strcmp(r.method, "GET")) {
