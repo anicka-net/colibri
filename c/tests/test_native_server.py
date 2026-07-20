@@ -178,6 +178,23 @@ class NativeServerTest(unittest.TestCase):
             self.assertEqual(response.headers["Access-Control-Allow-Origin"],
                              "http://localhost:5173")
 
+    def test_claude_code_query_routing_and_head_probe(self):
+        probe = Request(self.base + "/", method="HEAD", headers={
+            "Authorization": "Bearer secret",
+        })
+        with urlopen(probe, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), b"")
+
+        with self.request("/v1/messages?beta=true", {
+            "model": "glm-test", "messages": [{"role": "user",
+                                                   "content": "hello"}],
+            "max_tokens": 4, "stream": False,
+        }) as response:
+            result = json.load(response)
+        self.assertEqual(result["type"], "message")
+        self.assertEqual(result["content"][0]["text"], "Hello from C")
+
     def test_malformed_json_and_generation_option_types_are_rejected(self):
         malformed = Request(self.base + "/v1/chat/completions", data=b'{"model":',
                             headers={"Authorization": "Bearer secret",
