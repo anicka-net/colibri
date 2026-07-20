@@ -167,21 +167,22 @@ the full 756 GB on disk at once:
 
 ```bash
 cd c && ./setup.sh                        # checks gcc/OpenMP, builds, self-tests
-./coli convert --model /nvme/glm52_i4     # download+convert shard by shard (python, one-time)
+python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 \
+  --outdir /nvme/glm52_i4 --ebits 4 --io-bits 8  # development-time converter
 ```
 
 ### 2. Run it
 
 ```bash
-COLI_MODEL=/nvme/glm52_i4 ./coli chat     # RAM budget, cache and MTP auto-detected
-COLI_MODEL=/nvme/glm52_i4 ./coli plan     # inspect the planned VRAM/RAM/disk placement
-COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
-./coli web  --model /nvme/glm52_i4        # API + web dashboard on one port
-./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
+COLI_MODEL=/nvme/glm52_i4 ./coli-native chat
+COLI_MODEL=/nvme/glm52_i4 ./coli-native plan
+COLI_MODEL=/nvme/glm52_i4 ./coli-native doctor
+./coli-native web  --model /nvme/glm52_i4        # API + web dashboard
+./coli-native serve --model /nvme/glm52_i4       # API only
 ```
 
-The engine at runtime is pure C — python is only used by the one-time converter
-and the optional API gateway.
+The engine, CLI, HTTP gateway, scheduler, and compatibility APIs are native C.
+Python is only used by development-time conversion, benchmark, and test tools.
 
 ### 3. Go deeper
 
