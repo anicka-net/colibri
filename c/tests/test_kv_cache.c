@@ -22,7 +22,7 @@ static void cleanup_dir(const char *dir){
 }
 
 int main(void){
-    char dir[256]; snprintf(dir,sizeof(dir),"tests/.kv-cache-%ld",(long)getpid());
+    char dir[256]; snprintf(dir,sizeof(dir),".kv-cache-%ld",(long)getpid());
     cleanup_dir(dir); assert(kv_cache_mkdir(dir));
 
     static Model m; ServeCtx s={0};
