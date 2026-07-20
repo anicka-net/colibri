@@ -32,6 +32,52 @@ may use `think: false` or `thinking: {"type": "disabled"}`. Reasoning is
 returned separately as `reasoning_content` in the OpenAI chat API and as
 thinking blocks in the Anthropic API.
 
+### Claude Code via the Anthropic API
+
+The gateway implements the Anthropic inference surface needed by Claude Code:
+`POST /v1/messages`, Anthropic SSE events, tool-use/tool-result blocks, extended
+thinking blocks, `POST /v1/messages/count_tokens`, model discovery, Anthropic
+error envelopes and both `x-api-key` and Bearer authentication. Administrative
+APIs such as batches, files, billing and organizations are intentionally not
+implemented.
+
+Point Claude Code at the server and select Colibri's advertised model id:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+export ANTHROPIC_API_KEY=local                 # match COLI_API_KEY, or any value if unset
+export ANTHROPIC_MODEL=glm-5.2-colibri
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.2-colibri
+export API_TIMEOUT_MS=2147483647               # long prefill can exceed Claude Code's default
+claude
+```
+
+The token-count endpoint is an estimate (`x-colibri-token-count: estimated`)
+because the current engine wire protocol has no tokenizer RPC. Completed
+generation usage is exact. Claude Code may disable MCP tool search for a custom
+`ANTHROPIC_BASE_URL`; its ordinary built-in tools and explicitly configured MCP
+servers continue to work.
+
+### Ollama-compatible API
+
+Ollama clients can use the same host directly. Implemented endpoints are
+`POST /api/chat`, `POST /api/generate`, `POST /api/show`, `GET /api/tags`,
+`GET /api/ps`, and `GET /api/version`. Chat/generate support JSON and NDJSON
+streaming, tools, separate thinking output, the common `options` fields
+`num_predict`, `temperature` and `top_p`, and the Colibri `cache_slot` extension.
+
+```bash
+curl http://127.0.0.1:8000/api/chat -d '{
+  "model": "glm-5.2-colibri",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": false
+}'
+```
+
+Colibri is a text-generation runtime, not an Ollama model store. Pull, push,
+create, copy, delete, embeddings and image inputs are not implemented; unknown
+endpoints return Ollama-shaped errors.
+
 Use `--model-alias` for additional advertised ids and
 `--hidden-model-alias` for accepted compatibility ids. `--default-thinking`
 enables reasoning when the request has no explicit thinking control. The
