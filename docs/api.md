@@ -202,6 +202,33 @@ KV prefix, so stateless HTTP turns keep their cache across requests and even
 across engine restarts. Use `COLI_KV_SLOTS=N` as the environment equivalent.
 Start small: at the default 4096-token context, every slot costs hundreds of MB.
 
+## Many conversations, one RAM context
+
+For a family server or agent workloads, `COLI_KV_CACHE_GB=N` replaces
+RAM-multiplied slots with a bounded disk library while keeping `KV_SLOTS=1`.
+Every completed conversation is checkpointed under a content-derived name.
+Before each request the engine finds the saved token history with the longest
+exact prefix, restores only that prefix, and prefills the remaining suffix.
+Shared system/tool prompts therefore reuse the same model state across unrelated
+clients without exposing or attending to either conversation's private tail.
+
+```bash
+COLI_KV_SLOTS=1 \
+COLI_KV_CACHE_GB=512 \
+COLI_KV_CACHE_DIR=/persistent/colibri-kv \
+./coli serve --model /path/to/model
+```
+
+Snapshots are immutable and published with temp-file + rename, so branching
+conversations cannot overwrite a shared prefix. The oldest snapshots are
+evicted after checkpoints until the steady-state budget is met; atomic
+publication can temporarily require one additional snapshot's worth of disk.
+The directory contains token ids and activations, so permissions are restricted
+to the service user and the directory must be treated as conversation data.
+Use one cache directory per running engine; the library is single-writer.
+This mode is currently available in the mux/OpenAI service, not interactive
+`coli chat`.
+
 ## Web dashboard
 
 One command serves the OpenAI-compatible API **and** the web console on the

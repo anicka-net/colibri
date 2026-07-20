@@ -272,7 +272,7 @@ where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
-### 7b. Precomputed prefix KV caches (agentic time-to-first-token)
+### 7b. Precomputed prefix KV caches (implemented; live validation pending)
 Every new CLI/agent conversation re-prefills the same multi-thousand-token tool
 system prompt.  At the measured prefill rates that is ~2 min for a 5k prompt —
 paid per fresh session, and it dwarfs everything else in the interactive path.
@@ -283,17 +283,14 @@ restored prefix needs no re-scoring and a mismatched model is rejected.  Record
 size is `4 + n_layers*(kv_lora+qk_rope)*4 + n_ic*index_hd*4` = **~215 KB/token**
 here: 1.1 GB for 5k tokens, ~1 s to read from NVMe versus ~150 s to recompute —
 two orders of magnitude.
-What is missing is only the plumbing around it:
-- **A keyed library** instead of one live file per slot: content-hash the
-  leading token run, store `<cache>/<hash>.kv`, look up on request.  Today
-  `$SNAP/.coli_kv` IS the conversation, and it is overwritten as the turn
-  proceeds.
-- **Read-only prefixes with copy-on-write**: loading a shared prefix must not
-  let the continuing conversation append into it.
-- **Longest-prefix match at submit time**, replacing the current
-  compare-against-this-slot's-own-history (`mux_submit` / raw-API path).
-- **Storage location**: on a tmpfs-snapshot host `$SNAP/.coli_kv` costs RAM;
-  a prefix library belongs on real disk.
+The mux/OpenAI service now has the missing plumbing behind
+`COLI_KV_CACHE_GB`: a bounded content-keyed library, exact longest-prefix
+matching at submit time, copy-on-write branch checkpoints, incremental
+extension of linear histories, compact token sidecars for cheap matching,
+and LRU eviction.  `COLI_KV_CACHE_DIR` must point to private persistent disk
+and be owned by one engine process.  Unit and full C checks cover restore,
+branching, crash recovery, corruption fallback, and eviction; GB10 timing and
+greedy-output equivalence controls remain to be run before deployment.
 - Note RoPE bakes ABSOLUTE positions in, so a cache is only valid at position 0
   and two prefixes cannot be concatenated — fine for system prompts, which is
   exactly the use case.
