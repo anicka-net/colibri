@@ -210,10 +210,19 @@ LDFLAGS  += -framework Metal -framework Foundation -lc++
 METAL_OBJ = backend_metal.o
 endif
 
-all: glm$(EXE)
+ifeq ($(IS_WIN),)
+CLI_TARGET = coli-native$(EXE)
+else
+CLI_TARGET =
+endif
+
+all: glm$(EXE) $(CLI_TARGET)
 
 # phony 'glm' → 'glm.exe' on Windows (so 'make glm' and 'coli build' work on every platform)
 glm: glm$(EXE)
+
+coli-native$(EXE): coli_native.c native_server.c native_server.h native_plan.c native_plan.h native_chat.c native_chat.h json.h .build-config
+	$(CC) $(CFLAGS) coli_native.c native_server.c native_plan.c native_chat.c -o $@ $(LDFLAGS)
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
 # `make glm.exe CUDA_DLL=1` after a prior CPU-only build reports "up to date" and
@@ -288,12 +297,15 @@ PORTABLE_ARCH = native
 endif
 
 portable:
-	$(MAKE) glm$(EXE) ARCH=$(PORTABLE_ARCH)
+	$(MAKE) glm$(EXE) $(CLI_TARGET) ARCH=$(PORTABLE_ARCH)
 
 iobench$(EXE): iobench.c compat.h
 	$(CC) $(CFLAGS) iobench.c -o iobench$(EXE) $(LDFLAGS)
 
 tests/test_json$(EXE): tests/test_json.c json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/fake_mux_engine$(EXE): tests/fake_mux_engine.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
@@ -363,7 +375,15 @@ test-c: $(TEST_BINS)
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
-test: test-c test-python
+ifeq ($(IS_WIN),)
+test-native: coli-native$(EXE) tests/fake_mux_engine$(EXE)
+	$(PYTHON) tests/test_native_server.py
+else
+test-native:
+	@echo native CLI tests: skipped on Windows
+endif
+
+test: test-c test-python test-native
 
 # Local validation: one portable CPU build and dependency-free tests.
 check:
@@ -371,15 +391,16 @@ check:
 	$(MAKE) portable
 	$(MAKE) test
 
-install: glm$(EXE) olmoe$(EXE)
+install: glm$(EXE) $(CLI_TARGET) olmoe$(EXE)
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)
-	$(INSTALL) -d $(DESTDIR)$(LIBEXECDIR)/tools
+ifeq ($(IS_WIN),)
+	$(INSTALL) -m 755 coli-native$(EXE) $(DESTDIR)$(BINDIR)/coli$(EXE)
+else
 	$(INSTALL) -m 755 coli $(DESTDIR)$(BINDIR)/coli
+endif
 	$(INSTALL) -m 755 glm$(EXE) $(DESTDIR)$(LIBEXECDIR)/glm$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
-	$(INSTALL) -m 644 resource_plan.py doctor.py openai_server.py $(DESTDIR)$(LIBEXECDIR)/
-	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/coli
@@ -390,4 +411,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test check clean install uninstall bench
+.PHONY: all glm cuda-test cuda-bench cuda-dll portable test-c test-python test-native test check clean install uninstall bench

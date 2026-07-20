@@ -31,10 +31,9 @@ documents the per-profile reasoning and the measured service gotchas.
 
 `ExecStartPre` runs `ops/colibri-preflight.sh`, which refuses to start when the
 snapshot is missing or short (tmpfs does not survive a reboot), when
-`nvidia_uvm` lacks `uvm_disable_hmm=1`, or when `python3` predates 3.7 — each of
-which otherwise fails minutes into startup, or invisibly if the service user
-cannot read the journal.  Set `COLI_PREFLIGHT_*` in the env file to enable the
-checks that apply to the host.
+`nvidia_uvm` lacks `uvm_disable_hmm=1`. Set `COLI_PREFLIGHT_*` in the env file
+to enable the checks that apply to the host. The installed service and HTTP
+runtime are native C and do not require Python.
 
 Edit `service.env` first. `COLI_CONTEXT` is both the allocated engine context
 and the value advertised to clients. KV memory grows with context and slots, so

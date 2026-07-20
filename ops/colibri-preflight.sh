@@ -44,16 +44,6 @@ if [ "$min_gb" -gt 0 ]; then
     [ "$gb" -ge "$min_gb" ] || fail "snapshot is ${gb} GB, expected >= ${min_gb} GB — copy still running or truncated"
 fi
 
-# The HTTP server needs ThreadingHTTPServer (Python >= 3.7).  Distros whose
-# default python3 is older (SLES 15's 3.6) fail 100 ms into ExecStart with an
-# ImportError that never reaches the journal on a locked-down user session —
-# set COLI_PYTHON to a newer interpreter and check it here.
-PY=${COLI_PYTHON:-python3}
-if ! "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,7) else 1)' 2>/dev/null; then
-    have=$("$PY" -V 2>&1)
-    fail "$PY is $have; the server needs >= 3.7 (ThreadingHTTPServer). Set COLI_PYTHON to a newer interpreter."
-fi
-
 if [ "${COLI_PREFLIGHT_UVM_HMM:-0}" = "1" ]; then
     p=/sys/module/nvidia_uvm/parameters/uvm_disable_hmm
     [ -r "$p" ] || fail "nvidia_uvm is not loaded (CUDA would fail with error 3)"

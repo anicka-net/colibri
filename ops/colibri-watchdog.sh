@@ -31,11 +31,7 @@ gpu_util=$(timeout 10 nvidia-smi --query-gpu=utilization.gpu --format=csv,nohead
 [ "$gpu_util" -le 1 ] || exit 0
 
 health=$(curl -fsS --max-time 5 "$url/health" 2>/dev/null) || exit 0
-printf '%s' "$health" | python3 -c '
-import json, sys
-s = json.load(sys.stdin).get("scheduler", {})
-raise SystemExit(0 if s.get("active") == 0 and s.get("queued") == 0 else 1)
-' || exit 0
+printf '%s' "$health" | grep -q '"scheduler":{"active":0,"queued":0' || exit 0
 
 payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply OK"}],"max_tokens":1,"think":false}' "$model")
 auth=()
@@ -58,15 +54,9 @@ gpu_util=$(timeout 10 nvidia-smi --query-gpu=utilization.gpu --format=csv,nohead
 [ "$gpu_util" -le 1 ] || exit 0
 
 health=$(curl -fsS --max-time 5 "$url/health" 2>/dev/null) || exit 0
-printf '%s' "$health" | python3 -c '
-import json, sys
-health = json.load(sys.stdin)
-s = health.get("scheduler", {})
-idle = s.get("active") == 0 and s.get("queued") == 0
-own_wedge = (s.get("active") == 1 and s.get("queued") == 0
-             and health.get("watchdog_active") == 1)
-raise SystemExit(0 if idle or own_wedge else 1)
-' || exit 0
+if ! printf '%s' "$health" | grep -q '"scheduler":{"active":0,"queued":0'; then
+    printf '%s' "$health" | grep -q '"scheduler":{"active":1,"queued":0.*"watchdog_active":1' || exit 0
+fi
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 log="$state_dir/wedge-diag-$stamp.log"

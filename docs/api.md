@@ -3,12 +3,12 @@
 ## `coli serve`
 
 `coli serve` keeps one model process loaded and exposes a text-only
-OpenAI-compatible HTTP API. The gateway uses only the Python standard library;
-inference still runs in the same dependency-free C engine.
+OpenAI-compatible HTTP API. The gateway, scheduler, and engine protocol client
+are native C and add no runtime dependencies beyond libc and pthreads.
 
 ```bash
 cd c
-COLI_MODEL=/nvme/glm52_i4 COLI_API_KEY=local-secret ./coli serve \
+COLI_MODEL=/nvme/glm52_i4 COLI_API_KEY=local-secret ./coli-native serve \
   --host 127.0.0.1 --port 8000 --model-id glm-5.2-colibri
 
 curl http://127.0.0.1:8000/v1/chat/completions \

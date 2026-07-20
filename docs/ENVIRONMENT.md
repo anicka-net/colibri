@@ -147,9 +147,10 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 
 ---
 
-## Server / CLI (`openai_server.py`, `coli`)
+## Native server / CLI (`native_server.c`, `coli_native.c`)
 
-These are read by the Python programs (not the `glm` engine), so they don't appear in `glm.c`. They cover the OpenAI-compatible server, tool calling, and the debug view.
+These are read by the native CLI/server (not the `glm` engine), so they don't
+appear in `glm.c`. Development-only Python tools do not participate at runtime.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -170,7 +171,7 @@ These are read by the Python programs (not the `glm` engine), so they don't appe
 
 ## Set by the CLI (don't usually set by hand)
 
-`coli` / `openai_server.py` set these internally to select a run mode or pass through a flag:
+The native `coli` CLI sets these internally to select a run mode or pass through a flag:
 
 - `SNAP` — model snapshot directory (required by `glm`; set from `--model`).
 - `SERVE`, `SERVE_BATCH` — select serve / batched-serve mode.

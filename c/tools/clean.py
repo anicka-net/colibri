@@ -13,6 +13,8 @@ FILES = [
     "olmoe", "olmoe.exe",
     "glm", "glm.exe",
     "iobench", "iobench.exe",
+    "coli-native", "coli-native.exe",
+    "tests/fake_mux_engine", "tests/fake_mux_engine.exe",
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
@@ -21,7 +23,7 @@ FILES = [
 ]
 # Test binaries match this pattern. Only remove executables (.exe on Windows,
 # no extension on Unix) — never .c or .py source files.
-TEST_GLOBS = ["tests/test_*.exe"]
+TEST_GLOBS = ["tests/test_*.exe", "tests/test_*"]
 # Directories to remove.
 DIRS = ["tests/__pycache__"]
 
@@ -32,8 +34,11 @@ for f in FILES:
         removed += 1
 for pattern in TEST_GLOBS:
     for f in glob.glob(pattern):
-        os.remove(f)
-        removed += 1
+        # On POSIX test executables have no suffix.  Keep sources, fixtures,
+        # and Python tests even if a checkout happens to mark them executable.
+        if f.endswith(".exe") or (os.path.isfile(f) and "." not in os.path.basename(f)):
+            os.remove(f)
+            removed += 1
 for d in DIRS:
     if os.path.isdir(d):
         shutil.rmtree(d)
