@@ -1356,6 +1356,21 @@ __global__ static void rmsnorm_kernel(float *out,
     for (int i = tid; i < size; i += blockDim.x)
         out[i] = weight[i] * (x[i] * rms);
 }
+/* Tensor-core attention tail: residual add and following RMSNorm in one
+ * launch.  Static reduction storage avoids another dynamic-smem launch in
+ * the decode chain. */
+__global__ static void add_rmsnorm_rows(float *x,float *out,const float *add,
+        const float *weight,int S,int D,float eps){
+    int s=blockIdx.x,tid=threadIdx.x;if(s>=S)return;
+    float *xr=x+(size_t)s*D,*yr=out+(size_t)s*D;
+    const float *ar=add+(size_t)s*D;
+    __shared__ float red[256];float ss=0.f;
+    for(int i=tid;i<D;i+=blockDim.x){float v=xr[i]+ar[i];xr[i]=v;ss+=v*v;}
+    red[tid]=ss;__syncthreads();
+    for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
+    float r=rsqrtf(red[0]/(float)D+eps);
+    for(int i=tid;i<D;i+=blockDim.x)yr[i]=weight[i]*xr[i]*r;
+}
 __global__ static void memcpy_f32_kernel(float *__restrict__ dst,
                                           const float *__restrict__ src, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1681,6 +1696,8 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
 static int dsa_decode_tcgather(int device,float *ctx,const float *q,
         const float *latent,const float *rope,const int *sel,int S,int topk,
         const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,int T,float scale);
+__global__ static void w4a16_nt_ld(float *y,const float *x,const uint8_t *w,
+        const float *scale,int M,int K,int N,int ldy);
 /* COLI_DBG_DSACHAIN=1: tempi cumulativi del punto di sync a metà catena
  * (drenaggio pipeline + download punteggi) e del top-k host.  Esposti con una
  * funzione, non con dati extern: il loader Windows risolve solo simboli-funzione. */
@@ -1897,7 +1914,9 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
      * blocks walking the same top-k list.  Output projection stays on the
      * exact decode GEMV below. */
     static int decode_tcg=-1;
-    if(decode_tcg<0){const char *e=getenv("COLI_DSA_DECODE_TCGATHER");decode_tcg=e?(atoi(e)!=0):1;}
+    /* Opt-in until the post-TC normalization tail is accepted reliably by
+     * the persistent Tekton chain (the standalone/prefill TC path is fine). */
+    if(decode_tcg<0){const char *e=getenv("COLI_DSA_DECODE_TCGATHER");decode_tcg=e?(atoi(e)!=0):0;}
     float *tc_ctx=NULL; int tc_ok=0;
     int tc_uniform=selm;
     for(int s=0;tc_uniform&&s<S;s++)
@@ -1908,6 +1927,17 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
             dsa->topk,kvb,H,qk_nope,qk_rope,vh,kv_lora,pos_base+S,attn_scale);
         if(tc_ok)coli_dsac_tcg_rows+=(uint64_t)S;
         else coli_dsac_tcg_fb+=(uint64_t)S;
+    }
+    if(tc_ok){
+        dim3 go((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+        w4a16_nt_ld<<<go,128>>>(aout,tc_ctx,(const uint8_t*)o_proj->weights,
+            o_proj->scales,S,H*vh,D,D);
+        if(!cuda_ok(cudaGetLastError(),"chain tc o_proj"))return 0;
+        const char *sd=getenv("COLI_DSA_TC_SYNC_DEBUG");
+        if(sd&&atoi(sd)){
+            if(!cuda_ok(cudaDeviceSynchronize(),"chain tc o_proj sync"))return 0;
+            (void)cudaGetLastError(); /* synchronize reports execution errors; discard stale API status */
+        }
     }
     /* loop 2: absorb + o_proj per row (over the selection when active) */
     for(int s=0;s<S;s++){
@@ -1933,13 +1963,25 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
             absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
                 (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
                 d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
-        gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cxrow,
-            (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
+        if(!tc_ok){
+            gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cxrow,
+                (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
+            if(!cuda_ok(cudaGetLastError(),"chain selected o_proj"))return 0;
+        }
     }
     if(dbg2) cudaEventRecord(ctx->dbg_ev[2],0);
-    add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
-    for(int s=0;s<S;s++)
-        rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
+    /* Scratch growth and the TC helpers consult the per-device allocator;
+     * reassert the chain's home context before launching its resident tail. */
+    if(!select_ctx(ctx))return 0;
+    (void)cudaGetLastError();
+    if(tc_ok)add_rmsnorm_rows<<<S,256>>>(x_dev,nrm_dev,aout,w_post,S,D,eps);
+    else{
+        add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
+        if(!cuda_ok(cudaGetLastError(),"chain selected add"))return 0;
+        for(int s=0;s<S;s++)
+            rmsnorm_kernel<<<1,256,256*sizeof(float)>>>(nrm_dev+(size_t)s*D,x_dev+(size_t)s*D,w_post,D,eps);
+    }
+    if(!cuda_ok(cudaGetLastError(),"chain selected residual"))return 0;
     /* Optional fused shared expert: launched before the chain sync so it runs
      * during the downloads and the host-side gap, instead of after them. */
     if(shg&&shu&&shd&&sI>0&&shg->fmt==2&&shu->fmt==2&&shd->fmt==2){
@@ -1960,26 +2002,30 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
             add_vec_kernel<<<((unsigned)(S*D)+255)/256,256>>>(x_dev,x_dev,aout,S*D);
         }
     }
+    if(!cuda_ok(cudaGetLastError(),"chain selected shared"))return 0;
     float *sc=NULL;
     if(d_router&&scores_host&&E>0){
         sc=coli_cuda_pipe_scratch(device,28,(size_t)S*E*4);
         if(sc) for(int s=0;s<S;s++)
             gemv_f32_kernel<<<(unsigned)E,256>>>(sc+(size_t)s*E,nrm_dev+(size_t)s*D,d_router,D,E);
     }
+    if(!cuda_ok(cudaGetLastError(),"chain selected router"))return 0;
     if(dbg2) cudaEventRecord(ctx->dbg_ev[3],0);
     /* single sync point: the canonical-host downloads */
-    if(xn_host&&cudaMemcpy(xn_host,xn,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
-    if(cudaMemcpy(nrm_host,nrm_dev,(size_t)S*D*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+    if(xn_host&&!cuda_ok(cudaMemcpy(xn_host,xn,(size_t)S*D*4,cudaMemcpyDeviceToHost),
+                         "chain xn download")) return 0;
+    if(!cuda_ok(cudaMemcpy(nrm_host,nrm_dev,(size_t)S*D*4,cudaMemcpyDeviceToHost),
+                "chain norm download")) return 0;
     if(sc&&cudaMemcpy(scores_host,sc,(size_t)S*E*4,cudaMemcpyDeviceToHost)!=cudaSuccess) sc=NULL;
     if(d_router&&scores_host&&E>0&&!sc) scores_host[0]=NAN;   /* signal: no scores, caller recomputes */
     /* con f16 l'host scarica lo STAGING fp32 (esatto), non l'ombra lossy */
-    if(cudaMemcpy(kv_host_L,f16?lrow:d_Lc+(size_t)pos_base*kv_lora,
-                  (size_t)S*kv_lora*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
-    if(cudaMemcpy(kv_host_R,f16?rrow:d_Rc+(size_t)pos_base*qk_rope,
-                  (size_t)S*qk_rope*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+    if(!cuda_ok(cudaMemcpy(kv_host_L,f16?lrow:d_Lc+(size_t)pos_base*kv_lora,
+                  (size_t)S*kv_lora*4,cudaMemcpyDeviceToHost),"chain L download")) return 0;
+    if(!cuda_ok(cudaMemcpy(kv_host_R,f16?rrow:d_Rc+(size_t)pos_base*qk_rope,
+                  (size_t)S*qk_rope*4,cudaMemcpyDeviceToHost),"chain R download")) return 0;
     if((dsa_full||dsa_reuse)&&dsa->ic_host&&
-       cudaMemcpy(dsa->ic_host,f16?irow:dsa->d_Ic+(size_t)pos_base*dsa->hd,
-                  (size_t)S*dsa->hd*4,cudaMemcpyDeviceToHost)!=cudaSuccess) return 0;
+       !cuda_ok(cudaMemcpy(dsa->ic_host,f16?irow:dsa->d_Ic+(size_t)pos_base*dsa->hd,
+                  (size_t)S*dsa->hd*4,cudaMemcpyDeviceToHost),"chain Ic download")) return 0;
     { cudaError_t ce=cudaGetLastError();
       if(ce!=cudaSuccess){ fprintf(stderr,"[CUDA] attn_chain: %s\n",cudaGetErrorString(ce));
                            return 0; }
@@ -2547,6 +2593,8 @@ static int dsa_decode_tcgather(int device,float *ctx,const float *q,
     float *scb  =coli_cuda_pipe_scratch(device,35,(size_t)S*H*topk*4);
     float *ctxL =coli_cuda_pipe_scratch(device,36,(size_t)S*H*K*4);
     if(!LcSel||!RcSel||!qabs||!scb||!ctxL)return 0;
+    const char *sd=getenv("COLI_DSA_TC_SYNC_DEBUG"); int syncdbg=sd&&atoi(sd);
+#define TC_SYNC(label) do{if(syncdbg&&!cuda_ok(cudaDeviceSynchronize(),label))return 0;}while(0)
     cudaStream_t st=0; const uint8_t *wb=(const uint8_t*)kvb->weights;
     const float *wsc=kvb->scales; size_t rb=row_bytes(2,K);
     if(f16)dsa_gather_sel<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
@@ -2554,8 +2602,12 @@ static int dsa_decode_tcgather(int device,float *ctx,const float *q,
         sel,topk,K,R,T);
     else dsa_gather_sel<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
         LcSel,RcSel,latent,rope,sel,topk,K,R,T);
+    if(!cuda_ok(cudaGetLastError(),"decode tc gather"))return 0;
+    TC_SYNC("decode tc gather sync");
     w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
         qabs,q,wb,wsc,S,K,Q,H*(Q+R),rb,H*K,Q+R,Q+V,0,K);
+    if(!cuda_ok(cudaGetLastError(),"decode tc qabs"))return 0;
+    TC_SYNC("decode tc qabs sync");
     dim3 gs((unsigned)((topk+63)/64),(unsigned)((H+15)/16),(unsigned)S);
     if(f16){
         gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,qabs,(const __half*)LcSel,
@@ -2568,15 +2620,24 @@ static int dsa_decode_tcgather(int device,float *ctx,const float *q,
         gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,q+Q,RcSel,
             H,topk,R,Q+R,R,topk,1,1,(size_t)H*(Q+R),(size_t)topk*R,(size_t)H*topk);
     }
+    if(!cuda_ok(cudaGetLastError(),"decode tc score"))return 0;
+    TC_SYNC("decode tc score sync");
     softmax_rows_flat<<<S*H,256,0,st>>>(scb,topk,scale);
+    if(!cuda_ok(cudaGetLastError(),"decode tc softmax"))return 0;
+    TC_SYNC("decode tc softmax sync");
     dim3 gc((unsigned)((K+63)/64),(unsigned)((H+15)/16),(unsigned)S);
     if(f16)gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,(const __half*)LcSel,
         H,K,topk,topk,K,K,0,0,(size_t)H*topk,(size_t)topk*K,(size_t)H*K);
     else gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,LcSel,
         H,K,topk,topk,K,K,0,0,(size_t)H*topk,(size_t)topk*K,(size_t)H*K);
+    if(!cuda_ok(cudaGetLastError(),"decode tc context"))return 0;
+    TC_SYNC("decode tc context sync");
     w4a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
         ctx,ctxL,wb,wsc,S,K,V,H*K,H*V,K,Q+V,Q,V);
-    return cuda_ok(cudaGetLastError(),"decode dsa tc gather");
+    if(!cuda_ok(cudaGetLastError(),"decode tc value"))return 0;
+    TC_SYNC("decode tc value sync");
+#undef TC_SYNC
+    return 1;
 }
 /* DSA prefill: k_idx per S righe nuove nell'ombra Ic device + punteggi della
  * selezione per le righe di fase B (pos+1 > topk), scaricati sull'host per il
