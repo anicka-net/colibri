@@ -104,7 +104,15 @@ percentages are not comparable across engine versions under `--topp`
 ## Conversations reopen warm
 
 `coli chat` persists the compressed MLA KV-cache to disk after every turn
-(`.coli_kv`, ~182 KB/token, appended incrementally, crash-safe). Close the chat,
+(`.coli_kv`, ~190 KiB/token with the current DSA indexer, appended incrementally,
+crash-safe). Close the chat,
 reopen it tomorrow — the model still remembers the whole conversation and **zero
 re-prefill happens**: validated byte-identical to an uninterrupted session.
 `:reset` clears it, `KVSAVE=0` disables it.
+
+For many stateless clients, keep one RAM context and enable the bounded prefix
+library with `COLI_KV_CACHE_GB` and `COLI_KV_CACHE_DIR`. It restores the longest
+exact token prefix across all saved conversations, then copy-on-write
+checkpoints the result and evicts least-recent checkpoints under the disk
+budget. Use persistent local storage; the cache contains conversation token ids
+and activations.

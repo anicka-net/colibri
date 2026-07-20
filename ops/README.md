@@ -39,6 +39,10 @@ Edit `service.env` first. `COLI_CONTEXT` is both the allocated engine context
 and the value advertised to clients. KV memory grows with context and slots, so
 increase `COLI_KV_SLOTS` only after measuring available memory.
 
+For many users without multiplying RAM, leave `COLI_KV_SLOTS=1` and set
+`COLI_KV_CACHE_GB` plus `COLI_KV_CACHE_DIR`. The latter must be private,
+persistent local storage rather than a tmpfs snapshot.
+
 The watchdog waits through startup, requires an idle GPU, and then sends a
 one-token non-thinking inference request. It restarts only when that request
 times out while the GPU remains idle. Before restart it records service state,

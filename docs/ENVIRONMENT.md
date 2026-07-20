@@ -26,6 +26,8 @@ Format: `VAR` — default — effect.
 | `SEED` | unset → seeded from clock + PID | RNG seed for sampling. **Unset = different every run.** Set a fixed value for reproducible sampling. |
 | `KVSAVE` | `1` (on) | Persist the KV cache to `<model>/.coli_kv` so a conversation reopens warm. `KVSAVE=0` disables save+load (lossless round-trip; does not change output). |
 | `KV_SLOTS` | `1` | Number of independent KV conversation slots (1–16), used in serve mode. |
+| `COLI_KV_CACHE_GB` | `0` (off) | Mux-service disk library for many conversations with one RAM KV context. Exact longest-token-prefix lookup, copy-on-write checkpoints, and LRU eviction under this steady-state GB budget. Requires `KVSAVE=1` and `KV_SLOTS=1`. |
+| `COLI_KV_CACHE_DIR` | `<model>/.coli_kv_cache` | Storage directory used when `COLI_KV_CACHE_GB>0`. Put it on persistent local disk, not tmpfs. Files contain token ids and model activations; keep the directory private and use one directory per engine process. |
 | `THINK` | `0` (off) | Emit a `<think>` reasoning block. `THINK=1` turns on visible reasoning. |
 | `MTP` | on | Multi-Token Prediction (speculative draft head). `MTP=0` disables it. |
 
