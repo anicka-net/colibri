@@ -363,6 +363,7 @@ typedef struct {
     double edisk,ewait,emm,ecpu,egpu,route,p2p,attn,head;
     double aproj,acore,aout;                    /* outer attention phase timers */
     double dsync,dtopk,dphase[3];               /* fused DSA-chain CUDA timers */
+    uint64_t d_tcg_rows,d_tcg_fb;
     int64_t io,cpu_bytes; uint64_t hits,miss,ereq,n_fw,n_emit,nlat,n_p2p,cpu_rows;
     uint64_t hit_pin,hit_ecache;
     long dsc_full,dsc_shared,dsc_reuse,dsc_fb_pre,dsc_fb_chain;
@@ -2683,6 +2684,7 @@ static int g_dsc_on=-1;
 static void prof_cuda_base(ProfBase *b){
     coli_cuda_dsac_times(&b->dsync,&b->dtopk);
     coli_cuda_dsac_phase_times(b->dphase);
+    coli_cuda_dsac_tcg_stats(&b->d_tcg_rows,&b->d_tcg_fb);
     b->dsc_full=g_dsc_full;b->dsc_shared=g_dsc_shared;b->dsc_reuse=g_dsc_reuse;
     b->dsc_fb_pre=g_dsc_fb_pre;b->dsc_fb_chain=g_dsc_fb_chain;
     b->dsc_pfull=g_dsc_pfull;b->dsc_pshared=g_dsc_pshared;b->dsc_pfb=g_dsc_pfb;
@@ -5746,7 +5748,8 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         100*f_io,100*f_emm,100*f_attn,100*head/elapsed,100*other/elapsed);
 #ifdef COLI_CUDA
     { double ap=m->t_aproj-b->aproj,ac=m->t_acore-b->acore,ao=m->t_aout-b->aout;
-      double ds=0,dt=0,dp[3]={0};coli_cuda_dsac_times(&ds,&dt);coli_cuda_dsac_phase_times(dp);
+      double ds=0,dt=0,dp[3]={0};
+      coli_cuda_dsac_times(&ds,&dt);coli_cuda_dsac_phase_times(dp);
       long df=g_dsc_full-b->dsc_full,dsh=g_dsc_shared-b->dsc_shared,
            dr=g_dsc_reuse-b->dsc_reuse,dfp=g_dsc_fb_pre-b->dsc_fb_pre,
            dfc=g_dsc_fb_chain-b->dsc_fb_chain,pf=g_dsc_pfull-b->dsc_pfull,
@@ -5757,6 +5760,9 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
       fprintf(f,"[PROF] DSA chain: proj+KV+score %.3fs | sync+score-download %.3fs | host top-k %.3fs | selected absorb+o_proj %.3fs | tail %.3fs%s\n",
           dp[0]-b->dphase[0],ds-b->dsync,dt-b->dtopk,dp[1]-b->dphase[1],dp[2]-b->dphase[2],
           nfw?" (request deltas)":""); }
+    { uint64_t tr=0,tf=0;coli_cuda_dsac_tcg_stats(&tr,&tf);
+      fprintf(f,"[PROF] DSA decode TC gather: %llu row | %llu fallback\n",
+          (unsigned long long)(tr-b->d_tcg_rows),(unsigned long long)(tf-b->d_tcg_fb)); }
     { long dok=g_pipe_dense_ok-b->pipe_dense_ok,dfb=g_pipe_dense_fb-b->pipe_dense_fb;
       fprintf(f,"[PROF] resident dense layers: %ld engaged | %ld fallback\n",dok,dfb); }
 #endif

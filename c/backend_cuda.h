@@ -158,6 +158,8 @@ COLI_CUDA_DLLEXPORT void coli_cuda_dsac_times(double *sync_s, double *topk_s);
 /* COLI_DBG_DSACHAIN=2: cumulative GPU time of the chain's three phases
  * (loop1 projections+KV writes+scoring, loop2 absorb+o_proj, tail). */
 COLI_CUDA_DLLEXPORT void coli_cuda_dsac_phase_times(double out[3]);
+/* Decode selected-attention tensor-core gather engagement. */
+COLI_CUDA_DLLEXPORT void coli_cuda_dsac_tcg_stats(uint64_t *rows, uint64_t *fallbacks);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain_v2(int device,
         float *x_dev, float *nrm_dev, float *nrm_host,
         float *kv_host_L, float *kv_host_R,

@@ -1678,6 +1678,9 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
         const KT *latent,const KT *rope,const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale);
+static int dsa_decode_tcgather(int device,float *ctx,const float *q,
+        const float *latent,const float *rope,const int *sel,int S,int topk,
+        const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,int T,float scale);
 /* COLI_DBG_DSACHAIN=1: tempi cumulativi del punto di sync a metà catena
  * (drenaggio pipeline + download punteggi) e del top-k host.  Esposti con una
  * funzione, non con dati extern: il loader Windows risolve solo simboli-funzione. */
@@ -1691,6 +1694,7 @@ extern "C" void coli_cuda_dsac_times(double *sync_s, double *topk_s){
  * shared/router/norme) via coppie di cudaEvent sul timeline del device —
  * attribuisce i 256 ms/token di attention decode a lungo contesto. */
 static double coli_dsac_ph[3]={0,0,0};
+static uint64_t coli_dsac_tcg_rows=0,coli_dsac_tcg_fb=0;
 static int dsac_level(void){
     static int v=-1;
     if(v<0){ const char *e=getenv("COLI_DBG_DSACHAIN"); v=e?atoi(e):0; }
@@ -1698,6 +1702,10 @@ static int dsac_level(void){
 }
 extern "C" void coli_cuda_dsac_phase_times(double out[3]){
     for(int i=0;i<3;i++) out[i]=coli_dsac_ph[i];
+}
+extern "C" void coli_cuda_dsac_tcg_stats(uint64_t *rows,uint64_t *fallbacks){
+    if(rows)*rows=coli_dsac_tcg_rows;
+    if(fallbacks)*fallbacks=coli_dsac_tcg_fb;
 }
 static double dsac_now(void){
     return std::chrono::duration<double>(
@@ -1884,30 +1892,48 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         if(!cuda_ok(cudaMemcpyAsync(dsel_d,dsa->sel,(size_t)S*dsa->topk*sizeof(int),
             cudaMemcpyHostToDevice,0),"chain sel ul")) return 0;
     }
+    /* Decode TC gather: gather each selected KV row once, then treat the 64
+     * heads as the GEMM M dimension.  This replaces 64 independent scalar
+     * blocks walking the same top-k list.  Output projection stays on the
+     * exact decode GEMV below. */
+    static int decode_tcg=-1;
+    if(decode_tcg<0){const char *e=getenv("COLI_DSA_DECODE_TCGATHER");decode_tcg=e?(atoi(e)!=0):1;}
+    float *tc_ctx=NULL; int tc_ok=0;
+    int tc_uniform=selm;
+    for(int s=0;tc_uniform&&s<S;s++)
+        if(dsa->nsel[s]!=dsa->topk)tc_uniform=0;
+    if(tc_uniform&&decode_tcg){
+        tc_ctx=coli_cuda_pipe_scratch(device,41,(size_t)S*H*vh*4);
+        if(tc_ctx)tc_ok=dsa_decode_tcgather(device,tc_ctx,qQ,d_Lc,d_Rc,dsel_d,S,
+            dsa->topk,kvb,H,qk_nope,qk_rope,vh,kv_lora,pos_base+S,attn_scale);
+        if(tc_ok)coli_dsac_tcg_rows+=(uint64_t)S;
+        else coli_dsac_tcg_fb+=(uint64_t)S;
+    }
     /* loop 2: absorb + o_proj per row (over the selection when active) */
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         float *qQs=qQ+(size_t)s*H*qh;
-        if(selm){
+        float *cxrow=tc_ok?tc_ctx+(size_t)s*H*vh:cx;
+        if(selm&&!tc_ok){
             int ns=dsa->nsel[s];
             size_t smem_sel=(size_t)(2*kv_lora+ns+256)*sizeof(float);
-            if(f16) attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cx,qQs,
+            if(f16) attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cxrow,qQs,
                 hLc,hRc,dsel_d+(size_t)s*dsa->topk,ns,
                 kvb->weights,kvb->scales,kvb->fmt,
                 H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
-            else attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cx,qQs,
+            else attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cxrow,qQs,
                 d_Lc,d_Rc,dsel_d+(size_t)s*dsa->topk,ns,
                 kvb->weights,kvb->scales,kvb->fmt,
                 H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
         }else if(f16)
-            absorption_kernel<<<H,256,abs_smem>>>(cx,qQs,
+            absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
                 (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
                 hLc,hRc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
         else
-            absorption_kernel<<<H,256,abs_smem>>>(cx,qQs,
+            absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
                 (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
                 d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
-        gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cx,
+        gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cxrow,
             (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
     }
     if(dbg2) cudaEventRecord(ctx->dbg_ev[2],0);
@@ -2503,6 +2529,54 @@ __global__ static void softmax_rows_flat(float *rows,int width,float scale){
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];
     for(int t=tid;t<width;t+=blockDim.x)row[t]*=inv;
+}
+/* Resident decode counterpart of the prefill DSA phase-B tensor-core path.
+ * All launches use the legacy stream because the fused chain's projections,
+ * KV writes, selection upload and consumers are ordered there. */
+static int dsa_decode_tcgather(int device,float *ctx,const float *q,
+        const float *latent,const float *rope,const int *sel,int S,int topk,
+        const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,int T,float scale){
+    DeviceContext *dc=find_ctx(device);
+    if(!dc||!ctx||!q||!latent||!rope||!sel||!kvb||!select_ctx(dc)||
+       dc->compute_major<7||S<1||S>4||topk<1||topk>T||kvb->fmt!=2||
+       kvb->I!=K||kvb->O!=H*(Q+V)||(Q&15)||(R&15)||(V&15)||(K&15))return 0;
+    int f16=kv_f16_mode(); size_t esz=f16?sizeof(__half):sizeof(float);
+    float *LcSel=coli_cuda_pipe_scratch(device,32,(size_t)S*topk*K*esz);
+    float *RcSel=coli_cuda_pipe_scratch(device,33,(size_t)S*topk*R*esz);
+    float *qabs =coli_cuda_pipe_scratch(device,34,(size_t)S*H*K*4);
+    float *scb  =coli_cuda_pipe_scratch(device,35,(size_t)S*H*topk*4);
+    float *ctxL =coli_cuda_pipe_scratch(device,36,(size_t)S*H*K*4);
+    if(!LcSel||!RcSel||!qabs||!scb||!ctxL)return 0;
+    cudaStream_t st=0; const uint8_t *wb=(const uint8_t*)kvb->weights;
+    const float *wsc=kvb->scales; size_t rb=row_bytes(2,K);
+    if(f16)dsa_gather_sel<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
+        (__half*)LcSel,(__half*)RcSel,(const __half*)latent,(const __half*)rope,
+        sel,topk,K,R,T);
+    else dsa_gather_sel<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
+        LcSel,RcSel,latent,rope,sel,topk,K,R,T);
+    w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
+        qabs,q,wb,wsc,S,K,Q,H*(Q+R),rb,H*K,Q+R,Q+V,0,K);
+    dim3 gs((unsigned)((topk+63)/64),(unsigned)((H+15)/16),(unsigned)S);
+    if(f16){
+        gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,qabs,(const __half*)LcSel,
+            H,topk,K,K,K,topk,1,0,(size_t)H*K,(size_t)topk*K,(size_t)H*topk);
+        gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,q+Q,(const __half*)RcSel,
+            H,topk,R,Q+R,R,topk,1,1,(size_t)H*(Q+R),(size_t)topk*R,(size_t)H*topk);
+    }else{
+        gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,qabs,LcSel,
+            H,topk,K,K,K,topk,1,0,(size_t)H*K,(size_t)topk*K,(size_t)H*topk);
+        gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,q+Q,RcSel,
+            H,topk,R,Q+R,R,topk,1,1,(size_t)H*(Q+R),(size_t)topk*R,(size_t)H*topk);
+    }
+    softmax_rows_flat<<<S*H,256,0,st>>>(scb,topk,scale);
+    dim3 gc((unsigned)((K+63)/64),(unsigned)((H+15)/16),(unsigned)S);
+    if(f16)gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,(const __half*)LcSel,
+        H,K,topk,topk,K,K,0,0,(size_t)H*topk,(size_t)topk*K,(size_t)H*K);
+    else gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,LcSel,
+        H,K,topk,topk,K,K,0,0,(size_t)H*topk,(size_t)topk*K,(size_t)H*K);
+    w4a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
+        ctx,ctxL,wb,wsc,S,K,V,H*K,H*V,K,Q+V,Q,V);
+    return cuda_ok(cudaGetLastError(),"decode dsa tc gather");
 }
 /* DSA prefill: k_idx per S righe nuove nell'ombra Ic device + punteggi della
  * selezione per le righe di fase B (pos+1 > topk), scaricati sull'host per il

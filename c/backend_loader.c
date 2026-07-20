@@ -76,6 +76,7 @@ typedef int (*fn_prefill_attn_gemm)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
 typedef int (*fn_prefill_dsa_select)(int device,ColiCudaDsaChain *dsa, const float *xn_dev,const float *qres_dev, int S,int pos_base,int sB0,int D,int q_lora,int qk_rope,float theta);
 typedef void (*fn_dsac_times)(double *sync_s, double *topk_s);
 typedef void (*fn_dsac_phase_times)(double out[3]);
+typedef void (*fn_dsac_tcg_stats)(uint64_t *rows,uint64_t *fallbacks);
 typedef int (*fn_kv_f16)(void);
 typedef int (*fn_pipe_upload_kv)(int device,void *dst,const float *src,size_t elems,size_t elem_off);
 typedef int (*fn_pipe_copy2d_kv)(int device,void *dst,int dpitch,const float *src,int spitch,int width,int height,size_t elem_off);
@@ -150,6 +151,7 @@ static struct {
     fn_prefill_dsa_select prefill_dsa_select;
     fn_dsac_times      dsac_times;
     fn_dsac_phase_times dsac_phase_times;
+    fn_dsac_tcg_stats  dsac_tcg_stats;
     fn_kv_f16          kv_f16;
     fn_pipe_upload_kv  pipe_upload_kv;
     fn_pipe_copy2d_kv  pipe_copy2d_kv;
@@ -256,6 +258,7 @@ static int coli_cuda_load(void){
     RESOLVE(prefill_dsa_select, fn_prefill_dsa_select)
     RESOLVE(dsac_times,     fn_dsac_times)
     RESOLVE(dsac_phase_times, fn_dsac_phase_times)
+    RESOLVE(dsac_tcg_stats, fn_dsac_tcg_stats)
     RESOLVE(kv_f16,         fn_kv_f16)
     RESOLVE(pipe_upload_kv, fn_pipe_upload_kv)
     RESOLVE(pipe_copy2d_kv, fn_pipe_copy2d_kv)
@@ -461,6 +464,11 @@ int coli_cuda_kv_f16(void){
 void coli_cuda_dsac_phase_times(double out[3]){
     if(!g_cuda.available){ out[0]=out[1]=out[2]=0; return; }
     g_cuda.dsac_phase_times(out);
+}
+
+void coli_cuda_dsac_tcg_stats(uint64_t *rows,uint64_t *fallbacks){
+    if(!g_cuda.available){if(rows)*rows=0;if(fallbacks)*fallbacks=0;return;}
+    g_cuda.dsac_tcg_stats(rows,fallbacks);
 }
 
 int coli_cuda_pipe_upload_kv(int device,void *dst,const float *src,size_t elems,size_t elem_off){
