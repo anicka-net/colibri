@@ -584,7 +584,7 @@ Four things from the 2026-07-19 serving/validation pass:
    (kills the O(T)-with-sync-drain per token), (b) split-T/multi-block absorb
    launch shape (helps both dense absorb and the 1.4 ms/layer sel-absorb).
 
-**Dense resident follow-up (implemented 2026-07-20; Tekton benchmark pending):**
+**Dense resident follow-up (implemented and measured 2026-07-20):**
 PIPE2 now admits the first dense layers instead of requiring `l->sparse`.
 Their attention uses the same resident DSA chain and their gate/up/down SwiGLU
 stays on the layer home GPU (exact GEMV for decode, existing W4A16 tiles for
@@ -592,10 +592,14 @@ append/prefill).  Dense MLP tensors are colocated with `kv_b`; snapshot/CPU
 fallback semantics are unchanged.  `PROF=1` reports dense engagements and
 fallbacks per turn.  Unified-memory Ic-shadow capacity accounting now includes
 eligible dense FULL layers.  CPU tests pass; the CUDA host build and targeted
-dense pipe composition passed on one Tekton H100.  Expected removal is the
-~256 ms/token dense-layer O(T) term measured at 26k, but this remains a
-projection until an end-to-end frozen-state turn confirms engagement, output,
-and latency.
+dense pipe composition passed on one Tekton H100.  Deployed commit `fa53dc3`
+on Tekton and benchmarked against an exact cached 26,497-token prefix (no
+prefill), 64 greedy output tokens: **p50 485.5 -> 221.5 ms/forward**, or about
+**2.19x / 2.06 -> 4.60 tok/s** versus the preceding 26k Claude turn.  All
+192 expected dense-layer calls engaged (3 layers x 64 forwards), zero dense or
+DSA fallbacks; the old outer projection/RoPE bucket fell from 171.4 s/668 tok
+to exactly 0.  The remaining attention cost is resident DSA, especially
+selected absorb+o_proj (7.08 s/64 tok, ~111 ms/token).
 
 #### Increment 8 — device-side top-k for prefill selection (landed, default ON)
 `COLI_DSA_DEVTOPK=1` (default; `=0` restores the host top-k) moves the
