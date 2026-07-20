@@ -373,7 +373,7 @@ OK
 
 ### 3. Native test dependency and platform wiring
 
-**CHANGED-UNVERIFIED** - POSIX test discovery now builds `coli-native` and
+**FIXED** - POSIX test discovery now builds `coli-native` and
 the fake engine before either test class runs. Windows skips this POSIX-only
 module, and the generic test target no longer runs the native suite twice.
 Linux standalone discovery and the complete check pass:
@@ -394,16 +394,20 @@ Ran 110 tests in 6.035s
 OK
 ```
 
-The Windows skip path still needs the hosted Windows CI runner, so this item
-remains CHANGED-UNVERIFIED until that job passes.
+Hosted platform evidence:
+
+```text
+linux	pass	1m0s	https://github.com/anicka-net/colibri/actions/runs/29734505663/job/88326520334
+macos	pass	1m34s	https://github.com/anicka-net/colibri/actions/runs/29734505663/job/88326520348
+windows	pass	2m13s	https://github.com/anicka-net/colibri/actions/runs/29734505663/job/88326520394
+Python tests	pass	10s	https://github.com/anicka-net/colibri/actions/runs/29734505694/job/88326520482
+```
 
 ### Self-check
 
-1. Only the Windows native-test skip path remains unverified locally because
-   this host is Linux; hosted CI is the required evidence.
+1. No review item remains unverified; the Windows skip path ran in hosted CI.
 2. Every claim above corresponds to the current diff or a pasted command
    output.
 3. The review smoke paths were engine-pipe closure, repeated submission after
    engine death, sanitizer execution, standalone Python discovery, full
-   checks, and Windows test discovery. Outputs for every local path are above;
-   Windows is explicitly CHANGED-UNVERIFIED.
+   checks, and Windows test discovery. Local and hosted outputs are above.
