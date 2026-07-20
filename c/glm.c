@@ -6569,6 +6569,10 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
      * in a wall-time breakdown. With KV_SLOTS>1 concurrent slots share the
      * batched forwards, so the shares describe the whole engine over the
      * window, not the single request (same convention as the STAT hit% below). */
+    kv_bind(m,&sc->kv);
+    if(g_kv_cache.enabled) kv_cache_checkpoint(m,sc);
+    else kv_disk_append(m,sc->hist,sc->len);
+    /* DONE is the client commit point: publish it only after the turn is durable. */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",dt,
            r->prompt_tokens,r->emitted,
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
@@ -6577,9 +6581,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
-    fflush(stdout); kv_bind(m,&sc->kv);
-    if(g_kv_cache.enabled) kv_cache_checkpoint(m,sc);
-    else kv_disk_append(m,sc->hist,sc->len);
+    fflush(stdout);
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
