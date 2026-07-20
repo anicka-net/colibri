@@ -147,6 +147,8 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 | `REPIN_VERBOSE` | off | If set, prints per-swap `[REPIN]` diagnostics during VRAM repin. |
 | `REF` / `REF_FORCE` | `ref_glm.json` | Reference-output comparison mode. |
 | `REPLAY` | unset | Replay mode. |
+| `FORCE_REF` | unset | In reference mode with `TEMP=0`, force the oracle continuation while still running normal draft proposal and verification. Benchmark-only control for identical-token speculation timing. |
+| `ORACLE_DRAFT` | `0` | With `FORCE_REF`, propose up to this many future oracle tokens at zero draft cost. Measures the verifier's perfect-draft ceiling; valid range 0–63. |
 | `TF` | unset | Teacher-forcing mode. |
 | `CHAT_TEMPLATE` | `1` | Apply the GLM chat template (`0` = raw prompt). |
 | `PPL` | off (`olmoe.c` only) | `PPL=1` enters teacher-forced NLL/perplexity meter mode in the OLMoE sister engine. |
