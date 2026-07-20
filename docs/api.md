@@ -58,6 +58,13 @@ generation usage is exact. Claude Code may disable MCP tool search for a custom
 `ANTHROPIC_BASE_URL`; its ordinary built-in tools and explicitly configured MCP
 servers continue to work.
 
+Anthropic tools marked `"defer_loading": true` are retained by the gateway but
+excluded from the initial GLM prompt, keeping large deferred schemas out of the
+prefill and its reusable KV prefix. A later `tool_reference` block expands the
+named definition at that point in the conversation. Colibri does not currently
+execute Anthropic's hosted regex/BM25 tool-search tools itself; clients using a
+custom base URL must provide tool references through a client-side search tool.
+
 ### Ollama-compatible API
 
 Ollama clients can use the same host directly. Implemented endpoints are

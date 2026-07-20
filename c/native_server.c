@@ -399,6 +399,8 @@ static int engine_start(engine *e, const coli_server_config *c) {
     setenv("NGEN", tmp, 1);
     snprintf(tmp, sizeof(tmp), "%d", c->kv_slots);
     setenv("KV_SLOTS", tmp, 1);
+    snprintf(tmp, sizeof(tmp), "%d", c->context_length);
+    setenv("CTX", tmp, 1);
     setenv("COLI_MODE", "serve", 1);
     char cap[20], eb[20], db[20];
     snprintf(cap, sizeof(cap), "%d", c->cap);
@@ -771,30 +773,52 @@ static jval *tool_function(jval *t) {
   jval *f = jget(t, "function");
   return f && f->t == J_OBJ ? f : t;
 }
+static void render_tool_definition(buf *out, jval *tool) {
+  jval *f = tool_function(tool);
+  jval *schema = jget(f, "input_schema");
+  if (schema) {
+    /* Anthropic calls this field input_schema; the model's native tool
+     * prompt and the OpenAI/Responses dialects call it parameters. */
+    b_add(out, "{\"name\":");
+    b_json(out, jstr(f, "name", ""));
+    const char *description = jstr(f, "description", NULL);
+    if (description) {
+      b_add(out, ",\"description\":");
+      b_json(out, description);
+    }
+    b_add(out, ",\"parameters\":");
+    b_jval(out, schema);
+    b_add(out, "}");
+  } else
+    b_jval(out, f);
+}
+static jval *find_tool(jval *tools, const char *name) {
+  if (!tools || tools->t != J_ARR || !name)
+    return NULL;
+  for (int i = 0; i < tools->len; i++)
+    if (!strcmp(jstr(tool_function(tools->kids[i]), "name", ""), name))
+      return tools->kids[i];
+  return NULL;
+}
 static void render_tools(buf *out, jval *tools) {
   if (!tools || tools->t != J_ARR || !tools->len)
+    return;
+  int included = 0;
+  for (int i = 0; i < tools->len; i++) {
+    jval *defer = jget(tools->kids[i], "defer_loading");
+    if (!defer || defer->t != J_BOOL || !defer->boolean)
+      included++;
+  }
+  if (!included)
     return;
   b_add(out, "<|system|>\n# Tools\n\nYou may call one or more functions to "
              "assist with the user query.\n\nYou are provided with function "
              "signatures within <tools></tools> XML tags:\n<tools>\n");
   for (int i = 0; i < tools->len; i++) {
-    jval *f = tool_function(tools->kids[i]);
-    jval *schema = jget(f, "input_schema");
-    if (schema) {
-      /* Anthropic calls this field input_schema; the model's native tool
-       * prompt and the OpenAI/Responses dialects call it parameters. */
-      b_add(out, "{\"name\":");
-      b_json(out, jstr(f, "name", ""));
-      const char *description = jstr(f, "description", NULL);
-      if (description) {
-        b_add(out, ",\"description\":");
-        b_json(out, description);
-      }
-      b_add(out, ",\"parameters\":");
-      b_jval(out, schema);
-      b_add(out, "}");
-    } else
-      b_jval(out, f);
+    jval *defer = jget(tools->kids[i], "defer_loading");
+    if (defer && defer->t == J_BOOL && defer->boolean)
+      continue;
+    render_tool_definition(out, tools->kids[i]);
     b_add(out, "\n");
   }
   b_add(out,
@@ -1214,7 +1238,27 @@ static int render_anthropic(buf *out, jval *body, int thinking) {
         } else if (!strcmp(t, "tool_result")) {
           b_add(out, "<|observation|>");
           jval *x = jget(p, "content");
-          if (render_content(out, x))
+          if (x && x->t == J_ARR) {
+            for (int q = 0; q < x->len; q++) {
+              jval *block = x->kids[q];
+              const char *block_type = jstr(block, "type", "");
+              if (!strcmp(block_type, "tool_reference")) {
+                jval *tool = find_tool(jget(body, "tools"),
+                                       jstr(block, "tool_name", NULL));
+                if (!tool)
+                  return -1;
+                b_add(out, "<tool_reference>");
+                render_tool_definition(out, tool);
+                b_add(out, "</tool_reference>");
+              } else if (!strcmp(block_type, "text")) {
+                jval *text = jget(block, "text");
+                if (!text || text->t != J_STR)
+                  return -1;
+                b_add(out, text->str);
+              } else
+                return -1;
+            }
+          } else if (render_content(out, x))
             return -1;
         } else if (!strcmp(t, "thinking") || !strcmp(t, "redacted_thinking") ||
                    !strcmp(t, "tool_use"))
@@ -1665,6 +1709,52 @@ static int protocol_options(server *s, jval *body, int anthropic, int *maximum,
              : 400;
 }
 
+typedef struct {
+  int fd, index, started, failed;
+} anthropic_stream;
+
+static int anthropic_event(int fd, const char *name, buf *payload) {
+  buf wire = {0};
+  b_add(&wire, "event: ");
+  b_add(&wire, name);
+  b_add(&wire, "\ndata: ");
+  b_addn(&wire, payload->p, payload->n);
+  b_add(&wire, "\n\n");
+  int rc = write_all(fd, wire.p, wire.n);
+  b_free(&wire);
+  return rc;
+}
+
+static int anthropic_text_data(const char *data, size_t n, void *opaque) {
+  anthropic_stream *stream = opaque;
+  if (stream->failed)
+    return 1;
+  if (!stream->started) {
+    buf start = {0};
+    b_printf(&start,
+             "{\"type\":\"content_block_start\",\"index\":%d,"
+             "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+             stream->index);
+    stream->failed = anthropic_event(stream->fd, "content_block_start", &start);
+    b_free(&start);
+    stream->started = 1;
+    if (stream->failed)
+      return 1;
+  }
+  char *copy = strndup(data, n);
+  buf delta = {0};
+  b_printf(&delta,
+           "{\"type\":\"content_block_delta\",\"index\":%d,"
+           "\"delta\":{\"type\":\"text_delta\",\"text\":",
+           stream->index);
+  b_json(&delta, copy);
+  b_add(&delta, "}}");
+  stream->failed = anthropic_event(stream->fd, "content_block_delta", &delta);
+  b_free(&delta);
+  free(copy);
+  return stream->failed;
+}
+
 static void anthropic(server *s, int fd, jval *body) {
   int max;
   double temp, top_p;
@@ -1684,17 +1774,56 @@ static void anthropic(server *s, int fd, jval *body) {
     api_error(fd, 400, "Anthropic messages require supported text content.");
     return;
   }
+  jval *tools = jget(body, "tools");
+  int has_tools = tools && tools->t == J_ARR && tools->len;
+  int stream = jbool(body, "stream", 0);
+  char id[80];
+  snprintf(id, sizeof(id), "msg_%lld_%lu", (long long)time(NULL),
+           (unsigned long)pthread_self());
+  anthropic_stream live = {.fd = fd, .index = 0};
+  if (stream) {
+    if (send_stream_head(fd, "text/event-stream")) {
+      b_free(&prompt);
+      return;
+    }
+    buf start = {0};
+    b_add(&start, "{\"type\":\"message_start\",\"message\":{\"id\":");
+    b_json(&start, id);
+    b_add(&start, ",\"type\":\"message\",\"role\":\"assistant\",\"model\":");
+    b_json(&start, s->c.model_id);
+    b_add(&start, ",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,"
+                  "\"usage\":{\"input_tokens\":0,\"output_tokens\":0,"
+                  "\"cache_creation_input_tokens\":0,"
+                  "\"cache_read_input_tokens\":0}}}");
+    live.failed = anthropic_event(fd, "message_start", &start);
+    b_free(&start);
+    if (live.failed) {
+      b_free(&prompt);
+      return;
+    }
+  }
   request r;
-  int rc = generate_prompt(s, prompt.p, max, temp, top_p, -1, &r);
+  int rc = generate_prompt_cb(
+      s, prompt.p, max, temp, top_p, -1, &r,
+      stream && !thinking && !has_tools ? anthropic_text_data : NULL,
+      stream && !thinking && !has_tools ? &live : NULL);
   b_free(&prompt);
   if (rc) {
     if (rc == -4)
       request_destroy(&r);
-    api_error(fd, rc == -1 || rc == -2 ? 429 : 500,
-              "Inference request failed.");
+    if (!stream)
+      api_error(fd, rc == -1 || rc == -2 ? 429 : 500,
+                "Inference request failed.");
+    else if (!live.failed) {
+      buf error = {0};
+      b_add(&error, "{\"type\":\"error\",\"error\":{\"type\":\"api_error\","
+                    "\"message\":\"The colibri engine failed to process the "
+                    "request.\"}}");
+      anthropic_event(fd, "error", &error);
+      b_free(&error);
+    }
     return;
   }
-  jval *tools = jget(body, "tools");
   tool_call calls[16];
   buf visible = {0};
   int call_n = tools && tools->t == J_ARR && tools->len
@@ -1705,8 +1834,6 @@ static void anthropic(server *s, int fd, jval *body) {
     b_add(&visible, r.data.p ? r.data.p : "");
   buf reasoning = {0}, content = {0};
   split_reasoning(visible.p ? visible.p : "", thinking, &reasoning, &content);
-  char id[80];
-  snprintf(id, sizeof(id), "msg_%llu", r.id);
   buf out = {0};
   b_add(&out, "{\"id\":");
   b_json(&out, id);
@@ -1748,46 +1875,77 @@ static void anthropic(server *s, int fd, jval *body) {
            : r.length_limited ? "max_tokens"
                               : "end_turn",
            r.prompt_tokens, r.completion_tokens);
-  int stream = jbool(body, "stream", 0);
   if (!stream)
     send_json(fd, 200, &out);
   else {
     buf wire = {0};
-    b_add(
-        &wire,
-        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":");
-    b_addn(&wire, out.p, out.n);
-    b_add(&wire, "}\n\n");
     if (reasoning.n) {
-      b_add(&wire, "event: content_block_delta\ndata: "
+      b_add(&wire, "event: content_block_start\ndata: "
+                   "{\"type\":\"content_block_start\",\"index\":0,"
+                   "\"content_block\":{\"type\":\"thinking\","
+                   "\"thinking\":\"\",\"signature\":\"\"}}\n\n"
+                   "event: content_block_delta\ndata: "
                    "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"
                    "\"type\":\"thinking_delta\",\"thinking\":");
       b_json(&wire, reasoning.p);
-      b_add(&wire, "}}\n\n");
+      b_add(&wire, "}}\n\nevent: content_block_stop\ndata: "
+                   "{\"type\":\"content_block_stop\",\"index\":0}\n\n");
     }
-    if (content.n) {
-      b_add(&wire, "event: content_block_delta\ndata: "
-                   "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{"
-                   "\"type\":\"text_delta\",\"text\":");
+    if (content.n && !(live.started && !has_tools)) {
+      int index = reasoning.n ? 1 : 0;
+      b_printf(&wire,
+               "event: content_block_start\ndata: {\"type\":"
+               "\"content_block_start\",\"index\":%d,\"content_block\":{"
+               "\"type\":\"text\",\"text\":\"\"}}\n\n"
+               "event: content_block_delta\ndata: {\"type\":"
+               "\"content_block_delta\",\"index\":%d,\"delta\":{"
+               "\"type\":\"text_delta\",\"text\":",
+               index, index);
       b_json(&wire, content.p);
-      b_add(&wire, "}}\n\n");
+      b_printf(&wire,
+               "}}\n\nevent: content_block_stop\ndata: {\"type\":"
+               "\"content_block_stop\",\"index\":%d}\n\n",
+               index);
+    } else if (live.started && !has_tools) {
+      b_printf(&wire,
+               "event: content_block_stop\ndata: {\"type\":"
+               "\"content_block_stop\",\"index\":%d}\n\n",
+               live.index);
     }
     for (int i = 0; i < call_n; i++) {
+      int index = (reasoning.n ? 1 : 0) + (content.n ? 1 : 0) + i;
       b_add(&wire, "event: content_block_start\ndata: "
-                   "{\"type\":\"content_block_start\",\"index\":0,\"content_"
-                   "block\":{\"type\":\"tool_use\",\"id\":");
+                   "{\"type\":\"content_block_start\",\"index\":");
+      b_printf(&wire,
+               "%d,\"content_block\":{\"type\":\"tool_use\",\"id\":", index);
       b_json(&wire, calls[i].id);
       b_add(&wire, ",\"name\":");
       b_json(&wire, calls[i].name);
       b_add(&wire, ",\"input\":{}}}\n\nevent: content_block_delta\ndata: "
-                   "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{"
-                   "\"type\":\"input_json_delta\",\"partial_json\":");
+                   "{\"type\":\"content_block_delta\",\"index\":");
+      b_printf(&wire,
+               "%d,\"delta\":{\"type\":\"input_json_delta\","
+               "\"partial_json\":",
+               index);
       b_json(&wire, calls[i].args.p);
-      b_add(&wire, "}}\n\n");
+      b_printf(&wire,
+               "}}\n\nevent: content_block_stop\ndata: {\"type\":"
+               "\"content_block_stop\",\"index\":%d}\n\n",
+               index);
     }
-    b_add(&wire, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-    send_body(fd, 200, "text/event-stream", wire.p, wire.n,
-              "Cache-Control: no-cache\r\n");
+    b_printf(&wire,
+             "event: message_delta\ndata: {\"type\":\"message_delta\","
+             "\"delta\":{\"stop_reason\":\"%s\",\"stop_sequence\":null},"
+             "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d,"
+             "\"cache_creation_input_tokens\":0,"
+             "\"cache_read_input_tokens\":0}}\n\n"
+             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+             call_n             ? "tool_use"
+             : r.length_limited ? "max_tokens"
+                                : "end_turn",
+             r.prompt_tokens, r.completion_tokens);
+    if (!live.failed)
+      write_all(fd, wire.p, wire.n);
     b_free(&wire);
   }
   b_free(&out);
@@ -2269,12 +2427,19 @@ static void *client_main(void *arg) {
   }
   if (http_debug_enabled()) {
     jval *messages = jget(body, "messages"), *tools = jget(body, "tools");
+    int deferred = 0;
+    if (tools && tools->t == J_ARR)
+      for (int i = 0; i < tools->len; i++)
+        deferred += jbool(tools->kids[i], "defer_loading", 0) ? 1 : 0;
+    jval *maximum = jget(body, "max_tokens");
     fprintf(stderr,
-            "[http] id=%s request model=%s stream=%s messages=%d tools=%d\n",
+            "[http] id=%s request model=%s stream=%s messages=%d tools=%d "
+            "deferred_tools=%d max_tokens=%.0f\n",
             response_request_id, jstr(body, "model", "(default)"),
             jbool(body, "stream", 0) ? "true" : "false",
             messages && messages->t == J_ARR ? messages->len : 0,
-            tools && tools->t == J_ARR ? tools->len : 0);
+            tools && tools->t == J_ARR ? tools->len : 0, deferred,
+            maximum && maximum->t == J_NUM ? maximum->num : 0.0);
   }
   if (!strcmp(r.path, "/v1/chat/completions"))
     completion(s, fd, &r, body, 1);

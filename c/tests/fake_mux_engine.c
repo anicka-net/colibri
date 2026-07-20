@@ -37,8 +37,18 @@ int main(void) {
         free(prompt);
         return 0;
       }
+      char ctx_reply[64];
+      snprintf(ctx_reply, sizeof(ctx_reply), "CTX=%s",
+               getenv("CTX") ? getenv("CTX") : "unset");
       const char *reply =
-          strstr(prompt, "# Tools")
+          strstr(prompt, "show ctx") ? ctx_reply
+          : strstr(prompt, "check reference")
+              ? (strstr(prompt, "DEFERRED_SENTINEL") ? "reference-expanded"
+                                                     : "reference-missing")
+          : strstr(prompt, "check defer")
+              ? (strstr(prompt, "DEFERRED_SENTINEL") ? "deferred-leaked"
+                                                     : "deferred-ok")
+          : strstr(prompt, "# Tools")
               ? "<tool_call>lookup<arg_key>q</arg_key><arg_value>bird</"
                 "arg_value></tool_call>"
           : (strstr(prompt, "<think>") && !strstr(prompt, "<think></think>"))

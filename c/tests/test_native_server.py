@@ -57,7 +57,7 @@ class NativeServerTest(unittest.TestCase):
             "--host", "127.0.0.1", "--port", str(cls.port),
             "--model-id", "glm-test", "--model-alias", "glm-public",
             "--hidden-model-alias", "glm-hidden", "--api-key", "secret",
-            "--ngen", "32", "--ctx", "4096", "--kv-slots", "2",
+            "--ngen", "32", "--ctx", "4097", "--kv-slots", "2",
         ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         cls.base = f"http://127.0.0.1:{cls.port}"
         for _ in range(100):
@@ -100,7 +100,15 @@ class NativeServerTest(unittest.TestCase):
         with self.request("/v1/models") as response:
             models = json.load(response)["data"]
         self.assertEqual([m["id"] for m in models], ["glm-test", "glm-public"])
-        self.assertEqual(models[0]["context_length"], 4096)
+        self.assertEqual(models[0]["context_length"], 4097)
+
+    def test_context_is_propagated_to_engine(self):
+        with self.request("/v1/chat/completions", {
+            "model": "glm-test", "messages": [{"role": "user",
+                                                   "content": "show ctx"}],
+        }) as response:
+            result = json.load(response)
+        self.assertEqual(result["choices"][0]["message"]["content"], "CTX=4097")
 
     def test_private_pidfile_and_stop_dry_run(self):
         pidfile = Path(self.runtime_tmp.name) / f"colibri-serve-{self.port}.pid"
@@ -300,6 +308,34 @@ class NativeServerTest(unittest.TestCase):
         self.assertEqual(result["message"]["tool_calls"][0]["function"]["arguments"],
                          {"q": "bird"})
 
+    def test_anthropic_deferred_tools_are_not_rendered_into_initial_prompt(self):
+        tools = [
+            {"name": "always_available", "description": "small",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "large_deferred", "description": "DEFERRED_SENTINEL",
+             "input_schema": {"type": "object", "properties": {
+                 "payload": {"type": "string", "description": "DEFERRED_SENTINEL"},
+             }}, "defer_loading": True},
+        ]
+        with self.request("/v1/messages?beta=true", {
+            "model": "glm-test", "messages": [{"role": "user",
+                                                   "content": "check defer"}],
+            "max_tokens": 4, "tools": tools,
+        }) as response:
+            result = json.load(response)
+        self.assertEqual(result["content"][0]["text"], "deferred-ok")
+
+        with self.request("/v1/messages?beta=true", {
+            "model": "glm-test", "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "check reference"},
+                {"type": "tool_result", "tool_use_id": "search_1", "content": [
+                    {"type": "tool_reference", "tool_name": "large_deferred"},
+                ]},
+            ]}], "max_tokens": 4, "tools": tools,
+        }) as response:
+            result = json.load(response)
+        self.assertEqual(result["content"][0]["text"], "reference-expanded")
+
     def test_openai_stream_is_live_not_buffered(self):
         started = time.monotonic()
         with self.request("/v1/chat/completions", {
@@ -333,6 +369,25 @@ class NativeServerTest(unittest.TestCase):
         with self.request("/health") as response:
             self.assertEqual(json.load(response)["status"], "ok")
         self.assertIsNone(self.process.poll())
+
+    def test_anthropic_stream_starts_before_tool_generation_finishes(self):
+        started = time.monotonic()
+        tool = {"name": "lookup", "input_schema": {"type": "object",
+                                                       "properties": {}}}
+        with self.request("/v1/messages?beta=true", {
+            "model": "glm-test", "messages": [{"role": "user",
+                                                   "content": "slow"}],
+            "max_tokens": 4, "tools": [tool], "stream": True,
+        }) as response:
+            first_event = response.readline().decode()
+            first_data = response.readline().decode()
+            first_latency = time.monotonic() - started
+            remainder = response.read().decode()
+        self.assertEqual(first_event, "event: message_start\n")
+        self.assertIn('"type":"message_start"', first_data)
+        self.assertLess(first_latency, .3)
+        self.assertGreater(time.monotonic() - started, .45)
+        self.assertIn("event: message_stop", remainder)
 
 
 class NativePlanDoctorTest(unittest.TestCase):
