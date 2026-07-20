@@ -5443,6 +5443,13 @@ static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c,tok_eos,NULL);
  * killing the engine; :more can continue the interrupted answer. Armed only
  * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
 static volatile sig_atomic_t g_intr=0;
+/* Benchmark control: validation can replay the oracle continuation while still
+ * executing draft proposal and verification. This isolates runtime economics
+ * from route changes caused by an early greedy near-tie. */
+static const int *g_force_ref=NULL;
+static int g_force_ref_n=0;
+static int g_oracle_draft=0;
+static uint64_t g_oracle_prop=0, g_oracle_acc=0;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
 static void intr_install(void){
@@ -5472,7 +5479,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
-        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
+        int next=(g_force_ref && emitted<g_force_ref_n)
+            ? g_force_ref[emitted] : pick_tok(logit,V,carry_ban);
+        carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         gr_feed(next);                                  /* il walker segue l'output emesso */
@@ -5482,6 +5491,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                                                          * forza, l'acceptance e' ~1 (#48) */
             g=grammar_draft(draft,g_gr_max);
             if(g>0) gsrc=1;
+        }
+        if(!g && g_force_ref && g_oracle_draft>0){
+            g=g_force_ref_n-emitted;
+            if(g>g_oracle_draft) g=g_oracle_draft;
+            if(g>0){ memcpy(draft,g_force_ref+emitted,(size_t)g*sizeof(int)); gsrc=3; }
         }
         if(!g && g_draft>0 && m->has_mtp){
             /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
@@ -5503,6 +5517,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
         if(gsrc==1) g_gr_prop+=(uint64_t)g;
+        else if(gsrc==3) g_oracle_prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
         double tf0=g_prof?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
@@ -5512,9 +5527,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             fprintf(stderr,"[mtpdbg] draft0=%d verified=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
         while(k<g && emitted<n_new){
             int accept;
-            if(g_temp<=0) accept = (argmax_v(lo+(int64_t)k*V,V)==draft[k]);
+            int ref_ok=!g_force_ref ||
+                (emitted<g_force_ref_n && draft[k]==g_force_ref[emitted]);
+            if(g_temp<=0) accept = ref_ok && (argmax_v(lo+(int64_t)k*V,V)==draft[k]);
             else { dist_build(lo+(int64_t)k*V,V);          /* rejection sampling: p(draft) */
-                   accept = (rndu() < g_pbuf[draft[k]]); }
+                   accept = ref_ok && (rndu() < g_pbuf[draft[k]]); }
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
@@ -5522,7 +5539,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(gsrc==1) g_gr_acc+=(uint64_t)k;
         else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
-        if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
+        else if(gsrc==3) g_oracle_acc+=(uint64_t)k;
+        if(m->has_mtp && k>=1 && gsrc!=3)
+            mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
         kv += 1+k;                                      /* KV oltre kv e' stantia: verra' sovrascritta */
@@ -8381,8 +8400,18 @@ int main(int argc, char **argv){
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
+    if(getenv("FORCE_REF") && atoi(getenv("FORCE_REF"))){
+        if(g_temp>0){ fprintf(stderr,"FORCE_REF requires TEMP=0\n"); return 2; }
+        g_force_ref=full+np; g_force_ref_n=n_new;
+        g_oracle_draft=getenv("ORACLE_DRAFT")?atoi(getenv("ORACLE_DRAFT")):0;
+        if(g_oracle_draft<0 || g_oracle_draft>63){
+            fprintf(stderr,"ORACLE_DRAFT must be between 0 and 63\n"); return 2;
+        }
+        if(g_oracle_draft>g_draft) g_draft=g_oracle_draft;
+    }
     ProfBase pb; prof_base(&m,&pb);
     double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
+    g_force_ref=NULL; g_force_ref_n=0;
     int match=0;
     printf("\nReference (oracle): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
     printf("\nGLM C engine      : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
@@ -8390,9 +8419,16 @@ int main(int argc, char **argv){
     double tot=m.hits+m.miss;
     printf("N-gram speculation (DRAFT=%d): %.2f tokens/forward (%llu forwards per %llu tokens)\n",
         g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
-    printf("Expert cache hit rate: %.1f%% (%llu pin + %llu lru / %llu miss) | RSS: %.2f GB | %.1f tok/s\n",
+    if(m.mtp_prop) printf("MTP acceptance: %.1f%% (%llu/%llu)\n",
+        100.0*m.mtp_acc/m.mtp_prop,
+        (unsigned long long)m.mtp_acc,(unsigned long long)m.mtp_prop);
+    if(g_oracle_prop) printf("Oracle draft acceptance: %.1f%% (%llu/%llu)\n",
+        100.0*g_oracle_acc/g_oracle_prop,
+        (unsigned long long)g_oracle_acc,(unsigned long long)g_oracle_prop);
+    printf("Expert cache hit rate: %.1f%% (%llu pin + %llu lru / %llu miss) | RSS: %.2f GB | "
+           "%.3f tok/s | decode %.3fs\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hit_pin, (unsigned long long)m.hit_ecache,
-           (unsigned long long)m.miss, rss_gb(), n_new/dt);
+           (unsigned long long)m.miss, rss_gb(), n_new/dt, dt);
     profile_print(&m,dt);
     if(g_prof) prof_report(&m,&pb,dt,n_new,stdout);
 #ifdef COLI_CUDA
