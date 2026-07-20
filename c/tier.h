@@ -53,6 +53,28 @@ static int tier_pick_lfru(const uint32_t *heat, const uint32_t *last, uint32_t c
     *slot=cold; *eid=hot; *gain=(long)((hs-cs)>>8); return 1;
 }
 
+/* Same policy between two explicit tiers, e.g. VRAM residents and their RAM
+   backing candidates. The caller owns topology constraints; candidates can
+   therefore be limited to one layer/home GPU. */
+static int tier_pick_lfru_between(const uint32_t *heat, const uint32_t *last,
+                                  uint32_t clock, const int *resident, int nr,
+                                  const int *candidate, int nc,
+                                  int *slot, int *eid, long *gain) {
+    if(!heat||!last||!resident||!candidate||nr<1||nc<1) return 0;
+    int cold=0;
+    for(int z=1;z<nr;z++)
+        if(tier_lfru_score(heat[resident[z]],last[resident[z]],clock)<
+           tier_lfru_score(heat[resident[cold]],last[resident[cold]],clock)) cold=z;
+    int hot=0;
+    for(int z=1;z<nc;z++)
+        if(tier_lfru_score(heat[candidate[z]],last[candidate[z]],clock)>
+           tier_lfru_score(heat[candidate[hot]],last[candidate[hot]],clock)) hot=z;
+    uint64_t cs=tier_lfru_score(heat[resident[cold]],last[resident[cold]],clock);
+    uint64_t hs=tier_lfru_score(heat[candidate[hot]],last[candidate[hot]],clock);
+    if(hs<=cs+(cs>>2)+(4u<<8)) return 0;
+    *slot=cold; *eid=candidate[hot]; *gain=(long)((hs-cs)>>8); return 1;
+}
+
 static void tier_decay(uint32_t *heat, int nexpert){
     for(int e=0;e<nexpert;e++) heat[e]>>=1;
 }

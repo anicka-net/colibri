@@ -12,9 +12,9 @@ static double run(ColiCudaTensor *g,ColiCudaTensor *u,ColiCudaTensor *d,
     if(mode==2){setenv("COLI_CUDA_TC_INT4","1",1);setenv("COLI_CUDA_TC_MIN_ROWS","1",1);}
     else unsetenv("COLI_CUDA_TC_INT4");
     setenv("COLI_CUDA_W4_PACKED",mode==0?"0":"1",1);
-    if(!coli_cuda_expert_group(gs,us,ds,rs,1,y,x,nullptr,nullptr,0,0))std::exit(2);
+    if(!coli_cuda_expert_group(gs,us,ds,rs,1,y,x,nullptr,nullptr,0,0,0,nullptr))std::exit(2);
     auto begin=std::chrono::steady_clock::now();
-    for(int i=0;i<iterations;i++)if(!coli_cuda_expert_group(gs,us,ds,rs,1,y,x,nullptr,nullptr,0,0))std::exit(2);
+    for(int i=0;i<iterations;i++)if(!coli_cuda_expert_group(gs,us,ds,rs,1,y,x,nullptr,nullptr,0,0,0,nullptr))std::exit(2);
     auto end=std::chrono::steady_clock::now();
     return std::chrono::duration<double,std::milli>(end-begin).count()/iterations;
 }

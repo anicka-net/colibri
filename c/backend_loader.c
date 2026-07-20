@@ -42,7 +42,8 @@ typedef int            (*fn_expert_mlp)(ColiCudaTensor *gate, ColiCudaTensor *up
 typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                                           ColiCudaTensor *const *downs, const int *rows, int count,
                                           float *y, const float *x, const float *wrow,
-                                          const int *tokrow, int S_tok, int accum_ok);
+                                          const int *tokrow, int S_tok, int accum_ok,
+                                          int x_device,float *out_device);
 typedef int            (*fn_expert_group_collect)(int device, int home_device, float *x_dev, int D);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
@@ -342,9 +343,11 @@ int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
 int coli_cuda_expert_group(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs, const int *rows, int count,
                            float *y, const float *x, const float *wrow,
-                           const int *tokrow, int S_tok, int accum_ok){
+                           const int *tokrow, int S_tok, int accum_ok,
+                           int x_device,float *out_device){
     if(!g_cuda.available) return 0;
-    return g_cuda.expert_group(gates,ups,downs,rows,count,y,x,wrow,tokrow,S_tok,accum_ok);
+    return g_cuda.expert_group(gates,ups,downs,rows,count,y,x,wrow,tokrow,S_tok,accum_ok,
+                               x_device,out_device);
 }
 
 int coli_cuda_expert_group_collect(int device,int home_device,float *x_dev,int D){

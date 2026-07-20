@@ -22,6 +22,10 @@ int main(void){
     int live[2]={0,1};
     if(!tier_pick_lfru(freq,last,100,5,live,2,&slot,&eid,&gain)) return fail("LFRU promotion");
     if(slot!=0||eid!=4) return fail("LFRU did not prefer recent ties");
+    int vram[2]={0,1}, ram[2]={3,4};
+    if(!tier_pick_lfru_between(freq,last,100,vram,2,ram,2,&slot,&eid,&gain))
+        return fail("tier-to-tier LFRU promotion");
+    if(slot!=0||eid!=4) return fail("tier-to-tier LFRU picked outside candidates");
     puts("tier tests: ok");
     return 0;
 }

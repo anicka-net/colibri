@@ -40,8 +40,15 @@ int main(void) {
       char ctx_reply[64];
       snprintf(ctx_reply, sizeof(ctx_reply), "CTX=%s",
                getenv("CTX") ? getenv("CTX") : "unset");
+      char bind_reply[64];
+      snprintf(bind_reply, sizeof(bind_reply), "OMP_PROC_BIND=%s",
+               getenv("OMP_PROC_BIND") ? getenv("OMP_PROC_BIND") : "unset");
       const char *reply =
-          strstr(prompt, "show ctx") ? ctx_reply
+          strstr(prompt, "check headers")
+              ? (strstr(prompt, "x-anthropic-") ? "headers-leaked"
+                                                   : "headers-stripped")
+          : strstr(prompt, "show bind") ? bind_reply
+          : strstr(prompt, "show ctx") ? ctx_reply
           : strstr(prompt, "check reference")
               ? (strstr(prompt, "DEFERRED_SENTINEL") ? "reference-expanded"
                                                      : "reference-missing")

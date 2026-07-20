@@ -18,6 +18,7 @@ Format: `VAR` — default — effect.
 |---|---|---|
 | `RAM_GB` | `0` (auto ≈ 88% of free RAM) | RAM budget in GB for the resident/streamed expert working set. Higher → more experts stay hot → higher cache hit rate. |
 | `CTX` | `4096` | Maximum context length (tokens) the KV cache is sized for. |
+| `COLI_PROMPT_FILE` | unset | Read the generation prompt from a file; useful for long-context runs that exceed the OS environment/argument-size limit. Takes precedence over `COLI_PROMPT`/`PROMPT`. |
 | `NGEN` | `256` (engine) | Max tokens to generate before stopping (stop tokens can end sooner). `coli --ngen` defaults to `1024`. |
 | `TEMP` | `-1` (auto: `1.0` for chat/text, greedy elsewhere) | Sampling temperature. **`TEMP=0` = greedy/argmax = deterministic.** |
 | `NUCLEUS` | `0.90` | Nucleus (top-p) mass kept when sampling. Slightly tighter than the official 0.95 because the int4 tail is noisy. |
@@ -45,6 +46,7 @@ Format: `VAR` — default — effect.
 | `URING` | `0` (off) | Linux-only queued expert I/O. `URING=1` implies `PIPE=1`, forces cold reads through io-wq (`IOSQE_ASYNC`), replaces blocking loader pthreads and spin waits with batched SQEs/CQEs, and batches `PILOT_REAL` loads on a separate ring. Use `DIRECT=1` for cold NVMe to avoid page-cache copy/readahead limits. Fails clearly if the kernel denies io_uring; incompatible with `COLI_MMAP=1`. |
 | `DIRECT` | `0` (off) | Use `O_DIRECT`/unbuffered reads for expert slabs. Helps sustained NVMe; keeps the zero-copy GPU path. |
 | `COLI_NO_OMP_TUNE` | off | **Kill-switch** for the OpenMP hot-thread tuning (`OMP_WAIT_POLICY=active` spin + proc-bind). Set `=1` when the CPU is mostly waiting on the GPU (Metal) so spin doesn't steal the shared power budget. |
+| `COLI_ENGINE_OMP_PROC_BIND` | unset | Native server only: overrides `OMP_PROC_BIND` in the engine child. For a persistent service, start the mux with `OMP_PROC_BIND=false` and set this to `spread`; otherwise libgomp can pin the mux before `fork()` and leave every engine worker confined to one physical core. |
 | `COLI_NUMA` | off (Linux only) | `COLI_NUMA=1` interleaves expert slabs across NUMA nodes via `mbind` (raw syscall, no libnuma). Helps multi-socket hosts (+7–40% expert matmul); silent no-op on single-node or non-Linux. |
 | `MLOCK` | `-1` (auto: on for macOS) | Wire the streamed expert cache into physical RAM (`mlock`) to dodge the memory compressor. `0` off, `1` force. |
 | `CAP_RAISE` | `1` (on) | Let the engine raise the expert-cache cap above `topk` when RAM allows (bigger batches). `0` fixes the cap. |
@@ -56,7 +58,7 @@ Format: `VAR` — default — effect.
 | `PIN` | unset | Path to a `.coli_usage`/stats file; pins the hottest experts into a resident "hot store" at startup. **`PIN=auto`** seeds from the model dir's live `.coli_usage` (appended after every turn, so each restart's pin placement follows the accumulated real workload) with `stats.txt` as the fallback for a virgin model dir; neither present → no pin this run. |
 | `PIN_GB` | `10.0` | Size budget (GB) for the pinned hot store when `PIN` is set. |
 | `AUTOPIN` | `1` (on) | Auto-pin the hot store from usage history once ≥5000 selections are recorded. |
-| `REPIN` | `0` (off) | Live re-pin the hot store every N emitted tokens (RFC). |
+| `REPIN` | `0` generally; `16` automatically with a CUDA expert tier | Live LFRU adaptation every N emitted tokens. CUDA swaps stay within the expert's layer/home GPU and retain 25%+4 hysteresis. Set `0` explicitly to disable. |
 | `PILOT` | `0` (off) | Router-piloted cross-layer expert prefetch. |
 | `PILOT_REAL` | `0` (off) | Value-preserving real cross-layer prefetch loads (`PILOT_REAL=1` opts in). |
 | `PILOT_K` | `6` if `PILOT_REAL` else `8` | Number of experts the pilot prefetches per step. |
@@ -92,7 +94,8 @@ Format: `VAR` — default — effect.
 | `CUDA_DENSE` | `0` | Place dense (non-expert) matmuls on the GPU. |
 | `CUDA_EXPERT_GB` | `0` | VRAM budget (GB) for caching experts on the GPU. |
 | `COLI_CUDA_HOST_EXPERTS` | `0` | Execute RAM/LRU experts through CUDA from pageable host memory on coherent unified-memory devices such as GB10. |
-| `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. |
+| `CUDA_RELEASE_HOST` | auto (`1` if >1 device) | Release host-side copies after upload. Set `0` when RAM holds the whole model and should remain the authoritative backing store for fast VRAM-cache promotion/eviction. |
+| `COLI_CUDA_REPIN_PASSES` | `8` | LFRU adaptation passes after a substantial mux prefill. Each pass swaps at most one cold/hot pair per layer, always on that layer's home GPU; range 1–32. |
 | `COLI_CUDA_ATTN` | off | Run S≤4 attention on the GPU. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
@@ -108,6 +111,7 @@ Format: `VAR` — default — effect.
 | `COLI_CUDA_TC_MIN_ROWS` | `8` | Min rows-per-expert to engage the W4A4 Tensor Core path. |
 | `COLI_CUDA_TC_W4A16` | off | `=1` uses the lossless W4A16 Tensor Core path (compute capability ≥7). |
 | `COLI_CUDA_TC_W4A16_MIN` | `16` | Per-expert row threshold above which W4A16 TC tiles dispatch (smaller batches fall back to the naive kernel). |
+| `COLI_CUDA_GROUP_ROWS` | `16384` | Maximum routed rows staged per GPU expert-group dispatch. Bounds long-prefill host, pinned, and device scratch independently of prompt length; lower it if VRAM headroom is tight. |
 | `COLI_CUDA_SHARED_W4A16` | off | `=1` uploads shared-expert weights and runs the shared-MLP W4A16 Tensor Core kernel. |
 | `COLI_CUDA_SHARED_W4A16_MIN_ROWS` | `32` | Min row count to engage the shared-MLP W4A16 kernel. |
 | `COLI_METAL_UNTRACKED` | off (Metal only) | `=1` sets `MTLResourceHazardTrackingModeUntracked` on Metal buffers (reduces hazard-tracking overhead). |

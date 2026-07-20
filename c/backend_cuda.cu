@@ -776,6 +776,21 @@ __global__ static void group_accum_kernel(float *__restrict__ acc,
     for (int s = 0; s < S; s++) acc[(size_t)s * D + t] = a[s];
 }
 
+__global__ static void group_gather_rows(float *__restrict__ packed,
+        const float *__restrict__ source,const int *__restrict__ tok,int total,int S,int D){
+    size_t z=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)total*D;
+    if(z<n){int r=(int)(z/D),d=(int)(z-(size_t)r*D),t=tok[r];
+        if(t>=0&&t<S)packed[z]=source[(size_t)t*D+d];}
+}
+
+__global__ static void group_scatter_add(float *__restrict__ out,
+        const float *__restrict__ packed,const float *__restrict__ weight,
+        const int *__restrict__ tok,int total,int S,int D){
+    size_t z=(size_t)blockIdx.x*blockDim.x+threadIdx.x,n=(size_t)total*D;
+    if(z<n){int r=(int)(z/D),d=(int)(z-(size_t)r*D),t=tok[r];
+        if(t>=0&&t<S)atomicAdd(out+(size_t)t*D+d,weight[r]*packed[z]);}
+}
+
 template<int RMAX> __global__ static void grouped_gemv_q4_dual(float *__restrict__ gate_out,
         float *__restrict__ up_out, const float *__restrict__ x_all,
         const GroupDesc *__restrict__ g, int I_in, int O) {
@@ -864,8 +879,10 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         const int *rows, int count,
                                         float *y, const float *x,
                                         const float *wrow, const int *tokrow,
-                                        int S_tok, int accum_ok) {
+                                        int S_tok, int accum_ok,
+                                        int x_device,float *out_device) {
     if (!gates || !ups || !downs || !rows || !x || !y || count < 1) return 0;
+    if(x_device&&(!wrow||!tokrow||!out_device||S_tok<1))return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
@@ -888,7 +905,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
        !reserve(&ctx->gate,&ctx->gate_cap,ib)||!reserve(&ctx->up,&ctx->up_cap,ib)||
        !reserve_bytes(&ctx->group_desc,&ctx->group_desc_cap,(size_t)count*sizeof(GroupDesc))) return 0;
     int async=!getenv("COLI_CUDA_ASYNC")||atoi(getenv("COLI_CUDA_ASYNC"));
-    if(async&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb,ctx->device)||
+    if(async&&!x_device&&(!reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb,ctx->device)||
                !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb,ctx->device)))return 0;
     cudaError_t copy_desc=async?cudaMemcpyAsync(ctx->group_desc,host,(size_t)count*sizeof(GroupDesc),
                                                 cudaMemcpyHostToDevice,ctx->stream)
@@ -898,10 +915,20 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     cudaEvent_t ev[4]={};
     if(profile) for(int i=0;i<4;i++) if(!cuda_ok(cudaEventCreate(&ev[i]),"profile event")) profile=0;
     if(profile) cudaEventRecord(ev[0],ctx->stream);
-    if(async)std::memcpy(ctx->host_x,x,xb);
-    cudaError_t copy_x=async?cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream)
-                            :cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice);
-    if(!cuda_ok(copy_x,"expert group input upload")) return 0;
+    if(x_device){
+        if(!reserve(&ctx->wrow_d,&ctx->wrow_cap,(size_t)total*(sizeof(float)+sizeof(int)))||
+           !cuda_ok(cudaMemcpyAsync(ctx->wrow_d,wrow,(size_t)total*sizeof(float),cudaMemcpyHostToDevice,ctx->stream),"group weights upload")||
+           !cuda_ok(cudaMemcpyAsync((char*)ctx->wrow_d+(size_t)total*sizeof(float),tokrow,
+                    (size_t)total*sizeof(int),cudaMemcpyHostToDevice,ctx->stream),"group tokens upload"))return 0;
+        const int *dtok=(const int*)((const char*)ctx->wrow_d+(size_t)total*sizeof(float));
+        group_gather_rows<<<(unsigned)(((size_t)total*D+255)/256),256,0,ctx->stream>>>(ctx->x,x,dtok,total,S_tok,D);
+        if(!cuda_ok(cudaGetLastError(),"expert group device gather"))return 0;
+    }else{
+        if(async)std::memcpy(ctx->host_x,x,xb);
+        cudaError_t copy_x=async?cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream)
+                                :cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice);
+        if(!cuda_ok(copy_x,"expert group input upload")) return 0;
+    }
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
@@ -987,6 +1014,17 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_hidden<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
         silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+    }
+    if(x_device){
+        const float *dw=ctx->wrow_d;
+        const int *dt=(const int*)((const char*)ctx->wrow_d+(size_t)total*sizeof(float));
+        group_scatter_add<<<(unsigned)(((size_t)total*D+255)/256),256,0,ctx->stream>>>(
+            out_device,ctx->y,dw,dt,total,S_tok,D);
+        if(!cuda_ok(cudaGetLastError(),"expert group device scatter"))return 0;
+        if(profile)for(int i=0;i<4;i++)cudaEventDestroy(ev[i]);
+        { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+          g_group_calls++;g_group_experts+=(uint64_t)count;g_group_rows+=(uint64_t)total; }
+        return 2;
     }
     if(wrow&&tokrow&&accum_ok&&all_s4&&max_rows<=4&&S_tok>=1&&S_tok<=4){
         /* Device-side weighted accumulate: no y download, no sync.  The caller

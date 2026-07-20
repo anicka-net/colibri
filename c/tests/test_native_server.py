@@ -40,7 +40,8 @@ class NativeServerTest(unittest.TestCase):
         listener.bind(("127.0.0.1", 0))
         cls.port = listener.getsockname()[1]
         listener.close()
-        env = dict(os.environ, COLI_ENGINE=str(ROOT / "tests/fake_mux_engine"))
+        env = dict(os.environ, COLI_ENGINE=str(ROOT / "tests/fake_mux_engine"),
+                   OMP_PROC_BIND="false", COLI_ENGINE_OMP_PROC_BIND="spread")
         cls.web_tmp = tempfile.TemporaryDirectory()
         cls.runtime_tmp = tempfile.TemporaryDirectory()
         web = Path(cls.web_tmp.name)
@@ -109,6 +110,27 @@ class NativeServerTest(unittest.TestCase):
         }) as response:
             result = json.load(response)
         self.assertEqual(result["choices"][0]["message"]["content"], "CTX=4097")
+
+    def test_engine_only_openmp_binding_is_propagated(self):
+        with self.request("/v1/chat/completions", {
+            "model": "glm-test", "messages": [{"role": "user",
+                                                   "content": "show bind"}],
+        }) as response:
+            result = json.load(response)
+        self.assertEqual(result["choices"][0]["message"]["content"],
+                         "OMP_PROC_BIND=spread")
+
+    def test_anthropic_transport_headers_are_not_rendered_to_model(self):
+        body = {
+            "model": "glm-test",
+            "system": "x-anthropic-billing-header: cc_version=2; cch=random;"
+                      "You are Claude Code.",
+            "messages": [{"role": "user", "content": "check headers"}],
+            "max_tokens": 8,
+        }
+        with self.request("/v1/messages", body) as response:
+            result = json.load(response)
+        self.assertEqual(result["content"][0]["text"], "headers-stripped")
 
     def test_private_pidfile_and_stop_dry_run(self):
         pidfile = Path(self.runtime_tmp.name) / f"colibri-serve-{self.port}.pid"

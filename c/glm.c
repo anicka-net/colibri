@@ -58,6 +58,9 @@
 #include "grammar.h"                              /* metodo F: draft grammaticali (#48) */
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
+#include "group_plan.h"
+#include "serve_limit.h"
+#include "expert_vram_plan.h"
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -251,6 +254,10 @@ static int g_cuda_release_host;
 static int g_cuda_host_experts;
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
+static _Atomic uint64_t g_cuda_group_dev_calls,g_cuda_group_dev_rows;
+static _Atomic uint64_t g_cuda_vram_promotions,g_cuda_vram_evictions;
+static _Atomic uint64_t g_cuda_vram_upload_bytes;
+static _Atomic uint64_t g_cuda_vram_upload_us;
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
     t->cuda_failed=0;
@@ -288,6 +295,14 @@ static void cuda_stats_print(void){
         getenv("COLI_CUDA_PROFILE")?"; timing sotto":"");
     if(calls&&getenv("COLI_CUDA_PROFILE")) fprintf(stderr,
         "[CUDA] expert groups timing: H2D %.1f ms | kernel %.1f ms | D2H %.1f ms\n",h2d,kernel,d2h);
+    { uint64_t dc=atomic_load(&g_cuda_group_dev_calls),dr=atomic_load(&g_cuda_group_dev_rows);
+      if(dc)fprintf(stderr,"[CUDA] device-resident expert groups: %llu call, %llu routed rows\n",
+          (unsigned long long)dc,(unsigned long long)dr); }
+    { uint64_t p=atomic_load(&g_cuda_vram_promotions),e=atomic_load(&g_cuda_vram_evictions);
+      uint64_t ub=atomic_load(&g_cuda_vram_upload_bytes),us=atomic_load(&g_cuda_vram_upload_us);
+      if(p)fprintf(stderr,"[CUDA] VRAM expert cache: %llu promotion, %llu eviction, "
+          "%.2f GB uploaded in %.1f ms\n",(unsigned long long)p,(unsigned long long)e,
+          ub/1e9,us/1e3); }
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -2635,6 +2650,7 @@ static int g_fuse_shared=-1;                  /* COLI_FUSE_SHARED=1: shared expe
 static const float *g_cuda_pre_logits=NULL;
 static float *g_group_accum_xdev=NULL;        /* pipe path: routed experts accumulate on-device into x_dev */
 static int g_group_accum_home=-1;  /* router logits computed on-device by the fused chain */
+static float *g_group_input_xdev=NULL;        /* pipe prefill: normalized expert input on layer home GPU */
 static float *chain_scores=NULL; size_t chain_scores_cap=0; /* fused-chain router logits [S,E] */
 static float *chain_xn=NULL; size_t chain_xn_cap=0;         /* fused-chain in_ln rows [S,D] for DSA k_idx */
 /* COLI_DBG_DSACHAIN: engagement counters for the in-chain DSA selection */
@@ -3685,9 +3701,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
      * (misurato: 81s di expert-matmul tutto su CPU, GPU groups 21ms totali). */
-    int group_enabled = S<=64 || ((g_cuda_pipe||g_cuda_prefill) && S<=4096);
-    float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
-    float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
+    int group_enabled = S<=64 || g_cuda_pipe || g_cuda_prefill;
+    /* Bound grouped-prefill staging independently of the prompt length.  A
+     * whole-prompt S*K buffer is already ~4.7 GB at S=23672 for GLM-5.2, and
+     * the backend mirrors much of it in pinned/device scratch.  Routed-row
+     * batches keep each expert intact whenever it fits, avoiding the repeated
+     * per-expert launches that token tiling would create. */
+    int group_row_cap=getenv("COLI_CUDA_GROUP_ROWS")?atoi(getenv("COLI_CUDA_GROUP_ROWS")):16384;
+    if(group_row_cap<64)group_row_cap=64;
+    int64_t group_possible=(int64_t)S*K;
+    int group_stride=group_possible<group_row_cap?(int)group_possible:group_row_cap;
+    float *group_x=group_enabled?falloc((int64_t)group_stride*g_cuda_ndev*D):NULL;
+    float *group_y=group_enabled?falloc((int64_t)group_stride*g_cuda_ndev*D):NULL;
+    int *group_pack_row=group_enabled?malloc((size_t)group_stride*g_cuda_ndev*sizeof(int)):NULL;
+    float *group_pack_weight=group_enabled?malloc((size_t)group_stride*g_cuda_ndev*sizeof(float)):NULL;
     int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
@@ -3888,67 +3915,104 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 m->cpu_expert_rows+=(uint64_t)nr;}
         }
 #ifdef COLI_CUDA
-        ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
-        ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
-        int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
-        float dev_w[COLI_CUDA_MAX_DEVICES][256]; int dev_tok[COLI_CUDA_MAX_DEVICES][256];
-        int dev_nc[COLI_CUDA_MAX_DEVICES]={0},dev_total[COLI_CUDA_MAX_DEVICES]={0};
-        int dev_has_miss[COLI_CUDA_MAX_DEVICES]={0};
-        int dev_off[COLI_CUDA_MAX_DEVICES]={0},dev_ok[COLI_CUDA_MAX_DEVICES]={0};
-        double dev_time[COLI_CUDA_MAX_DEVICES]={0};
-        for(int di=0;di<g_cuda_ndev;di++) for(int q=0;q<ngroup;q++)
-            if(group_e[q]->g.cuda_device==g_cuda_devices[di]) dev_total[di]+=group_n[q];
-        for(int di=1;di<g_cuda_ndev;di++) dev_off[di]=dev_off[di-1]+dev_total[di-1];
+        ColiGroupSeg *seg[COLI_CUDA_MAX_DEVICES]={0};
+        int nseg[COLI_CUDA_MAX_DEVICES]={0},segpos[COLI_CUDA_MAX_DEVICES]={0};
+        int group_dev[64];for(int q=0;q<ngroup;q++)group_dev[q]=group_e[q]->g.cuda_device;
         for(int di=0;di<g_cuda_ndev;di++){
-            int cursor=0,device=g_cuda_devices[di];
-            for(int q=0;q<ngroup;q++) if(group_e[q]->g.cuda_device==device){
-                int nc=dev_nc[di]++; ESlot *e=group_e[q];
-                dev_g[di][nc]=e->g.cuda; dev_u[di][nc]=e->u.cuda; dev_d[di][nc]=e->d.cuda;
-                dev_rows[di][nc]=group_n[q]; dev_which[di][nc]=q;
-                dev_has_miss[di]|=group_miss[q];
-                for(int r=0;r<group_n[q]&&cursor+r<256;r++){
-                    dev_w[di][cursor+r]=group_weight[(int64_t)q*S+r];
-                    dev_tok[di][cursor+r]=group_row[(int64_t)q*S+r];
+            int ns=coli_group_plan(group_n,group_dev,ngroup,g_cuda_devices[di],group_row_cap,NULL,0);
+            seg[di]=ns?malloc((size_t)ns*sizeof(ColiGroupSeg)):NULL;
+            if(ns&& !seg[di]){fprintf(stderr,"OOM CUDA expert group plan\n");exit(1);}
+            nseg[di]=coli_group_plan(group_n,group_dev,ngroup,g_cuda_devices[di],group_row_cap,seg[di],ns);
+            if(nseg[di]<0){fprintf(stderr,"OOM/invalid CUDA expert group plan\n");exit(1);}
+        }
+        double tg=now_s(),dev_time[COLI_CUDA_MAX_DEVICES]={0};
+        for(;;){
+            int any=0;
+            ColiCudaTensor *dev_g[COLI_CUDA_MAX_DEVICES][64],*dev_u[COLI_CUDA_MAX_DEVICES][64];
+            ColiCudaTensor *dev_d[COLI_CUDA_MAX_DEVICES][64];
+            int dev_rows[COLI_CUDA_MAX_DEVICES][64],dev_which[COLI_CUDA_MAX_DEVICES][64];
+            int dev_begin[COLI_CUDA_MAX_DEVICES][64];
+            float dev_w[COLI_CUDA_MAX_DEVICES][256]; int dev_tok[COLI_CUDA_MAX_DEVICES][256];
+            int dev_nc[COLI_CUDA_MAX_DEVICES]={0},dev_total[COLI_CUDA_MAX_DEVICES]={0};
+            int dev_has_miss[COLI_CUDA_MAX_DEVICES]={0};
+            int dev_off[COLI_CUDA_MAX_DEVICES],dev_ok[COLI_CUDA_MAX_DEVICES]={0};
+            for(int di=0;di<g_cuda_ndev;di++){
+                dev_off[di]=di*group_stride;
+                while(segpos[di]<nseg[di]&&dev_nc[di]<64){
+                    ColiGroupSeg z=seg[di][segpos[di]];
+                    if(dev_total[di]&&dev_total[di]+z.rows>group_row_cap)break;
+                    int nc=dev_nc[di]++,gi=z.group;ESlot *e=group_e[gi];
+                    dev_g[di][nc]=e->g.cuda;dev_u[di][nc]=e->u.cuda;dev_d[di][nc]=e->d.cuda;
+                    dev_rows[di][nc]=z.rows;dev_which[di][nc]=gi;dev_begin[di][nc]=z.begin;
+                    dev_total[di]+=z.rows;dev_has_miss[di]|=group_miss[gi];
+                    segpos[di]++;any=1;
                 }
-                for(int r=0;r<group_n[q];r++) memcpy(group_x+(int64_t)(dev_off[di]+cursor+r)*D,
-                    x+(int64_t)group_row[(int64_t)q*S+r]*D,D*sizeof(float));
-                cursor+=group_n[q];
             }
-        }
-        double tg=now_s();
-        #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
-        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
-            double td=g_prof?now_s():0;
-            dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
-                group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D,
-                dev_w[di],dev_tok[di],S,
-                (g_group_accum_xdev&&S<=4&&dev_total[di]<=256&&!dev_has_miss[di])?1:0);
-            if(g_prof)dev_time[di]=now_s()-td;
-        }
-        for(int di=0;di<g_cuda_ndev;di++){
-            int off=dev_off[di];
-            for(int q=0;q<dev_nc[di];q++){
-                int gi=dev_which[di][q],nr=group_n[gi]; ESlot *e=group_e[gi];
-                if(!dev_ok[di]){
-                    for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)group_row[(int64_t)gi*S+r]*D,D*sizeof(float));
-                    double tc=g_prof?now_s():0;
-                    if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
-                        expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        matmul_qt(hh,gg,&e->d,nr);
-                        if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
-                            m->cpu_expert_rows+=(uint64_t)nr;}
+            if(!any)break;
+            for(int di=0;di<g_cuda_ndev;di++){
+                int cursor=0;
+                int device_path=g_group_input_xdev&&g_group_accum_xdev&&
+                                g_cuda_devices[di]==g_group_accum_home&&!dev_has_miss[di]&&S>4;
+                for(int q=0;q<dev_nc[di];q++){
+                    int gi=dev_which[di][q],b=dev_begin[di][q],e=b+dev_rows[di][q];
+                    for(int r=b;r<e;r++){
+                        int row=group_row[(int64_t)gi*S+r];
+                        float w=group_weight[(int64_t)gi*S+r];
+                        group_pack_weight[dev_off[di]+cursor]=w;group_pack_row[dev_off[di]+cursor]=row;
+                        if(S<=4&&cursor<256){dev_w[di][cursor]=w;dev_tok[di][cursor]=row;}
+                        if(!device_path)memcpy(group_x+(int64_t)(dev_off[di]+cursor)*D,x+(int64_t)row*D,D*sizeof(float));
+                        cursor++;
                     }
-                    if(g_prof)m->t_ecpu+=now_s()-tc;
                 }
-                if(dev_ok[di]==2){ off+=nr; continue; }   /* accumulated on device into x_dev */
-                float *src=dev_ok[di]?group_y+(int64_t)off*D:hh;
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)group_row[(int64_t)gi*S+r]*D,wgt=group_weight[(int64_t)gi*S+r];
-                    for(int d=0;d<D;d++) os[d]+=wgt*src[(int64_t)r*D+d]; }
-                off+=nr;
+            }
+            #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
+            for(int di=0;di<g_cuda_ndev;di++)if(dev_nc[di]){
+                double td=g_prof?now_s():0;
+                int device_path=g_group_input_xdev&&g_group_accum_xdev&&
+                                g_cuda_devices[di]==g_group_accum_home&&!dev_has_miss[di]&&S>4;
+                dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
+                    group_y+(int64_t)dev_off[di]*D,
+                    device_path?g_group_input_xdev:group_x+(int64_t)dev_off[di]*D,
+                    device_path?group_pack_weight+dev_off[di]:(S<=4?dev_w[di]:NULL),
+                    device_path?group_pack_row+dev_off[di]:(S<=4?dev_tok[di]:NULL),S,
+                    (g_group_accum_xdev&&S<=4&&dev_total[di]<=256&&!dev_has_miss[di])?1:0,
+                    device_path,device_path?g_group_accum_xdev:NULL);
+                if(device_path&&dev_ok[di]==2){atomic_fetch_add(&g_cuda_group_dev_calls,1);
+                    atomic_fetch_add(&g_cuda_group_dev_rows,(uint64_t)dev_total[di]);}
+                if(g_prof)dev_time[di]+=now_s()-td;
+            }
+            for(int di=0;di<g_cuda_ndev;di++){
+                int off=dev_off[di];
+                for(int q=0;q<dev_nc[di];q++){
+                    int gi=dev_which[di][q],nr=dev_rows[di][q];ESlot *e=group_e[gi];
+                    if(!dev_ok[di]){
+                        int rr=0,b=dev_begin[di][q],end=b+nr;
+                        for(int r=b;r<end;r++){
+                            int row=group_row[(int64_t)gi*S+r];
+                            memcpy(xg+(int64_t)rr++*D,x+(int64_t)row*D,D*sizeof(float));
+                        }
+                        double tc=g_prof?now_s():0;
+                        if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
+                            expert_host_ensure(m,layer,e);expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+                            for(int64_t z=0;z<(int64_t)nr*I;z++)gg[z]=siluf(gg[z])*uu[z];
+                            matmul_qt(hh,gg,&e->d,nr);
+                            if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);m->cpu_expert_rows+=(uint64_t)nr;}
+                        }
+                        if(g_prof)m->t_ecpu+=now_s()-tc;
+                    }
+                    if(dev_ok[di]==2){off+=nr;continue;}
+                    float *src=dev_ok[di]?group_y+(int64_t)off*D:hh;int rr=0;
+                    int b=dev_begin[di][q],end=b+nr;
+                    for(int r=b;r<end;r++){
+                        int row=group_row[(int64_t)gi*S+r];
+                        float *os=out+(int64_t)row*D,wgt=group_weight[(int64_t)gi*S+r];
+                        for(int d=0;d<D;d++)os[d]+=wgt*src[(int64_t)rr*D+d];rr++;
+                    }
+                    off+=nr;
+                }
             }
         }
+        for(int di=0;di<g_cuda_ndev;di++)free(seg[di]);
         if(g_prof){double mx=0;for(int di=0;di<g_cuda_ndev;di++)if(dev_time[di]>mx)mx=dev_time[di];m->t_egpu+=mx;}
         m->t_emm+=now_s()-tg;
 #endif
@@ -4001,7 +4065,7 @@ shared_done:
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
 #ifdef COLI_CUDA
     free(group_x);free(group_y);
-    free(group_row); free(group_weight);
+    free(group_row); free(group_weight);free(group_pack_row);free(group_pack_weight);
 #endif
 }
 
@@ -4267,7 +4331,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
         for(int kk=0;kk<g_couple_k;kk++){
             int best=-1; float bv=0;
             for(int e=0;e<E;e++) if(sc[e]>bv){bv=sc[e];best=e;}
-            if(best<0) break;
+            if(best<0) continue;
             sc[best]=0;
             int found=0;                            /* residency scan, same locking as pilot */
             pthread_mutex_lock(&g_pilot_mx);
@@ -4594,10 +4658,10 @@ attn_done:;
     m->t_emm += now_s()-te;                                       /* shared-expert GPU dispatch only */
     /* expert routed su CPU/gruppi GPU come oggi (shared saltata: la fa il device) */
     if(chain_pre_logits) g_cuda_pre_logits=chain_scores;
-    g_group_accum_xdev=x_dev; g_group_accum_home=dev;
+    g_group_input_xdev=nrm_d;g_group_accum_xdev=x_dev; g_group_accum_home=dev;
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
     g_cuda_pre_logits=NULL;
-    g_group_accum_xdev=NULL;
+    g_group_input_xdev=NULL;g_group_accum_xdev=NULL;
     for(int di2=0;di2<g_cuda_ndev;di2++)
         coli_cuda_expert_group_collect(g_cuda_devices[di2],dev,x_dev,S*D);
     te=now_s();
@@ -5269,6 +5333,7 @@ static int pick_tok(const float *lo, int V, int ban){
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
 static int g_stop[256], g_nstop=0;  /* config eos + ogni added-token "special" del tokenizer */
 static void repin_pass_limit(Model *m,int limit);
+static void repin_adapt(Model *m,int limit);
 static void repin_pass(Model *m){ repin_pass_limit(m,16); }
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
 /* T=NULL -> solo gli stop del config (validazione/oracolo, dove il tokenizer non serve). */
@@ -5810,22 +5875,20 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
     for(int l=0;l<c->n_layers;l++){
         if(!m->npin || m->npin[l]<1 || !m->eheat[l]) continue;
 #ifdef COLI_CUDA
-        int cold=-1,hot=-1;
+        int gpu_slot[4096],gpu_id[4096],ram_id[4096],ng=0,nr=0;
         for(int z=0;z<m->npin[l];z++){
-            ESlot *s=&m->pin[l][z]; uint32_t heat=m->eheat[l][s->eid];
-            if(s->g.cuda_eligible){
-                if(cold<0||heat<m->eheat[l][m->pin[l][cold].eid]) cold=z;
-            }else if(hot<0||heat>m->eheat[l][m->pin[l][hot].eid]) hot=z;
+            ESlot *s=&m->pin[l][z];
+            if(s->g.cuda_eligible){ if(ng<4096){gpu_slot[ng]=z;gpu_id[ng++]=s->eid;} }
+            else if(nr<4096) ram_id[nr++]=s->eid;
         }
-        if(cold>=0&&hot>=0){
-            uint32_t ch=m->eheat[l][m->pin[l][cold].eid],hh=m->eheat[l][m->pin[l][hot].eid];
-            if(hh>ch+1){
-                RepinCand v={(long)hh-(long)ch,l,cold,m->pin[l][hot].eid,1};
-                if(nb<maxc) out[nb++]=v;
-                else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain)w=b;
-                       if(v.gain>out[w].gain)out[w]=v; }
-                continue;
-            }
+        int gs=-1,hot=-1;long gg=0;
+        if(tier_pick_lfru_between(m->eheat[l],m->elast[l],m->eaccess_clock,
+                                  gpu_id,ng,ram_id,nr,&gs,&hot,&gg)){
+            RepinCand v={gg,l,gpu_slot[gs],hot,1};
+            if(nb<maxc) out[nb++]=v;
+            else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain)w=b;
+                   if(v.gain>out[w].gain)out[w]=v; }
+            continue;
         }
 #endif
         ESlot *P=m->pin[l]; int ids[4096], zp, eu; long g;
@@ -5904,11 +5967,7 @@ static void rss_guard(Model *m){
     if(rss>0) rss_guard_apply(m,rss,lim);
 }
 
-static void repin_pass_limit(Model *m,int limit){
-    rss_guard(m);
-    if(g_repin<=0) return;
-    if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
-    g_last_repin = m->n_emit;
+static void repin_adapt(Model *m,int limit){
     double pass_t0=now_s(); int gpu_swaps=0;
     RepinCand cd[130];
     if(limit<1) limit=1; if(limit>130) limit=130;
@@ -5917,12 +5976,14 @@ static void repin_pass_limit(Model *m,int limit){
     /* Cold GPU slots have no host backing. Restore all demoted experts in
      * parallel first; serial 20 MB reads made a 32-slot adaptation pass cost
      * ~0.7 s on the six-GPU host. */
+    int restored[130]={0};
     #pragma omp parallel for schedule(dynamic,1)
     for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
+        restored[b]=s->slab?0:1;
         expert_host_ensure(m,cd[b].l,s);
     }
-    for(int b=0;b<nb;b++) if(cd[b].gpu_swap){
+    for(int b=0;b<nb;b++) if(cd[b].gpu_swap&&restored[b]){
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
         m->resident_bytes+=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
     }
@@ -5953,6 +6014,11 @@ static void repin_pass_limit(Model *m,int limit){
             qt_unwire_mmap(&hot->g); qt_unwire_mmap(&hot->u); qt_unwire_mmap(&hot->d);
             if(g_cuda_release_host) expert_host_release(m,hot);
             gpu_swaps++;
+            atomic_fetch_add(&g_cuda_vram_promotions,1);
+            atomic_fetch_add(&g_cuda_vram_evictions,1);
+            atomic_fetch_add(&g_cuda_vram_upload_bytes,
+                (uint64_t)(qt_bytes(&hot->g)+qt_bytes(&hot->u)+qt_bytes(&hot->d)));
+            atomic_fetch_add(&g_cuda_vram_upload_us,(uint64_t)((now_s()-t0)*1e6));
             if(getenv("REPIN_VERBOSE")) fprintf(stderr,
                 "[REPIN] VRAM layer %d: esce/out %d (heat=%u) <- entra/in %d "
                 "(heat=%u) in %.0f ms\n",cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
@@ -5987,7 +6053,20 @@ static void repin_pass_limit(Model *m,int limit){
     }
     if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d expert scambiati/swapped in %.0f ms\n",
         gpu_swaps,(now_s()-pass_t0)*1e3);
-    for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
+}
+
+static void repin_decay(Model *m){
+    for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l])
+        tier_decay(m->eheat[l],m->c.n_experts);
+}
+
+static void repin_pass_limit(Model *m,int limit){
+    rss_guard(m);
+    if(g_repin<=0) return;
+    if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
+    g_last_repin = m->n_emit;
+    repin_adapt(m,limit);
+    repin_decay(m);
 }
 /* ---- KV SU DISCO: la conversazione si riapre CALDA (KVSAVE=0 disattiva) ----
  * Il re-prefill di una chat riaperta costa ore su questo disco; la KV compressa MLA
@@ -6658,13 +6737,31 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
-    int room=maxctx-sc->len-1; if(r->maximum>room){r->maximum=room; r->length_limited=1;}
+#ifdef COLI_CUDA
+    /* A long prefill is a routing sample for every layer. At this safe point
+     * no expert kernel is in flight, so adapt the bounded same-home VRAM tier
+     * before decode. Multiple small passes retain the existing LFU/recency
+     * hysteresis while allowing more than one slot per layer to converge. */
+    if(add>4 && g_repin>0 && m->gpu_expert_count){
+        int passes=getenv("COLI_CUDA_REPIN_PASSES")?atoi(getenv("COLI_CUDA_REPIN_PASSES")):8;
+        if(passes<1)passes=1;if(passes>32)passes=32;
+        for(int p=0;p<passes;p++) repin_adapt(m,m->c.n_layers);
+        repin_decay(m);
+    }
+#endif
+    int room=maxctx-sc->len-1;
+    r->maximum=coli_effective_generation_limit(r->maximum,room);
     g_temp=r->temp; g_nuc=r->top_p;
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
-    if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
+    if(coli_generation_limit_reached(0,r->maximum)){
+        r->length_limited=1; mux_done(m,sc,r); return 1;
+    }
+    if(next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
     mux_data(T,r->id,next);
-    if(r->emitted>=r->maximum) mux_done(m,sc,r);
+    if(coli_generation_limit_reached(r->emitted,r->maximum)){
+        r->length_limited=1; mux_done(m,sc,r);
+    }
     return 1;
 }
 
@@ -6754,9 +6851,12 @@ static void run_serve_mux(Model *m, const char *snap){
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
             mux_data(&T,r->id,next);
-            if(r->emitted>=r->maximum) mux_done(m,sc,r);
+            if(coli_generation_limit_reached(r->emitted,r->maximum)){
+                r->length_limited=1; mux_done(m,sc,r);
+            }
         }
         free(lo);
+        repin_pass(m);                    /* safe point: adapt VRAM/RAM tiers during mux decode */
         rss_guard(m);                    /* mux decode bypasses spec_decode/repin_pass */
     }
     usage_save(m);
@@ -7332,7 +7432,18 @@ static void pin_load(Model *m, const char *statspath, double gb){
         }
     }
     if(g_cuda_expert_auto||budget>safe_total) budget=safe_total;
-    if(g_cuda_enabled&&g_cuda_release_host&&budget>0){ gpu_prefix=(int)(budget/eb)+g_cuda_ndev; if(gpu_prefix>npin)gpu_prefix=npin; }
+    /* The aggregate budget is not permission for a hot layer block to consume
+     * another GPU's scratch reserve. Give every device a proportional hard
+     * share; experts never spill away from their layer home. */
+    if(safe_total>0) for(int i=0;i<g_cuda_ndev;i++)
+        remaining[i]=coli_vram_device_budget(budget,remaining[i],safe_total);
+    if(g_cuda_enabled&&budget>0){
+        /* When RAM remains authoritative, load the complete RAM tier before
+         * choosing VRAM residents so a skewed global ranking cannot starve the
+         * quieter home GPU. Memory-saving profiles retain the bounded prefix. */
+        gpu_prefix=!g_cuda_release_host?npin:(int)(budget/eb)+g_cuda_ndev;
+        if(gpu_prefix>npin)gpu_prefix=npin;
+    }
 #else
     int gpu_prefix=0;
 #endif
@@ -7357,9 +7468,18 @@ static void pin_load(Model *m, const char *statspath, double gb){
             int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
             if(proj+need>budget) break;
             int best=-1;
-            for(int i=0;i<g_cuda_ndev;i++) if(remaining[i]>=need &&
-                (best<0||placed_b[i]<placed_b[best])) best=i;
-            if(best<0) break;
+            /* PIPE2 keeps a layer's residual on kv_b's home GPU.  Putting a
+             * routed expert on another device turns every prefill group into
+             * PCIe/NUMA traffic (tekton has no NVLink).  Main-model experts
+             * therefore never spill to a remote GPU; if home is full they
+             * remain in the RAM tier.  The optional MTP row has no layer home
+             * and retains balanced placement. */
+            if(r[a].l<c->n_layers){
+                int home=m->L[r[a].l].kv_b.cuda_device;
+                for(int i=0;i<g_cuda_ndev;i++)if(g_cuda_devices[i]==home&&remaining[i]>=need)best=i;
+            }else for(int i=0;i<g_cuda_ndev;i++)if(remaining[i]>=need&&
+                (best<0||placed_b[i]<placed_b[best]))best=i;
+            if(best<0) continue;
             assign[a]=best; proj+=need;
             remaining[best]-=need; placed_b[best]+=need;
           } }
@@ -7682,6 +7802,18 @@ static void adaptive_cap_init(Model *m, int maxctx){
  * self-test, and would "generate" from "$P$G". So on Windows a PROMPT carrying
  * cmd's $-metacodes is ignored; set COLI_PROMPT to pass a real prompt from cmd. */
 static const char *coli_user_prompt(void){
+    static char *file_prompt=NULL;
+    const char *path=getenv("COLI_PROMPT_FILE");
+    if(path&&*path){
+        if(file_prompt)return file_prompt;
+        FILE *f=fopen(path,"rb");if(!f){perror(path);return NULL;}
+        if(fseek(f,0,SEEK_END)){fclose(f);return NULL;}
+        long n=ftell(f);if(n<0||fseek(f,0,SEEK_SET)){fclose(f);return NULL;}
+        file_prompt=malloc((size_t)n+1);
+        if(!file_prompt||fread(file_prompt,1,(size_t)n,f)!=(size_t)n){
+            free(file_prompt);file_prompt=NULL;fclose(f);return NULL;}
+        fclose(f);file_prompt[n]=0;return file_prompt;
+    }
     const char *p = getenv("COLI_PROMPT");
     if(p) return p;
     p = getenv("PROMPT");
@@ -7926,8 +8058,7 @@ int main(int argc, char **argv){
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
-    if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
-       !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
+    if(!getenv("REPIN")&&(g_cuda_expert_auto||g_cuda_expert_gb>0)) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
     if((getenv("COLI_GPU")||getenv("COLI_GPUS"))&&!g_cuda_enabled){ fprintf(stderr,"COLI_GPU(S) requires COLI_CUDA=1\n"); return 2; }
     if(g_cuda_dense&&!g_cuda_enabled){ fprintf(stderr,"CUDA_DENSE requires COLI_CUDA=1\n"); return 2; }

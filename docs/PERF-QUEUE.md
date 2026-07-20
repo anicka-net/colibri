@@ -127,6 +127,33 @@ expert's prefill gemms ride the same path.  Decode (S<16) stays on the
 exact fp32 kernel.  Perturbation vs fp32 projections: ~0.06 on the top-1
 logit at 2.7k, same winner; frozen-state pairs are bit-identical.
 
+#### 256k grouped-expert work (2026-07-20, PCIe-only Tekton)
+The `S<=4096` grouped-expert gate has been removed.  Prefill now plans
+bounded routed-row batches, pins an expert only on the GPU that owns its
+layer, gathers routed rows from the device-resident normalized residual,
+and atomically applies weighted GPU expert outputs to the device-resident
+layer residual.  CPU expert results retain a single combined upload/add per
+layer.  A CUDA correctness test covers the device gather/scatter path, and
+engagement counters distinguish it from the host-staged group path.
+
+On a deliberately repetitive synthetic 23,606-token prompt, with frozen
+usage state, `CUDA_EXPERT_GB=150`, W4A16 and the prefill GEMMs enabled:
+**723.31 s = 32.64 tok/s**.  The device path served 8,971,835 routed rows in
+830 group calls.  The remaining profile is expert matmul 416.0 s (routed
+CPU 413.6 s), attention 221.9 s, router 39.3 s, and orchestration 46.1 s.
+This workload's routing is not representative of ordinary text, but it
+confirms that long prompts no longer fall back wholesale to host staging.
+
+Tekton's GPUs have no NVLink; their GPU-to-GPU topology is `SYS`.  A
+synchronized peer-copy benchmark of the actual FP32 layer-boundary residual
+measures ~35 GiB/s in both directions: 580,141,056 bytes at 23,606 tokens
+takes 15.4 ms, and 6,442,450,944 bytes at 262,144 tokens takes 170-172 ms.
+The engine's older wall timer measured only asynchronous dispatch and must
+not be used as transfer duration.  Even at 256k, one boundary copy is tiny
+beside prefill compute, so lossy FP16 residual transfer and a different layer
+partition are not justified.  The next material targets are CPU-resident
+expert execution/placement and attention, not PCIe.
+
 #### Measured dead end: next-token expert prediction from the MTP head
 `COLI_DBG_MTPROUTE=1` (telemetry, DRAFT>=1) runs every layer's router on
 the MTP block's predicted hidden state and scores it against the next

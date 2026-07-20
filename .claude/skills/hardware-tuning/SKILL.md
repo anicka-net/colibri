@@ -19,6 +19,7 @@ at 91% acceptance.
 ```
 COLI_CUDA=1 COLI_GPUS=0,1 CUDA_DENSE=1 \
 CUDA_EXPERT_GB=<see below> \
+CUDA_RELEASE_HOST=0 REPIN=16 COLI_CUDA_REPIN_PASSES=8 \
 COLI_CUDA_PIPE=2 COLI_CUDA_PIPE_S_MIN=1 \
 COLI_CUDA_TC_W4A16=1 \
 OMP_NUM_THREADS=<physical cores> OMP_PLACES=cores OMP_PROC_BIND=spread \
@@ -31,6 +32,16 @@ DIRECT=0 ./glm 256 4 4
   dense weights, KV cache growth, and scratch. Past the point where the CPU-side
   expert work and GPU expert work are balanced, more budget stops helping —
   sweep in 5–10 GB steps and keep the knee.
+- Keep `CUDA_RELEASE_HOST=0`: RAM is the authoritative complete expert tier and
+  VRAM is a live LFRU cache. `REPIN=16` adapts during decode, while
+  `COLI_CUDA_REPIN_PASSES=8` performs bounded adaptation after a substantial
+  prefill. Promotion reuses an evicted expert's allocation and never grows the
+  VRAM tier.
+- On multiple discrete GPUs, expert allocations are capped proportionally per
+  device and swaps stay within the expert layer's home GPU. Do not place a
+  home-GPU expert on another GPU: without NVLink the activation traffic over
+  PCIe can cost more than the saved CPU work. Confirm the startup per-device
+  expert totals are balanced and leave comparable scratch headroom.
 - `COLI_CUDA_PIPE=2` + `COLI_CUDA_PIPE_S_MIN=1` enables the resident decode
   stream with the fused attention chain (S<=4). On multi-GPU, layers get
   contiguous home-device blocks, so the residual crosses P2P once per forward.
@@ -53,6 +64,12 @@ here.  Measured gotchas, each of which produced a working-but-wrong service:
   **1.7 tok/s instead of ~9**, with `nvidia-smi` showing a few hundred MB
   instead of `CUDA_EXPERT_GB`.  Confirm the banner has both
   `hot expert tier: N/19200 experts` and `[PIN] placement:`.
+- **Retain RAM backing and enable live VRAM adaptation.** Use
+  `CUDA_RELEASE_HOST=0`, `REPIN=16`, and `COLI_CUDA_REPIN_PASSES=8`. The banner
+  must not say `VRAM experts without host backing`; after representative
+  traffic, `[REPIN] VRAM:` lines should show bounded swaps while `nvidia-smi`
+  remains flat. On a 2×H100 150 GB tier, expected placement is approximately
+  75 GB per GPU, not a heat-skewed split such as 66/84 GB.
 - **Python >= 3.7** (`ThreadingHTTPServer`).  Where the distro default is older
   (SLES 15 ships 3.6) the unit must invoke a newer interpreter by ABSOLUTE
   PATH: systemd expands `${VAR}` in arguments but not in the executable
@@ -83,7 +100,8 @@ bound (45% of wall, CPU tier a ~2.1x straggler over the GPU tier): all 19200
 experts are RAM-pinned (363 GB, zero disk I/O), but only ~7900 fit VRAM.
 Raising the tier to 175 GB buys hit 57.8 -> 62.9% and +3.8% throughput while
 leaving only ~7 GB VRAM margin at a full 32k prompt — not worth it; the cache
-improves on its own as `.coli_usage` learns real traffic.
+now adapts online using frequency with recency tie-breaking, while `.coli_usage`
+still provides the next cold-start placement.
 
 ### Long context on Profile A: DSA sparse attention
 
@@ -121,6 +139,11 @@ the defaults do this. Knobs and caveats:
 CPU and GPU share LPDDR; the GPU reads weights zero-copy, no VRAM tier or
 upload path. RAM is smaller than the model, so experts stream from NVMe and the
 expert cache hit rate — not compute — decides throughput. Two distinct regimes:
+
+This profile's cache hierarchy is disk→RAM/unified memory. Do not copy Profile
+A's `CUDA_RELEASE_HOST=0`/VRAM-repin settings here: there is no separate VRAM
+capacity to manage, and the existing RAM LRU already evicts cold expert slabs
+when the cache cap is reached.
 
 **Short-context (CTX<=4096) benchmark/interactive profile** — no separate CUDA
 tier, big LRU:
@@ -176,6 +199,8 @@ DIRECT=1 DRAFT=0 ./glm <cache-slots> 4 4
 - Cache slots: (free RAM − dense-resident GB) / expert size. When RAM is very
   tight, prefer fewer slots over swapping — a wired model plus swap thrashing
   is worse than honest streaming.
+- Here the expert cache is strictly disk→RAM. The RAM LRU owns promotion and
+  eviction; VRAM repinning variables have no effect.
 
 ## Prefill (long prompts)
 

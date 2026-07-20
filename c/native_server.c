@@ -402,6 +402,12 @@ static int engine_start(engine *e, const coli_server_config *c) {
     snprintf(tmp, sizeof(tmp), "%d", c->context_length);
     setenv("CTX", tmp, 1);
     setenv("COLI_MODE", "serve", 1);
+    /* A mux linked with libgomp may bind its initial thread before main when
+       OMP_PROC_BIND is set. Services should start the mux with binding off
+       and pass the desired engine-only policy through this variable. */
+    const char *engine_bind = getenv("COLI_ENGINE_OMP_PROC_BIND");
+    if (engine_bind && *engine_bind)
+      setenv("OMP_PROC_BIND", engine_bind, 1);
     char cap[20], eb[20], db[20];
     snprintf(cap, sizeof(cap), "%d", c->cap);
     snprintf(eb, sizeof(eb), "%d", c->expert_bits);
@@ -766,6 +772,58 @@ static int render_content(buf *out, jval *v) {
         x->t != J_STR)
       return -1;
     b_add(out, x->str);
+  }
+  return 0;
+}
+
+/* Claude Code currently prepends transport/accounting metadata to the first
+   system block. It is useful to the API boundary but meaningless to the model,
+   and its per-request cch value destroys exact-prefix KV reuse. Keep the JSON
+   body untouched; strip only recognized leading transport headers while
+   rendering the model prompt. */
+static const char *strip_anthropic_headers(const char *s) {
+  if (!s)
+    return "";
+  if (!strncasecmp(s, "x-anthropic-billing-header:", 27)) {
+    const char *cch = strstr(s + 27, "cch=");
+    const char *end = cch ? strchr(cch, ';') : NULL;
+    if (end)
+      s = end + 1;
+  }
+  for (;;) {
+    const char *colon = strchr(s, ':'), *newline = strchr(s, '\n');
+    if (!colon || !newline || colon > newline)
+      break;
+    size_t name = (size_t)(colon - s);
+    int transport = (name >= 2 && !strncasecmp(s, "x-", 2)) ||
+                    (name >= 10 && !strncasecmp(s, "anthropic-", 10)) ||
+                    (name == 13 && !strncasecmp(s, "authorization", 13)) ||
+                    (name == 12 && !strncasecmp(s, "content-type", 12)) ||
+                    (name == 10 && !strncasecmp(s, "user-agent", 10));
+    if (!transport)
+      break;
+    s = newline + 1;
+  }
+  return s;
+}
+
+static int render_anthropic_system(buf *out, jval *v) {
+  if (!v || v->t == J_NULL)
+    return 0;
+  if (v->t == J_STR) {
+    b_add(out, strip_anthropic_headers(v->str));
+    return 0;
+  }
+  if (v->t != J_ARR)
+    return -1;
+  for (int i = 0; i < v->len; i++) {
+    jval *p = v->kids[i];
+    jval *t = jget(p, "type"), *x = jget(p, "text");
+    if (!p || p->t != J_OBJ || !t || t->t != J_STR ||
+        (strcmp(t->str, "text") && strcmp(t->str, "input_text")) || !x ||
+        x->t != J_STR)
+      return -1;
+    b_add(out, strip_anthropic_headers(x->str));
   }
   return 0;
 }
@@ -1208,7 +1266,7 @@ static int render_anthropic(buf *out, jval *body, int thinking) {
   jval *system = jget(body, "system");
   if (system) {
     b_add(out, "<|system|>");
-    if (render_content(out, system))
+    if (render_anthropic_system(out, system))
       return -1;
   }
   render_tools(out, jget(body, "tools"));
