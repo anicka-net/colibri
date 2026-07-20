@@ -130,6 +130,7 @@ static void apply_plan_environment(const coli_plan *p) {
 }
 
 int main(int argc, char **argv) {
+  signal(SIGPIPE, SIG_IGN);
   if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") ||
       !strcmp(argv[1], "help")) {
     usage(stdout);

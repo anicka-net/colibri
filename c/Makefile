@@ -383,7 +383,7 @@ test-native:
 	@echo native CLI tests: skipped on Windows
 endif
 
-test: test-c test-python test-native
+test: test-c test-python
 
 # Local validation: one portable CPU build and dependency-free tests.
 check:

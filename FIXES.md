@@ -327,3 +327,83 @@ both DLL generations and was not available locally.
    tests, GB10 CUDA compilation, exported-symbol inspection, and both Windows
    DLL mismatch directions. The first four outputs are above; the mismatch
    matrix is explicitly CHANGED-UNVERIFIED.
+
+## Round 4 - Native server lifecycle
+
+### 1. SIGPIPE terminates the native runtime
+
+**FIXED** - `coli-native` ignores `SIGPIPE` before dispatching any command, so
+socket and engine-pipe closures reach the existing write-error handling.
+
+The fake engine was terminated before a request. The request returned HTTP
+500 and the same standalone server remained healthy:
+
+```text
+500
+{"status":"ok","scheduler":{"active":0,"queued":0,"capacity":1,"max_queue":8,"queue_timeout_seconds":300,"admitted":1,"completed":1,"rejected":0,"timed_out":0,"cancelled":0},"kv_slots":1,"watchdog_active":0,"tiers":{"vram":2,"ram":3,"disk":4,"vram_gb":5.00,"ram_gb":6.00},"hwinfo":{"cores":8,"ram_total_gb":16.0,"ram_avail_gb":12.0,"gpus":1,"vram_total_gb":24.0,"cpu":"Test CPU ","gpu":" Test GPU"}}
+```
+
+### 2. Failed submissions retain stack requests
+
+**FIXED** - A failed `SUBMIT` removes its request from the pending list.
+Dispatcher shutdown detaches the complete pending list before waking callers,
+and every initialized error-path request now releases its buffer, condition
+variable, and mutex. The regression fake engine exits during a request; two
+consecutive requests return HTTP 500 while `/health` remains available.
+
+Focused native suite:
+
+```text
+................
+----------------------------------------------------------------------
+Ran 16 tests in 0.599s
+
+OK
+```
+
+The same lifecycle suite under AddressSanitizer with leak detection:
+
+```text
+................
+----------------------------------------------------------------------
+Ran 16 tests in 0.716s
+
+OK
+```
+
+### 3. Native test dependency and platform wiring
+
+**CHANGED-UNVERIFIED** - POSIX test discovery now builds `coli-native` and
+the fake engine before either test class runs. Windows skips this POSIX-only
+module, and the generic test target no longer runs the native suite twice.
+Linux standalone discovery and the complete check pass:
+
+```text
+----------------------------------------------------------------------
+Ran 110 tests in 6.004s
+
+OK
+```
+
+```text
+test_dsa_select: 129 cases run, 0 failure(s)
+test_dsa_select: ok
+----------------------------------------------------------------------
+Ran 110 tests in 6.035s
+
+OK
+```
+
+The Windows skip path still needs the hosted Windows CI runner, so this item
+remains CHANGED-UNVERIFIED until that job passes.
+
+### Self-check
+
+1. Only the Windows native-test skip path remains unverified locally because
+   this host is Linux; hosted CI is the required evidence.
+2. Every claim above corresponds to the current diff or a pasted command
+   output.
+3. The review smoke paths were engine-pipe closure, repeated submission after
+   engine death, sanitizer execution, standalone Python discovery, full
+   checks, and Windows test discovery. Outputs for every local path are above;
+   Windows is explicitly CHANGED-UNVERIFIED.

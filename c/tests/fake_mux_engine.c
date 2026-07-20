@@ -33,6 +33,10 @@ int main(void) {
         return 2;
       prompt[bytes] = 0;
       (void)fgetc(stdin);
+      if (strstr(prompt, "exit-engine")) {
+        free(prompt);
+        return 0;
+      }
       const char *reply =
           strstr(prompt, "# Tools")
               ? "<tool_call>lookup<arg_key>q</arg_key><arg_value>bird</"
