@@ -1016,11 +1016,19 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_down<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }
     if(x_device){
+        if(!ctx->group_ev_init){
+            if(cuda_ok(cudaEventCreateWithFlags(&ctx->group_ev,cudaEventDisableTiming),
+                       "group event")) ctx->group_ev_init=1;
+        }
+        if(!ctx->group_ev_init)return 0;
         const float *dw=ctx->wrow_d;
         const int *dt=(const int*)((const char*)ctx->wrow_d+(size_t)total*sizeof(float));
         group_scatter_add<<<(unsigned)(((size_t)total*D+255)/256),256,0,ctx->stream>>>(
             out_device,ctx->y,dw,dt,total,S_tok,D);
         if(!cuda_ok(cudaGetLastError(),"expert group device scatter"))return 0;
+        if(!cuda_ok(cudaEventRecord(ctx->group_ev,ctx->stream),"group event record")||
+           !cuda_ok(cudaStreamWaitEvent(0,ctx->group_ev,0),"group device scatter wait"))
+            if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"group device scatter sync"))return 0;
         if(profile)for(int i=0;i<4;i++)cudaEventDestroy(ev[i]);
         { std::lock_guard<std::mutex> lock(g_group_stats_mu);
           g_group_calls++;g_group_experts+=(uint64_t)count;g_group_rows+=(uint64_t)total; }

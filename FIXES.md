@@ -411,3 +411,129 @@ Python tests	pass	10s	https://github.com/anicka-net/colibri/actions/runs/2973450
 3. The review smoke paths were engine-pipe closure, repeated submission after
    engine death, sanitizer execution, standalone Python discovery, full
    checks, and Windows test discovery. Local and hosted outputs are above.
+
+## Round 5 - Long-context and live-VRAM safety
+
+### 1. Device-resident expert scatter ordering
+
+**FIXED** - The device scatter records an event on the non-blocking expert
+stream and makes the default stream wait before the caller can consume or
+rewrite the residual. Event setup fails before the scatter; an event/wait
+failure falls back to synchronizing the expert stream.
+
+The GB10 stress case queued 64 device groups before a default-stream overwrite:
+
+```text
+[CUDA] device 0: NVIDIA GB10, 130.7 GB VRAM, sm_121
+device group ordering: ok
+```
+
+The repository's broader CUDA test still fails later on this GB10. The exact
+unmodified `66f2111` test fails too, before these fixes:
+
+```text
+[CUDA] device 0: NVIDIA GB10, 130.7 GB VRAM, sm_121
+mismatch 0: got 0.000000 want 0.365529
+make: *** [Makefile:274: cuda-test] Error 1
+baseline_rc=2
+```
+
+### 2. Integrated-memory CUDA expert accounting
+
+**FIXED** - RAM planning now charges actual CUDA expert tensor bytes only for
+integrated devices. Discrete VRAM remains outside the system-RAM budget.
+
+The real GB10 model started with its 30 GB expert tier and the planner reported
+that charge explicitly:
+
+```text
+[CUDA] hot expert tier: 1586/1586 experts, VRAM 30.00 GB (total budget 30.0 GB)
+[RAM_GB=108.3 auto] resident 10.6 GB + reserve 75.2 GB (ws 1.2, KV 1x131072 25.3, CUDA experts 30.0, kvb 15.0), experts 18.9 MB x 77 layers -> cap lowered 64->15 (projected peak 107.6 GB)
+```
+
+### 3. Live repin overlap with `PILOT_REAL`
+
+**FIXED** - Every `repin_adapt()` drains pilot work and holds `g_pilot_mx`
+while scanning or mutating pin slots. The contention probe holds that mutex,
+confirms repin cannot finish, releases it, and confirms repin releases the
+mutex after completion.
+
+```text
+[RAM-GUARD] RSS 3.0 GB over the 1.0 GB budget: dropped 1 cached experts, cap 2 -> 1
+OK kv_alloc re-allocation
+```
+
+### 4. Anthropic system-text stripping
+
+**FIXED** - Header removal now requires the exact Claude billing envelope and
+applies only to the first system block. User-authored `Authorization:` and
+`x-*` content is retained.
+
+```text
+test_anthropic_transport_headers_are_not_rendered_to_model ... ok
+test_anthropic_authored_system_text_is_preserved ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 2.416s
+
+OK
+```
+
+### 5. KV token decoder malformed input and allocation failure
+
+**FIXED** - The tool validates numeric ranges, checkpoint length, decode-size
+bounds, and both allocations before reading or decoding. A constrained address
+space forces the token-ID allocation failure path.
+
+```text
+test_rejects_empty_range_argument ... ok
+test_rejects_truncated_checkpoint_before_allocating ... ok
+test_reports_id_allocation_failure ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.121s
+
+OK
+```
+
+### 6. Tekton benchmark applicability
+
+**NOT DONE** - A 2xH100 PIPE2 result cannot establish GB10 PIPE0 throughput.
+This round ran a GB10 correctness/startup probe only; it makes no performance
+claim and leaves production on the previous known-good build.
+
+### Full validation
+
+```text
+test_st_pread: chunk loop + honest truncation error: ok
+test_grammar: ok
+expert VRAM per-device budget: ok
+test_i4_grouped: ok
+test_stops: ok
+test_topp: ok
+test_sample_nan: ok
+OK kv_alloc re-allocation
+test_dsa_select: ok
+zero-target PPL guard: ok
+test_uring: ok
+Ran 120 tests in 6.791s
+OK
+```
+
+Production recovery after the isolated GB10 probes:
+
+```text
+{"status":"ok","scheduler":{"active":0,"queued":0,"capacity":1,"max_queue":8,"queue_timeout_seconds":300.0,"admitted":0,"completed":0,"rejected":0,"timed_out":0,"cancelled":0},"kv_slots":1,"watchdog_active":0,"tiers":{"vram":1586,"ram":0,"disk":17870,"vram_gb":30.0,"ram_gb":0.0},"hwinfo":{"cores":20,"ram_total_gb":127.6,"ram_avail_gb":81.4,"gpus":1,"vram_total_gb":130.7,"cpu":"","gpu":"CUDA device x1"}}
+```
+
+### Self-check
+
+1. The Tekton-to-GB10 throughput claim was not tested because it requires a
+   controlled performance experiment, not a correctness patch. The Windows
+   `_fseeki64` branch of the decoder was compiled only indirectly, not run.
+2. Every FIXED claim above corresponds to the final diff and an executed output
+   block. The benchmark item is explicitly NOT DONE.
+3. The review smoke paths were CUDA residual ordering, integrated-memory
+   charging, pilot/repin exclusion, transport-header removal plus authored
+   system preservation, malformed/OOM token checkpoints, and the full suite.
+   Their outputs appear in items 1-5 and Full validation.

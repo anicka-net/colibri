@@ -5968,6 +5968,7 @@ static void rss_guard(Model *m){
 }
 
 static void repin_adapt(Model *m,int limit){
+    pilot_drain_lock();
     double pass_t0=now_s(); int gpu_swaps=0;
     RepinCand cd[130];
     if(limit<1) limit=1; if(limit>130) limit=130;
@@ -6053,6 +6054,7 @@ static void repin_adapt(Model *m,int limit){
     }
     if(gpu_swaps) fprintf(stderr,"[REPIN] VRAM: %d expert scambiati/swapped in %.0f ms\n",
         gpu_swaps,(now_s()-pass_t0)*1e3);
+    pthread_mutex_unlock(&g_pilot_mx);
 }
 
 static void repin_decay(Model *m){
@@ -7573,6 +7575,25 @@ static int cuda_ic_shadow_layer_eligible(int full, int sparse, int resident_elig
     return full && sparse && resident_eligible && integrated;
 }
 
+static double cuda_expert_ram_bytes(Model *m){
+#ifdef COLI_CUDA
+    if(!g_cuda_enabled) return 0;
+    double total=0;
+    for(int i=0;i<=m->c.n_layers;i++) for(int z=0;z<m->npin[i];z++){
+        ESlot *s=&m->pin[i][z];
+        if(!s->g.cuda) continue;
+        double bytes=(double)coli_cuda_tensor_bytes(s->g.cuda)
+                    +(double)coli_cuda_tensor_bytes(s->u.cuda)
+                    +(double)coli_cuda_tensor_bytes(s->d.cuda);
+        total+=coli_vram_ram_charge(bytes,
+            coli_cuda_device_is_integrated(s->g.cuda_device));
+    }
+    return total;
+#else
+    (void)m; return 0;
+#endif
+}
+
 /* PIPE2 keeps a second Ic copy on the layer's CUDA device for FULL DSA layers.
  * On coherent unified-memory hosts it consumes the same physical RAM as host Ic. */
 static double cuda_ic_shadow_bytes(Model *m, int max_ctx){
@@ -7611,6 +7632,7 @@ static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     double slack = 1.2e9 + 2.5e9 + ws_b
         + kv_pool_bytes(m,max_ctx)
         + cuda_ic_shadow_bytes(m,max_ctx)
+        + cuda_expert_ram_bytes(m)
         + (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
@@ -7640,6 +7662,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * re-reads. Clamp ws_b to the actual budget (min 8 for non-budgeted / prefill). */
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx) + cuda_ic_shadow_bytes(m,max_ctx);
+    double cuda_expert_b = cuda_expert_ram_bytes(m);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
@@ -7650,7 +7673,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * and slowed decode (1.03->0.83 tok/s). The reserve is a legitimate safety margin
      * for OS + CUDA + file metadata, not just buffered pread throughput. Keep it. */
     double pc_b  = 2.5e9;
-    double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
+    double slack = 1.2e9 + pc_b + ws_b + kv_b + cuda_expert_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
     int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
@@ -7678,10 +7701,10 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
         }
     }
     if(capmax < m->ecap){
-        fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
+        fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, CUDA experts %.1f, kvb %.1f), "
             "experts %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
             ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
-            kv_slot_count(),max_ctx,kv_b/1e9,kvb_b/1e9,
+            kv_slot_count(),max_ctx,kv_b/1e9,cuda_expert_b/1e9,kvb_b/1e9,
             eb/1e6, nsp, m->ecap, capmax,
             (m->resident_bytes + (double)capmax*nsp*eb + slack)/1e9);
         m->ecap=capmax;
