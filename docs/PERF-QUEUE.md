@@ -17,6 +17,40 @@ splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
 ## Open items, largest first
 
+### Mux resident decode: single-session fixed; multi-session design remains
+
+Profiling a real Claude Code turn at 25,335 tokens exposed a scheduler/path
+boundary rather than an attention-kernel regression: 275 decode forwards took
+563.4 s (0.488 tok/s), with 523.8 s in attention.  Projection/RoPE alone was
+470.0 s; DSA prefill engaged 21 FULL + 57 SHARED layers, but decode reported
+zero resident-chain engagements and zero fallbacks.  Cause: `run_serve_mux`
+always called the ragged `step_decode_batch`, even with one active slot;
+non-NULL `kvs[]` deliberately disables PIPE2.  The single-row specialization
+now binds that row's KV state and calls ordinary `step()`, so `KV_SLOTS=1` and
+any moment with one active session regain the resident PIPE2/DSA chain.
+
+Longer-term, genuinely concurrent rows still need a resident ragged chain:
+
+1. Extend the PIPE2 chain ABI from one `(KVState,pos)` to per-row device KV/Ic
+   bases, positions, starts, and validity watermarks. Keep each row's host KV
+   canonical and preserve rewind/truncation semantics independently.
+2. Group active rows by layer home GPU and compatible attention mode
+   (dense/below-threshold, DSA FULL, DSA SHARED). Keep residual rows resident
+   across the layer block and cross PCIe only at the existing device boundary.
+3. Make DSA selections row-owned: FULL rows score/top-k their own Ic history;
+   SHARED layers reuse the matching row's latest FULL selection. Never share a
+   selection or scratch stamp between conversations.
+4. Generalize fused-chain scratch and router/expert accumulation to `[S,...]`
+   without assuming contiguous positions. Preserve per-row cancellation and
+   do not publish KV valid watermarks until that row's kernels complete.
+5. Add a two-slot correctness harness comparing ragged resident output against
+   two isolated contiguous forwards with different positions, KV starts, and
+   rewind events. Require token/logit equivalence in the exact kernel class.
+6. Add engagement and fallback-reason counters split by contiguous-single and
+   resident-ragged paths, then benchmark 1, 2, 4, and 8 simultaneous sessions.
+   The resident-ragged path lands only if it beats isolated scheduling without
+   changing DSA selections or cross-session state.
+
 ### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: IndexShare, decode-attention attribution (inc.6 ruled out selection cost)
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048

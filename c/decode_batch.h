@@ -12,6 +12,15 @@ static inline float *coli_kv_row(float *base, int position, int width)
     return base + (size_t)position * (size_t)width;
 }
 
+/* A one-row mux batch is not ragged: binding that sequence's KV state restores
+ * the ordinary contiguous PIPE2/DSA decode path.  Keep the policy in this
+ * model-independent seam so a future scheduler refactor cannot silently send
+ * single-session traffic back through the much slower ragged attention path. */
+static inline int coli_decode_uses_contiguous_path(int rows)
+{
+    return rows == 1;
+}
+
 typedef struct {
     unsigned long long id, bytes;
     int slot, max_tokens;

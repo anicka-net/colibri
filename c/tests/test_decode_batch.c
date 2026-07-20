@@ -46,11 +46,20 @@ static void test_submit_header(void)
     assert(!coli_submit_parse("SUBMIT 1 0 2 3 1 1 trailing", &sub));
 }
 
+static void test_single_row_uses_resident_contiguous_path(void)
+{
+    assert(!coli_decode_uses_contiguous_path(0));
+    assert(coli_decode_uses_contiguous_path(1));
+    assert(!coli_decode_uses_contiguous_path(2));
+    assert(!coli_decode_uses_contiguous_path(16));
+}
+
 int main(void)
 {
     test_rows_use_their_own_sequence_storage();
     test_const_reader_selects_the_same_row();
     test_submit_header();
+    test_single_row_uses_resident_contiguous_path();
     puts("decode batch helper tests: ok");
     return 0;
 }

@@ -5076,8 +5076,18 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         }
         for(int p=0;p<s;p++) if(rows[p].kv==rows[s].kv){ free(x); return NULL; }
         kvs[s]=rows[s].kv; positions[s]=rows[s].pos;
-        embed_row(m,rows[s].token,x+(int64_t)s*D);
     }
+    /* The mux scheduler represents even one active conversation as a DecodeRow.
+     * Passing kvs[] into layers_forward_rows disables PIPE2 because the resident
+     * chain cannot express genuinely ragged positions.  With one row there is
+     * no raggedness: bind its KV and use the ordinary contiguous step, restoring
+     * the fused DSA chain used by direct/single-session decode. */
+    if(coli_decode_uses_contiguous_path(S)){
+        free(x);
+        kv_bind(m,rows[0].kv);
+        return step(m,&rows[0].token,1,rows[0].pos);
+    }
+    for(int s=0;s<S;s++) embed_row(m,rows[s].token,x+(int64_t)s*D);
     layers_forward_rows(m,x,S,0,kvs,positions);
     float *norm=falloc((int64_t)S*D);
     for(int s=0;s<S;s++)
