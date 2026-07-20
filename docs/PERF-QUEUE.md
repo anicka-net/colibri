@@ -272,7 +272,7 @@ where they are right; diversity from the weak temporal predictor is harmful.
 Any next predictor must improve accuracy while retaining a full-layer I/O
 horizon; late correction alone cannot hide the NVMe read.
 
-### 7b. Precomputed prefix KV caches (implemented; live validation pending)
+### 7b. Precomputed prefix KV caches (implemented and validated on GB10)
 Every new CLI/agent conversation re-prefills the same multi-thousand-token tool
 system prompt.  At the measured prefill rates that is ~2 min for a 5k prompt —
 paid per fresh session, and it dwarfs everything else in the interactive path.
@@ -280,17 +280,26 @@ The persistence format is ALREADY sufficient: `kv_disk_append` writes, per
 token, the token id plus every layer's `Lc`/`Rc` **and the DSA `Ic` indexer
 rows**, and `kv_hdr` binds layers/kv_lora/qk_rope/index_hd/n_ic/vocab, so a
 restored prefix needs no re-scoring and a mismatched model is rejected.  Record
-size is `4 + n_layers*(kv_lora+qk_rope)*4 + n_ic*index_hd*4` = **~215 KB/token**
-here: 1.1 GB for 5k tokens, ~1 s to read from NVMe versus ~150 s to recompute —
-two orders of magnitude.
+size is `4 + n_layers*(kv_lora+qk_rope)*4 + n_ic*index_hd*4` = **~190 KiB/token**
+in the current GLM-5.2 snapshot: about 0.93 GiB for 5k tokens.
 The mux/OpenAI service now has the missing plumbing behind
 `COLI_KV_CACHE_GB`: a bounded content-keyed library, exact longest-prefix
 matching at submit time, copy-on-write branch checkpoints, incremental
 extension of linear histories, compact token sidecars for cheap matching,
 and LRU eviction.  `COLI_KV_CACHE_DIR` must point to private persistent disk
 and be owned by one engine process.  Unit and full C checks cover restore,
-branching, crash recovery, corruption fallback, and eviction; GB10 timing and
-greedy-output equivalence controls remain to be run before deployment.
+branching, crash recovery, corruption fallback, and eviction.
+
+GB10 live validation (2026-07-20, one 3,170-token shared prefix):
+- Cold A: **348.4 s**.
+- Divergent B reusing the RAM prefix: **6.3 s**.
+- Resume A after B: **3,172 tokens restored from disk in 0.2 s**,
+  **7.6 s** end to end.
+- Branch from A: **5.3 s**.
+- After a full engine restart, resume B again restored 3,172 tokens in
+  **0.2 s** and completed in **13.4 s**.
+- The identical cache-disabled control took **345.6 s** and produced
+  byte-identical greedy text, finish reason, and token counts.
 - Note RoPE bakes ABSOLUTE positions in, so a cache is only valid at position 0
   and two prefixes cannot be concatenated — fine for system prompts, which is
   exactly the use case.

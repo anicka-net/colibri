@@ -104,7 +104,7 @@ percentages are not comparable across engine versions under `--topp`
 ## Conversations reopen warm
 
 `coli chat` persists the compressed MLA KV-cache to disk after every turn
-(`.coli_kv`, ~215 KB/token with the current DSA indexer, appended incrementally,
+(`.coli_kv`, ~190 KiB/token with the current DSA indexer, appended incrementally,
 crash-safe). Close the chat,
 reopen it tomorrow — the model still remembers the whole conversation and **zero
 re-prefill happens**: validated byte-identical to an uninterrupted session.
