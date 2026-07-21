@@ -687,7 +687,9 @@ class HTTPTest(unittest.TestCase):
         with self.request("/api/ps") as response:
             self.assertEqual(json.load(response)["models"][0]["model"], "test-model")
         with self.request("/api/show", {"model": "test-model"}) as response:
-            self.assertIn("tools", json.load(response)["capabilities"])
+            capabilities = json.load(response)["capabilities"]
+            self.assertIn("tools", capabilities)
+            self.assertNotIn("thinking", capabilities)
 
         with self.request("/api/chat", {
             "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],

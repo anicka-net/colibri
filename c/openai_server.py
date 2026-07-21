@@ -1536,7 +1536,11 @@ class APIHandler(BaseHTTPRequestHandler):
             "model_info": {"general.architecture": "glm4moe",
                            "general.parameter_count": 744000000000,
                            "glm.context_length": self.server.context_length or 0},
-            "capabilities": ["completion", "tools", "thinking"]}, request_id)
+            # Ollama automatically enables `think` when this endpoint advertises
+            # thinking.  GLM can finish directly without closing </think>, which
+            # makes Ollama display the answer as reasoning and can induce long
+            # repetitions.  Explicit API requests may still opt into `think`.
+            "capabilities": ["completion", "tools"]}, request_id)
 
     def _ollama_run(self, body, prompt, request_id, chat, tools, thinking):
         _normalized, maximum, temperature, top_p = ollama_options(body, self.server.max_tokens)

@@ -200,6 +200,7 @@ class NativeServerTest(unittest.TestCase):
             shown = json.load(response)
         self.assertIn("completion", shown["capabilities"])
         self.assertIn("tools", shown["capabilities"])
+        self.assertNotIn("thinking", shown["capabilities"])
 
     def test_profile_collects_engine_telemetry(self):
         with self.request("/v1/completions", {"model": "glm-test", "prompt": "x"}):
