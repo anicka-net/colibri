@@ -278,6 +278,7 @@ static double g_cuda_expert_gb;
 static int g_cuda_expert_auto;
 static int g_cuda_dense;
 static int g_cuda_release_host;
+static double g_cuda_reserve_gb;   /* CUDA_RESERVE_GB: VRAM headroom kept free of expert tier (default 2 GB) */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -5722,11 +5723,16 @@ static void pin_load(Model *m, const char *statspath, double gb){
     if(g_cuda_enabled&&(g_cuda_expert_gb>0||g_cuda_expert_auto)) for(int i=0;i<g_cuda_ndev;i++){
         size_t free_b=0,total_b=0;
         if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
-            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-2e9;
+            remaining[i]=(double)free_b-(double)g_cuda_dense_projected[i]-g_cuda_reserve_gb*1e9;
             if(remaining[i]<0) remaining[i]=0; safe_total+=remaining[i];
         }
     }
-    if(g_cuda_expert_auto||budget>safe_total) budget=safe_total;
+    /* auto: fill to measured headroom (safe_total). An explicit CUDA_EXPERT_GB is
+     * honored as-is even when it exceeds headroom; per-expert upload failure below
+     * (remaining[best]=0, continue to next expert) degrades gracefully rather
+     * than OOM-ing. Previously both paths were clamped, which silently capped the
+     * tier under CUDA_DENSE=1 regardless of the configured budget (#491). */
+    if(g_cuda_expert_auto) budget=safe_total;
     if(g_cuda_enabled&&g_cuda_release_host&&budget>0){
         prefix_est=(int)(budget/eb)+g_cuda_ndev;
         npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
@@ -5796,8 +5802,11 @@ static void pin_load(Model *m, const char *statspath, double gb){
                 }
             }
         }
-        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (total budget %.1f GB)\n",
-            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,g_cuda_expert_gb);
+        fprintf(stderr,"[CUDA] hot expert tier: %d/%d experts, VRAM %.2f GB (budget %.1f GB%s, reserve %.1f GB)\n",
+            m->gpu_expert_count,npin,m->gpu_expert_bytes/1e9,
+            g_cuda_expert_auto?safe_total/1e9:budget/1e9,
+            g_cuda_expert_auto?", auto":"",
+            g_cuda_reserve_gb);
         for(int i=0;i<g_cuda_ndev;i++) fprintf(stderr,"[CUDA]   device %d: %d experts, %.2f GB\n",
             g_cuda_devices[i],placed_n[i],placed_b[i]/1e9);
     }
@@ -6218,6 +6227,7 @@ int main(int argc, char **argv){
     const char *cuda_expert=getenv("CUDA_EXPERT_GB");
     g_cuda_expert_auto=cuda_expert&&!strcmp(cuda_expert,"auto");
     g_cuda_expert_gb=cuda_expert&&!g_cuda_expert_auto?atof(cuda_expert):0;
+    g_cuda_reserve_gb=getenv("CUDA_RESERVE_GB")?atof(getenv("CUDA_RESERVE_GB")):2.0;
     if(!getenv("REPIN")&&g_cuda_expert_auto&&getenv("PIN_GB")&&
        !strcmp(getenv("PIN_GB"),"all")) g_repin=16;
     g_cuda_release_host=getenv("CUDA_RELEASE_HOST")?atoi(getenv("CUDA_RELEASE_HOST")):(g_cuda_ndev>1);
