@@ -169,7 +169,7 @@ else
 PYTHON ?= python3
 endif
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_group_plan$(EXE) tests/test_serve_limit$(EXE) tests/test_expert_vram_plan$(EXE) tests/test_nvfp4$(EXE) tests/test_snapshot_manifest$(EXE) tests/test_kv_dtype$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_kv_cache$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_olmoe_ppl$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_group_plan$(EXE) tests/test_serve_limit$(EXE) tests/test_expert_vram_plan$(EXE) tests/test_nvfp4$(EXE) tests/test_nvfp4_loader$(EXE) tests/test_snapshot_manifest$(EXE) tests/test_kv_dtype$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_kv_alloc$(EXE) tests/test_kv_cache$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_olmoe_ppl$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -341,6 +341,9 @@ tests/test_expert_vram_plan$(EXE): tests/test_expert_vram_plan.c expert_vram_pla
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_nvfp4$(EXE): tests/test_nvfp4.c nvfp4.h tensor_format.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_nvfp4_loader$(EXE): tests/test_nvfp4_loader.c glm.c st.h nvfp4.h snapshot_manifest.h tensor_format.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_snapshot_manifest$(EXE): tests/test_snapshot_manifest.c snapshot_manifest.h tensor_format.h json.h

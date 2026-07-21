@@ -1991,13 +1991,14 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
         numa_slab_bind(s->fslab,6*sizeof(float));
 #endif
     }
+    uint8_t *native_weight[3]={0},*native_scales[3]={0};
     int64_t pos=0,total=0;
     for(int k=0;k<3;k++){
         int64_t wb=tw[k]->nbytes,sb=ts[k]->nbytes;
         if(pread_full(tw[k]->fd,s->slab+pos,wb,tw[k]->off,"pread NVFP4 weight")){if(fatal)exit(1);return -1;}
-        uint8_t *weight=s->slab+pos;pos+=wb;
+        native_weight[k]=s->slab+pos;pos+=wb;
         if(pread_full(ts[k]->fd,s->slab+pos,sb,ts[k]->off,"pread NVFP4 scales")){if(fatal)exit(1);return -1;}
-        uint8_t *scales=s->slab+pos;pos+=sb;
+        native_scales[k]=s->slab+pos;pos+=sb;
         if(pread_full(tt[k]->fd,&s->fslab[k*2],4,tt[k]->off,"pread NVFP4 tensor scale")||
            pread_full(ti[k]->fd,&s->fslab[k*2+1],4,ti[k]->off,"pread NVFP4 input scale")){
             if(fatal)exit(1);return -1;
@@ -2008,18 +2009,23 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
             if(fatal)exit(1);return -1;
         }
         /* Validate every FP8 scale byte now, never lazily reinterpret malformed data. */
-        for(int64_t z=0;z<sb;z++){float v=coli_e4m3fn_f32(scales[z]);
+        for(int64_t z=0;z<sb;z++){float v=coli_e4m3fn_f32(native_scales[k][z]);
             /* CUTLASS padding bytes are zero; logical scale positions must be positive. */
             if(isnan(v)){fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
         for(int o=0;o<OO[k];o++)for(int g=0;g<(II[k]+15)/16;g++){
-            float v=coli_e4m3fn_f32(scales[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
+            float v=coli_e4m3fn_f32(native_scales[k][coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
             if(!isfinite(v)||v<=0){fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
+        total+=wb+sb+8;
+    }
+    /* Publish all three projections only after the complete immutable record
+     * has been read and validated. A short read must never leave a mixed old/
+     * new expert visible through the slot's QT fields. */
+    for(int k=0;k<3;k++){
         qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
         qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;
         qt[k]->O=OO[k];qt[k]->I=II[k];qt[k]->gs=COLI_NVFP4_GROUP_SIZE;
-        qt[k]->q4=weight;qt[k]->block_scales=scales;qt[k]->tensor_scale=s->fslab[k*2];
+        qt[k]->q4=native_weight[k];qt[k]->block_scales=native_scales[k];qt[k]->tensor_scale=s->fslab[k*2];
         qt[k]->input_scale=s->fslab[k*2+1];qt[k]->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;
-        total+=wb+sb+8;
     }
     atomic_fetch_add_explicit(&g_prof_io,total,memory_order_relaxed);
     s->eid=eid;return 0;
