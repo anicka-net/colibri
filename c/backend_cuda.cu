@@ -16,6 +16,10 @@
 #include <cfloat>
 #include <mutex>
 
+#ifdef COLI_CUTLASS_NVFP4
+#include "backend_cuda_nvfp4_cutlass.cuh"
+#endif
+
 struct ColiCudaTensor {
     void *weights;
     float *scales;
@@ -64,6 +68,7 @@ static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static uint64_t g_nvfp4_native_calls,g_nvfp4_generic_calls;
 static uint64_t g_nvfp4_fallback_native_unavailable,g_nvfp4_failures;
+static uint64_t g_nvfp4_fallback_shape,g_nvfp4_fallback_rejected,g_nvfp4_fallback_launch;
 static uint64_t g_kv_fp8_quantized_rows,g_kv_fp8_reader_rows,g_kv_fp8_fallbacks;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
 static std::mutex g_group_stats_mu;
@@ -254,13 +259,16 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
               fmt == COLI_TENSOR_INT2_ROW) ? scales[o] : 1.0f);
 }
 
+static int nvfp4_native_launch(float*,const float*,const ColiCudaTensor*,int,cudaStream_t);
 static void tensor_matmul_launch(float *y,const float *x,const ColiCudaTensor *t,
                                   int S,cudaStream_t stream=0){
     dim3 grid((unsigned)t->O,(unsigned)S);
-    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4)
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4&&nvfp4_native_launch(y,x,t,S,stream))return;
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4){
+        g_nvfp4_generic_calls++;
         nvfp4_w4a32<<<grid,256,0,stream>>>(y,x,(const uint8_t*)t->weights,t->block_scales,
             t->tensor_scale,t->scale_layout,S,t->I,t->O);
-    else quant_matmul<<<grid,256,0,stream>>>(y,x,t->weights,t->scales,t->fmt,S,t->I,t->O,
+    }else quant_matmul<<<grid,256,0,stream>>>(y,x,t->weights,t->scales,t->fmt,S,t->I,t->O,
             row_bytes(t->fmt,t->I));
 }
 
@@ -546,6 +554,33 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
 static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(*cap>=bytes) return 1; if(*ptr) cudaFree(*ptr); *ptr=nullptr; *cap=0;
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
+}
+
+static int nvfp4_native_launch(float *y,const float *x,const ColiCudaTensor *t,
+                               int S,cudaStream_t stream){
+    DeviceContext *ctx=find_ctx(t->device);
+#ifndef COLI_CUTLASS_NVFP4
+    (void)y;(void)x;(void)S;(void)stream;g_nvfp4_fallback_native_unavailable++;return 0;
+#else
+    if(!ctx||(ctx->compute_major!=12)||(ctx->compute_minor!=0&&ctx->compute_minor!=1)||
+       t->scale_layout!=COLI_SCALE_CUTLASS_SM1XX_128X4){
+        g_nvfp4_fallback_native_unavailable++;return 0;
+    }
+    size_t qb=coli_nvfp4_native::activation_bytes(S,t->I);
+    size_t sb=coli_nvfp4_native::scale_bytes(S,t->O,t->I);
+    if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
+       !reserve(&ctx->qscale,&ctx->qscale_cap,sb)){g_nvfp4_fallback_launch++;return 0;}
+    int reason=0;
+    if(!coli_nvfp4_native::run(y,x,ctx->qx,ctx->qscale,(const uint8_t*)t->weights,
+                              t->block_scales,t->tensor_scale,t->input_scale,
+                              S,t->O,t->I,stream,&reason)){
+        if(reason==1)g_nvfp4_fallback_shape++;
+        else if(reason==2)g_nvfp4_fallback_rejected++;
+        else g_nvfp4_fallback_launch++;
+        return 0;
+    }
+    g_nvfp4_native_calls++;return 1;
+#endif
 }
 
 /* NUMA node of a GPU's PCIe root (sysfs), cached per CUDA ordinal; -1 = unknown. */
@@ -849,12 +884,11 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,float *y,const flo
     size_t xb=(size_t)S*I*sizeof(float),yb=(size_t)S*O*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb)||
        !cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"NVFP4 input upload"))return 0;
-    nvfp4_w4a32<<<dim3((unsigned)O,(unsigned)S),256>>>(ctx->y,ctx->x,(const uint8_t*)t->weights,
-        t->block_scales,t->tensor_scale,t->scale_layout,S,I,O);
-    if(!cuda_ok(cudaGetLastError(),"generic NVFP4 W4A32 launch")||
+    tensor_matmul_launch(ctx->y,ctx->x,t,S);
+    if(!cuda_ok(cudaGetLastError(),"NVFP4 matmul launch")||
        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"NVFP4 output download")){
         g_nvfp4_failures++;return 0;}
-    g_nvfp4_generic_calls++;g_nvfp4_fallback_native_unavailable++;return 1;
+    return 1;
 }
 
 extern "C" void coli_cuda_nvfp4_stats(uint64_t *native_calls,uint64_t *generic_calls,
@@ -863,6 +897,12 @@ extern "C" void coli_cuda_nvfp4_stats(uint64_t *native_calls,uint64_t *generic_c
     if(generic_calls)*generic_calls=g_nvfp4_generic_calls;
     if(fallback_native_unavailable)*fallback_native_unavailable=g_nvfp4_fallback_native_unavailable;
     if(failures)*failures=g_nvfp4_failures;
+}
+extern "C" void coli_cuda_nvfp4_fallback_stats(uint64_t *shape,uint64_t *rejected,
+        uint64_t *launch){
+    if(shape)*shape=g_nvfp4_fallback_shape;
+    if(rejected)*rejected=g_nvfp4_fallback_rejected;
+    if(launch)*launch=g_nvfp4_fallback_launch;
 }
 
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
@@ -889,10 +929,6 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) {
         if(gate->fmt==COLI_TENSOR_MODELOPT_NVFP4)g_nvfp4_failures++;
         return 0;
-    }
-    if(gate->fmt==COLI_TENSOR_MODELOPT_NVFP4){
-        g_nvfp4_generic_calls++;
-        g_nvfp4_fallback_native_unavailable++;
     }
     return 1;
 }

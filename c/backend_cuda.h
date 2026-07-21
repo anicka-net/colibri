@@ -75,6 +75,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT void coli_cuda_nvfp4_stats(uint64_t *native_calls,
                      uint64_t *generic_calls, uint64_t *fallback_native_unavailable,
                      uint64_t *failures);
+COLI_CUDA_DLLEXPORT void coli_cuda_nvfp4_fallback_stats(uint64_t *shape,
+                     uint64_t *rejected, uint64_t *launch);
 
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in

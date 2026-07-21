@@ -65,6 +65,7 @@ typedef int            (*fn_matmul_nvfp4)(ColiCudaTensor **tensor, float *y, con
                                           int S, int I, int O, int device);
 typedef void           (*fn_nvfp4_stats)(uint64_t *native_calls, uint64_t *generic_calls,
                                          uint64_t *fallback_native_unavailable, uint64_t *failures);
+typedef void           (*fn_nvfp4_fallback_stats)(uint64_t *shape,uint64_t *rejected,uint64_t *launch);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
@@ -157,6 +158,7 @@ static struct {
     fn_matmul          matmul;
     fn_matmul_nvfp4    matmul_nvfp4;
     fn_nvfp4_stats     nvfp4_stats;
+    fn_nvfp4_fallback_stats nvfp4_fallback_stats;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
@@ -273,6 +275,7 @@ static int coli_cuda_load(void){
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(matmul_nvfp4,   fn_matmul_nvfp4)
     RESOLVE(nvfp4_stats,    fn_nvfp4_stats)
+    RESOLVE(nvfp4_fallback_stats, fn_nvfp4_fallback_stats)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     RESOLVE(tensor_device,  fn_tensor_device)
@@ -454,6 +457,11 @@ void coli_cuda_nvfp4_stats(uint64_t *native_calls, uint64_t *generic_calls,
         if(failures)*failures=0; return;
     }
     g_cuda.nvfp4_stats(native_calls,generic_calls,fallback_native_unavailable,failures);
+}
+
+void coli_cuda_nvfp4_fallback_stats(uint64_t *shape,uint64_t *rejected,uint64_t *launch){
+    if(!g_cuda.available){if(shape)*shape=0;if(rejected)*rejected=0;if(launch)*launch=0;return;}
+    g_cuda.nvfp4_fallback_stats(shape,rejected,launch);
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){

@@ -147,6 +147,8 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 endif
 CUDA_ARCH ?= native
+NVFP4_NATIVE ?= 0
+CUTLASS_DIR ?= ../third_party/cutlass
 ifneq ($(IS_WIN),)
 # nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
 # -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
@@ -156,6 +158,9 @@ ifneq ($(IS_WIN),)
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-W3
 else
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+endif
+ifeq ($(NVFP4_NATIVE),1)
+NVCCFLAGS += --expt-relaxed-constexpr -DCOLI_CUTLASS_NVFP4 -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include
 endif
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
@@ -231,7 +236,7 @@ coli-native$(EXE): coli_native.c native_server.c native_server.h native_plan.c n
 # it ONLY when they change (evaluated here at parse time, so the file's timestamp
 # moves exactly when the config moves). glm.exe and the CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|NVFP4_NATIVE=$(NVFP4_NATIVE)|CUTLASS_DIR=$(CUTLASS_DIR)|METAL=$(METAL)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 $(shell printf '%s' '$(BUILD_CONFIG)' > .build-config)
@@ -250,14 +255,14 @@ backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu backend_cuda.h
+cuda-dll: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
 		backend_cuda.cu -o coli_cuda.dll
 
-backend_cuda.o: backend_cuda.cu backend_cuda.h .build-config
+backend_cuda.o: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda.cu -o $@
 
@@ -268,7 +273,7 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 	$(METALXX) tests/test_backend_metal.mm backend_metal.mm -framework Metal -framework Foundation -o backend_metal_test
 	./backend_metal_test
 
-cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh tests/test_backend_cuda.cu
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -DCOLI_CUDA_TEST backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)

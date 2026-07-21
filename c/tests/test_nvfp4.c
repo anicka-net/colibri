@@ -26,7 +26,7 @@ int main(void) {
     enum { O = 131, I = 17, RB = 9, GROUPS = 2 };
     uint8_t packed[O * RB], row_scales[O * GROUPS];
     uint8_t cutlass_scales[1024];
-    float x[I], row_y[O], cutlass_y[O];
+    float x[I], row_y[O], cutlass_y[O], w4a4_y[O];
     memset(packed, 0, sizeof(packed));
     memset(cutlass_scales, 0, sizeof(cutlass_scales));
     for (int i = 0; i < I; i++) x[i] = (float)(i - 8) / 8.0f;
@@ -46,9 +46,12 @@ int main(void) {
         !coli_matmul_nvfp4_w4a32_ref(cutlass_y,x,packed,cutlass_scales,.25f,
                                      COLI_SCALE_CUTLASS_SM1XX_128X4,1,I,O)) return 5;
     for (int o = 0; o < O; o++) if (!near(row_y[o], cutlass_y[o])) return 6;
+    if (!coli_matmul_nvfp4_w4a4_ref(w4a4_y,x,packed,cutlass_scales,.25f,.5f,
+                                     COLI_SCALE_CUTLASS_SM1XX_128X4,1,I,O)) return 7;
+    for(int o=0;o<O;o++)if(!isfinite(w4a4_y[o]))return 8;
     row_scales[0] = 0;
     if (coli_matmul_nvfp4_w4a32_ref(row_y,x,packed,row_scales,.25f,
-                                    COLI_SCALE_ROW_MAJOR_G16,1,I,O)) return 7;
+                                    COLI_SCALE_ROW_MAJOR_G16,1,I,O)) return 9;
     puts("nvfp4 reference: ok");
     return 0;
 }
