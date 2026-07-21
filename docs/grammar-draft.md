@@ -1,5 +1,8 @@
 # Grammar-forced speculative drafts
 
+For the separate proposal that *constrains* sampling only after a model emits
+`<tool_call>`, see [Constrained decoding for tool calls](tool-call-grammar-plan.md).
+
 *The canonical reference for the `GRAMMAR=` draft source (method F). History: idea in
 [#48](https://github.com/JustVugg/colibri/issues/48), implementation in
 [#70](https://github.com/JustVugg/colibri/pull/70), consolidated write-up with A/B

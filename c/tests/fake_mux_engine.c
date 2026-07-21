@@ -73,6 +73,17 @@ int main(void) {
         printf("DATA %llu 1\n\xc3\n", id);
         printf("DATA %llu 1\n\xa9\n", id);
         reply = NULL;
+      } else if (strstr(prompt, "two malformed orphan tool values")) {
+        const char *malformed =
+            "<tool_call>lookup</arg_value>bird</arg_value></tool_call>"
+            "<tool_call>lookup</arg_value>tern</arg_value></tool_call>";
+        printf("DATA %llu %zu\n%s\n", id, strlen(malformed), malformed);
+        reply = NULL;
+      } else if (strstr(prompt, "malformed orphan tool value")) {
+        const char *malformed =
+            "<tool_call>lookup</arg_value>bird</arg_value></tool_call>";
+        printf("DATA %llu %zu\n%s\n", id, strlen(malformed), malformed);
+        reply = NULL;
       } else if (strstr(prompt, "fragmented tool")) {
         const char *parts[] = {
             "Before ", "<tool_", "call>lookup<arg_key>q</arg_key><arg_",

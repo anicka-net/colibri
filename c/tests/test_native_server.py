@@ -525,7 +525,25 @@ class NativeServerTest(unittest.TestCase):
         self.assertIn('"type":"response.function_call_arguments.delta"',
                       stream)
         self.assertIn('"delta":"{\\"q\\":\\"bird\\"}"', stream)
+        self.assertIn('"type":"response.output_item.added"', stream)
+        self.assertIn('"arguments":""', stream)
+        self.assertIn('"type":"response.function_call_arguments.done"', stream)
+        self.assertIn('"arguments":"{\\"q\\":\\"bird\\"}"', stream)
+        self.assertIn('"type":"response.output_item.done"', stream)
         self.assertNotIn("<tool_", stream)
+        payloads = [json.loads(line[len("data: "):])
+                    for line in stream.splitlines()
+                    if line.startswith("data: {")]
+        lifecycle = [event["type"] for event in payloads
+                     if event["type"].startswith("response.output_item") or
+                     event["type"].startswith(
+                         "response.function_call_arguments")]
+        self.assertEqual(lifecycle, [
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+        ])
 
         with self.request("/api/chat", {
             "model": "glm-test", "messages": [{"role": "user",
@@ -538,6 +556,29 @@ class NativeServerTest(unittest.TestCase):
                  if e.get("message", {}).get("tool_calls")]
         self.assertEqual(calls[0][0]["function"]["arguments"], {"q": "bird"})
         self.assertTrue(events[-1]["done"])
+
+        required_tool = {"type": "function", "function": {"name": "lookup",
+            "parameters": {"type": "object", "properties": {
+                "q": {"type": "string"}}, "required": ["q"]}}}
+        with self.request("/v1/chat/completions", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "malformed orphan tool value"}],
+            "tools": [required_tool], "reasoning_effort": "none",
+        }) as response:
+            result = json.load(response)
+        call = result["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         {"q": "bird"})
+
+        with self.request("/v1/chat/completions", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "two malformed orphan tool values"}],
+            "tools": [required_tool], "reasoning_effort": "none",
+        }) as response:
+            result = json.load(response)
+        calls = result["choices"][0]["message"]["tool_calls"]
+        self.assertEqual([json.loads(call["function"]["arguments"])
+                          for call in calls], [{"q": "bird"}, {"q": "tern"}])
 
     def test_anthropic_stream_retains_split_utf8_tail(self):
         with self.request("/v1/messages", {

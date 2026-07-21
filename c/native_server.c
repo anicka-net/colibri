@@ -1249,6 +1249,22 @@ static int tool_has_param(jval *tools, const char *name, const char *key) {
   }
   return 0;
 }
+static const char *tool_single_required_param(jval *tools, const char *name) {
+  jval *tool = find_tool(tools, name);
+  if (!tool)
+    return NULL;
+  jval *f = tool_function(tool);
+  jval *schema = jget(f, "parameters");
+  if (!schema)
+    schema = jget(f, "input_schema");
+  jval *required = jget(schema, "required"), *properties = jget(schema, "properties");
+  if (!required || required->t != J_ARR || required->len != 1 ||
+      !required->kids[0] || required->kids[0]->t != J_STR ||
+      !properties || properties->t != J_OBJ ||
+      !jget(properties, required->kids[0]->str))
+    return NULL;
+  return required->kids[0]->str;
+}
 /* GLM occasionally uses its learned Python-like tool syntax even when the
  * prompt requests the XML argument dialect, for example:
  *
@@ -1432,6 +1448,29 @@ static int parse_tool_calls(const char *raw, jval *tools, buf *content,
         free(key);
         q = vc + 12;
       }
+      /* A quantized model can retain the value while corrupting the opening
+       * argument tags, e.g. bash</arg_value>command</arg_value>. Recover only
+       * when the schema makes the mapping unambiguous: exactly one required
+       * parameter and exactly one orphaned value. */
+      if (!argc) {
+        while (q < end && isspace((unsigned char)*q))
+          q++;
+        static const char orphan[] = "</arg_value>";
+        if ((size_t)(end - q) > sizeof(orphan) - 1 &&
+            !memcmp(q, orphan, sizeof(orphan) - 1)) {
+          const char *vs = q + sizeof(orphan) - 1;
+          const char *vc = strstr(vs, orphan);
+          const char *key = tool_single_required_param(tools, c->name);
+          const char *extra = vc ? strstr(vc + sizeof(orphan) - 1, orphan) : NULL;
+          if (vc && vc < end && key && (!extra || extra >= end)) {
+            b_json(&c->args, key);
+            b_add(&c->args, ":");
+            emit_tool_arg(&c->args, vs, (size_t)(vc - vs),
+                          tool_param_type(tools, c->name, key));
+            argc = 1;
+          }
+        }
+      }
       b_add(&c->args, "}");
       n++;
     }
@@ -1457,7 +1496,7 @@ typedef int (*semantic_emit_fn)(void *opaque, semantic_kind kind,
 typedef struct {
   int thinking, failed, tool_count;
   jval *tools;
-  buf pending;
+  buf pending, raw_debug;
   semantic_emit_fn emit;
   void *opaque;
 } semantic_stream;
@@ -1522,6 +1561,8 @@ static int semantic_feed(semantic_stream *s, const char *data, size_t n) {
   static const char tool_end[] = "</tool_call>";
   if (s->failed)
     return 1;
+  if (http_debug_enabled())
+    b_addn(&s->raw_debug, data, n);
   b_addn(&s->pending, data, n);
   for (;;) {
     if (s->thinking) {
@@ -1582,6 +1623,13 @@ static int semantic_feed(semantic_stream *s, const char *data, size_t n) {
   }
 }
 static int semantic_finish(semantic_stream *s) {
+  if (http_debug_enabled() && s->raw_debug.p) {
+    buf quoted = {0};
+    b_json(&quoted, s->raw_debug.p);
+    fprintf(stderr, "[http] raw_generation=%s\n", quoted.p);
+    fflush(stderr);
+    b_free(&quoted);
+  }
   if (s->failed)
     return 1;
   if (s->thinking)
@@ -1606,7 +1654,10 @@ static int semantic_finish(semantic_stream *s) {
   }
   return semantic_emit_bytes(s, SEM_TEXT, s->pending.n);
 }
-static void semantic_free(semantic_stream *s) { b_free(&s->pending); }
+static void semantic_free(semantic_stream *s) {
+  b_free(&s->pending);
+  b_free(&s->raw_debug);
+}
 
 static int render_anthropic(buf *out, jval *body, int thinking) {
   b_add(out, "[gMASK]<sop>");
@@ -2420,14 +2471,55 @@ static int responses_semantic_emit(void *opaque, semantic_kind kind,
     return 1;
   buf event = {0};
   if (kind == SEM_TOOL) {
+    int index = stream->semantic.tool_count;
+    b_add(&event, "{\"type\":\"response.output_item.added\",\"output_index\":");
+    b_printf(&event, "%d,\"item\":{\"type\":\"function_call\",\"id\":", index);
+    b_json(&event, call->id);
+    b_add(&event, ",\"call_id\":");
+    b_json(&event, call->id);
+    b_add(&event, ",\"name\":");
+    b_json(&event, call->name);
+    b_add(&event, ",\"arguments\":\"\",\"status\":\"in_progress\"}}");
+    if (responses_event(stream, &event)) {
+      b_free(&event);
+      return 1;
+    }
+    b_free(&event);
+
     b_add(&event,
           "{\"type\":\"response.function_call_arguments.delta\",\"delta\":");
     b_json(&event, call->args.p ? call->args.p : "{}");
-    b_add(&event, ",\"name\":");
-    b_json(&event, call->name);
+    b_add(&event, ",\"item_id\":");
+    b_json(&event, call->id);
+    b_printf(&event, ",\"output_index\":%d}", index);
+    if (responses_event(stream, &event)) {
+      b_free(&event);
+      return 1;
+    }
+    b_free(&event);
+
+    b_add(&event,
+          "{\"type\":\"response.function_call_arguments.done\",\"arguments\":");
+    b_json(&event, call->args.p ? call->args.p : "{}");
+    b_add(&event, ",\"item_id\":");
+    b_json(&event, call->id);
+    b_printf(&event, ",\"output_index\":%d}", index);
+    if (responses_event(stream, &event)) {
+      b_free(&event);
+      return 1;
+    }
+    b_free(&event);
+
+    b_add(&event, "{\"type\":\"response.output_item.done\",\"output_index\":");
+    b_printf(&event, "%d,\"item\":{\"type\":\"function_call\",\"id\":", index);
+    b_json(&event, call->id);
     b_add(&event, ",\"call_id\":");
     b_json(&event, call->id);
-    b_add(&event, "}");
+    b_add(&event, ",\"name\":");
+    b_json(&event, call->name);
+    b_add(&event, ",\"arguments\":");
+    b_json(&event, call->args.p ? call->args.p : "{}");
+    b_add(&event, ",\"status\":\"completed\"}}");
   } else {
     b_add(&event, kind == SEM_REASONING
                       ? "{\"type\":\"response.reasoning_text.delta\",\"delta\":"
