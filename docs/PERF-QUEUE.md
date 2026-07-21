@@ -92,10 +92,11 @@ Longer-term, genuinely concurrent rows still need a resident ragged chain:
 Both direct CX7 cables recovered after the physical power cycle and negotiate
 200 Gb/s.  One stream sustains 105.3/105.0 Gb/s RDMA write on the two ports;
 the addressed port sustains 80.6 Gb/s RDMA read.  Concurrent writes deliver
-92.55 + 91.59 = **184.14 Gb/s (23.02 GB/s)** in either host direction.
-Two-byte RDMA write latency is 1.47 us typical, 1.55 us p99, 1.90 us p99.9.
-The current netdev MTU exposes RDMA MTU 1024, so jumbo-frame configuration may
-raise the ceiling further.
+92.55 + 91.59 = **184.14 Gb/s (23.02 GB/s)**; concurrent reads deliver
+74.72 + 74.72 = **149.44 Gb/s (18.68 GB/s)**.  Both aggregates reproduce in
+either host direction.  Two-byte RDMA write latency is 1.47 us typical,
+1.55 us p99, 1.90 us p99.9.  The current netdev MTU exposes RDMA MTU 1024, so
+jumbo-frame configuration may raise the ceiling further.
 
 Recipe: `rocep1s0f1` uses RoCEv2 GID 3 and the 169.254/16 link-local addresses.
 `roceP2p1s0f1` has no IP address and uses RoCEv1 GID 0; perftest's TCP control
