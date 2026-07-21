@@ -1360,7 +1360,7 @@ static int g_xcrc=0;          /* COLI_DBG_XCRC=1: hash FNV del residuo per layer
 static void xcrc_emit(int layer,const float *src,int S,int D){
     uint64_t h=1469598103934665603ULL;
     const unsigned char *b=(const unsigned char*)src;
-    for(size_t z=0;z<(size_t)S*D*4;z+=64){ h^=b[z]; h*=1099511628211ULL; }
+    for(size_t z=0;z<(size_t)S*D*4;z++){ h^=b[z]; h*=1099511628211ULL; }
     double t2=0; for(int s=S>4?S-4:0;s<S;s++){ double n2=0;
         for(int j=0;j<D;j+=8){ float v=src[(int64_t)s*D+j]; n2+=(double)v*v; }
         t2+=n2; }
@@ -1899,9 +1899,13 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
 }
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
-    /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
-     * Keep its tier assignment, but invalidate the old device weights. */
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+    /* ws[] slots are shared across layers.  The same eid in another layer may
+     * have different tensor offsets inside the slab, so every reload must
+     * invalidate host wrappers that retain the old weight/scale pointers.
+     * Device-tier tensors keep their allocation for REPIN's in-place update. */
+    if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
+    if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
+    if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
@@ -2144,7 +2148,9 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     if(g_mmap || !st_has(&m->S,qn))
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
 #ifdef COLI_CUDA
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+    if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
+    if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
+    if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
@@ -6138,7 +6144,7 @@ static void repin_adapt(Model *m,int limit){
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
-            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            if(qt_cuda_update(&s->g) && qt_cuda_update(&s->u) && qt_cuda_update(&s->d)){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);

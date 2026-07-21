@@ -104,7 +104,7 @@ channel can use the management address while RDMA data stays on that device.
 The direct transport is fast enough to justify a remote expert-cache/compute
 prototype; the remaining question is scheduling and transfer granularity.
 
-### Remote complete-layer tier (measured 2026-07-21) — CLEARS GATE
+### Remote complete-layer tier (measured 2026-07-21) — DECODE WIN, LONG E2E MISSES
 
 The smallest exact integration assigns six complete sparse layers (4–9) to
 deepthought. Those layers had the weakest historical coverage in
@@ -115,19 +115,45 @@ and pondermatic applies the existing router weights in the existing union
 order. The worker uses registered host buffers and the existing grouped CUDA
 ABI; no GPUDirect or general scheduler.
 
-Two order-reversed runs used the same 43-token prompt, frozen `.coli_usage`,
-PIPE2, TC gather off, and a forced exact 128-token continuation:
+The first forced-replay benchmark appeared to clear the gate, but the
+subsequent unforced control exposed a pre-existing local correctness bug.
+CUDA expert wrappers in shared `ws[]` slots were invalidated only when the
+expert id changed. The same id in a different layer could therefore retain
+weight and scale pointers into the previous layer's slab, making ordinary
+local output cache-history-dependent. Remote execution changed that history
+and exposed the fault.
+
+The fix resets every non-device CUDA wrapper on reload in both the pread and
+io_uring loaders. REPIN keeps true VRAM allocations and refreshes them with
+the existing in-place update API. An aggressive `REPIN=1` smoke completed 51
+VRAM swaps without failure and reproduced the normal 16-token trajectory.
+
+Four independent unforced 128-token runs used the same 43-token prompt,
+frozen `.coli_usage`, PIPE2, and TC gather off:
 
 | Order | Local wall | Remote wall | Gain | Local p50 | Remote p50 |
 |---|---:|---:|---:|---:|---:|
-| off → on | 127.10 s | 117.30 s | **7.7%** | 693.1 ms | 607.0 ms |
-| on → off | 125.29 s | 117.60 s | **6.1%** | 688.1 ms | 610.9 ms |
+| off1 → on1 | 121.12 s | 115.58 s | **4.6%** | 684.2 ms | 616.8 ms |
+| off2 → on2 | 123.32 s | 114.20 s | **7.4%** | 679.6 ms | 617.1 ms |
 
-Both sides replayed 128/128 exact tokens. Mean wall gain is **6.9%** and mean
-p50 gain **11.8%**. The remote worker served 762 layer calls / 6,096 expert
-rows per run at 683–684 us CUDA compute and 720 us end-to-end per call, with
-zero fallback. Expert-read wait fell from a mean 85.0 s to 75.3 s while
-pondermatic's CUDA resident set stayed fixed at 39.18 GB.
+All four greedy trajectories were token-identical. Mean wall gain was
+**6.0%**. Each remote run served 762 layer calls / 6,096 expert rows at about
+726 us end to end per call, with zero fallback.
+
+The production-shaped 2,701-token prompt changes the verdict. Two
+order-reversed forced-replay pairs measured:
+
+| Order | Local wall | Remote wall | Gain | Local p50 | Remote p50 |
+|---|---:|---:|---:|---:|---:|
+| off1 → on1 | 382.19 s | 374.89 s | **1.9%** | 884.7 ms | 811.8 ms |
+| on2 → off2 | 383.42 s | 372.32 s | **2.9%** | 882.3 ms | 802.2 ms |
+
+Remote decode p50 improved by 8–9%, but the local 2,701-token prefill
+dominates total wall time because the fixed worker protocol handles only
+`S<=4`. Mean end-to-end gain was **2.4%**, below the 5% production gate.
+Production therefore remains on the local known-good build. The remote tier
+is a validated decode optimization, but deployment requires either remote
+prefill support or a workload gate that is explicitly decode-heavy.
 
 Control: doubling pondermatic's local expert tier from 30 to 60 GB improved
 p50 876.7→770.4 ms and cut read wait 113.7→95.5 s, but orchestration rose
