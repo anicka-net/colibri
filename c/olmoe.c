@@ -358,6 +358,25 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
+    /* SEC: st_init skips its numel*esz==nbytes cross-check for dtype-3 (U8/I8)
+     * tensors, so a crafted header from an untrusted mirror can declare nbytes
+     * far larger than the config-sized destination and st_read_raw would write
+     * past w_block (heap overflow); an oversized .qs likewise overruns s->gs.
+     * slot_ensure_allocated sizes those buffers exactly ng+ng+nd bytes and
+     * inter+inter+hidden floats, so require an exact match. Reject, never
+     * repair — same contract as qt_resolve_fmt in the GLM engine. */
+    Cfg *cc = &m->c;
+    int64_t ng = (int64_t)cc->inter * cc->hidden, nd = (int64_t)cc->hidden * cc->inter;
+    int64_t want_w = ng + ng + nd;
+    int64_t want_s = (int64_t)cc->inter + cc->inter + cc->hidden;
+    st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
+    if (!tw || tw->nbytes != want_w) {
+        fprintf(stderr, "%s: expert weight is %lld bytes — expected %lld for [inter=%d,hidden=%d], "
+                "refusing (untrusted container)\n", nm, (long long)(tw ? tw->nbytes : -1),
+                (long long)want_w, cc->inter, cc->hidden); exit(1); }
+    if (!ts || ts->numel != want_s) {
+        fprintf(stderr, "%s: scale array is %lld elems — expected %lld, refusing (untrusted container)\n",
+                qsnm, (long long)(ts ? ts->numel : -1), (long long)want_s); exit(1); }
     st_read_raw(&m->S, nm, s->g, 1);
     st_read_f32(&m->S, qsnm, s->gs, 0);  /* scales are F32; use typed reader for dtype safety */
 }
