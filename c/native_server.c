@@ -2991,7 +2991,8 @@ static void *client_main(void *arg) {
     ollama_generate(s, fd, body, 0);
   else if (!strcmp(r.path, "/api/show"))
     send_body(fd, 200, "application/json",
-              "{\"capabilities\":[\"completion\",\"tools\",\"thinking\"]}", 58,
+              "{\"capabilities\":[\"completion\",\"tools\",\"thinking\"]}",
+              sizeof("{\"capabilities\":[\"completion\",\"tools\",\"thinking\"]}") - 1,
               NULL);
   else
     api_error(fd, 404, "Not found.");

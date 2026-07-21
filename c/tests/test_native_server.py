@@ -196,6 +196,10 @@ class NativeServerTest(unittest.TestCase):
             model = json.load(response)["models"][0]
             self.assertEqual(model["name"], "glm-test")
             self.assertRegex(model["digest"], r"^sha256:[0-9a-f]{64}$")
+        with self.request("/api/show", {"model": "glm-test"}) as response:
+            shown = json.load(response)
+        self.assertIn("completion", shown["capabilities"])
+        self.assertIn("tools", shown["capabilities"])
 
     def test_profile_collects_engine_telemetry(self):
         with self.request("/v1/completions", {"model": "glm-test", "prompt": "x"}):
