@@ -681,7 +681,9 @@ class HTTPTest(unittest.TestCase):
         with self.request("/api/version") as response:
             self.assertTrue(json.load(response)["version"].startswith("colibri-"))
         with self.request("/api/tags") as response:
-            self.assertEqual(json.load(response)["models"][0]["name"], "test-model")
+            model = json.load(response)["models"][0]
+            self.assertEqual(model["name"], "test-model")
+            self.assertRegex(model["digest"], r"^sha256:[0-9a-f]{64}$")
         with self.request("/api/ps") as response:
             self.assertEqual(json.load(response)["models"][0]["model"], "test-model")
         with self.request("/api/show", {"model": "test-model"}) as response:

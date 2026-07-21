@@ -193,7 +193,9 @@ class NativeServerTest(unittest.TestCase):
         self.assertTrue(ollama["done"])
         self.assertEqual(ollama["message"]["content"], "Hello from C")
         with self.request("/api/tags") as response:
-            self.assertEqual(json.load(response)["models"][0]["name"], "glm-test")
+            model = json.load(response)["models"][0]
+            self.assertEqual(model["name"], "glm-test")
+            self.assertRegex(model["digest"], r"^sha256:[0-9a-f]{64}$")
 
     def test_profile_collects_engine_telemetry(self):
         with self.request("/v1/completions", {"model": "glm-test", "prompt": "x"}):

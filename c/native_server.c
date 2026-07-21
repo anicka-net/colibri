@@ -2584,6 +2584,11 @@ static void responses(server *s, int fd, jval *body) {
 }
 
 static void ollama_discovery(server *s, int fd, int ps) {
+  /* Ollama's list command abbreviates digests with digest[:12].  Keep this a
+     full, sha256-shaped value even though Colibri does not manage Ollama
+     manifests, so older clients do not panic on a short compatibility ID. */
+  static const char digest[] =
+      "sha256:636f6c6962726900000000000000000000000000000000000000000000000000";
   buf b = {0};
   b_add(&b, "{\"models\":[{");
   if (ps) {
@@ -2591,17 +2596,19 @@ static void ollama_discovery(server *s, int fd, int ps) {
     b_json(&b, s->c.model_id);
     b_add(&b, ",\"model\":");
     b_json(&b, s->c.model_id);
-    b_add(&b, ",\"size\":0,\"digest\":\"colibri\",\"expires_at\":\"9999-12-"
-              "31T23:59:59Z\",\"size_vram\":0");
+    b_add(&b, ",\"size\":0,\"digest\":");
+    b_json(&b, digest);
+    b_add(&b, ",\"expires_at\":\"9999-12-31T23:59:59Z\",\"size_vram\":0");
   } else {
     b_add(&b, "\"name\":");
     b_json(&b, s->c.model_id);
     b_add(&b, ",\"model\":");
     b_json(&b, s->c.model_id);
+    b_add(&b, ",\"modified_at\":\"1970-01-01T00:00:00Z\",\"size\":0,\"digest\":");
+    b_json(&b, digest);
     b_add(&b,
-          ",\"modified_at\":\"1970-01-01T00:00:00Z\",\"size\":0,\"digest\":"
-          "\"colibri\",\"details\":{\"format\":\"safetensors\",\"family\":"
-          "\"glm\",\"parameter_size\":\"744B\",\"quantization_level\":\"Q4\"}");
+          ",\"details\":{\"format\":\"safetensors\",\"family\":\"glm\","
+          "\"parameter_size\":\"744B\",\"quantization_level\":\"Q4\"}");
   }
   b_add(&b, "}]}");
   send_json(fd, 200, &b);

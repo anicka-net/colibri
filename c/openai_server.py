@@ -1214,7 +1214,11 @@ class APIHandler(BaseHTTPRequestHandler):
                     self.server.created, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
                 models = [{"name": model_id, "model": model_id,
                            "modified_at": created_at, "size": 0,
-                           "digest": "colibri", "details": {
+                           # Ollama's CLI slices the first 12 digest bytes when
+                           # rendering `ollama list`; short IDs panic in older
+                           # releases.
+                           "digest": "sha256:636f6c6962726900000000000000000000000000000000000000000000000000",
+                           "details": {
                                "format": "colibri", "family": "glm", "families": ["glm"],
                                "parameter_size": "744B", "quantization_level": "Q4"}}
                           for model_id in self.server.model_ids]
