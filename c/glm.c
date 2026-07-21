@@ -61,6 +61,8 @@
 #include "group_plan.h"
 #include "serve_limit.h"
 #include "expert_vram_plan.h"
+#include "nvfp4.h"
+#include "snapshot_manifest.h"
 #ifdef _OPENMP
 #include <omp.h>                                  /* scratch per-thread nell'attention */
 #else
@@ -108,14 +110,13 @@ typedef struct {
     float eps, theta, attn_scale, routed_scale;
 } Cfg;
 
-/* tensore [O,I] in uno di tre formati:
- *   fmt=0 F32   -> qf
- *   fmt=1 INT8  -> q8 (1 byte/param) + scala per riga
- *   fmt=2 INT4  -> q4 (2 valori per byte, impacchettati) + scala per riga
- * INT4 e' cio' che fa stare la densa residente nei 15 GB (0.5 byte/param). */
-/* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
+/* Tensor format is explicit and shared with the CUDA ABI. Legacy snapshots
+ * retain formats 0..4; manifest snapshots may additionally carry BF16 or
+ * native ModelOpt NVFP4. */
 typedef struct {
-    int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    int fmt; float *qf; int8_t *q8; uint8_t *q4; uint16_t *bf16;
+    float *s; uint8_t *block_scales; float tensor_scale, input_scale;
+    int O, I, gs, scale_layout;  /* gs=group size (0=per-row, 16=NVFP4, 128=grouped) */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -123,10 +124,17 @@ typedef struct {
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
-    if(t->fmt==0) return n*4;
-    if(t->fmt==1) return n + (int64_t)t->O*4;
-    if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
-    if(t->fmt==4){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
+    if(t->fmt==COLI_TENSOR_F32) return n*4;
+    if(t->fmt==COLI_TENSOR_BF16) return n*2;
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4){
+        int64_t sb=t->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4
+            ?(int64_t)coli_nvfp4_cutlass_scale_bytes(t->O,t->I)
+            :(int64_t)t->O*((t->I+15)/16);
+        return (int64_t)t->O*((t->I+1)/2)+sb+8;
+    }
+    if(t->fmt==COLI_TENSOR_INT8_ROW) return n + (int64_t)t->O*4;
+    if(t->fmt==COLI_TENSOR_INT2_ROW) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
+    if(t->fmt==COLI_TENSOR_INT4_GROUP){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
         int ng=(t->I+t->gs-1)/t->gs;
         return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
@@ -185,7 +193,7 @@ typedef struct {
 } DecodeRow;
 
 typedef struct {
-    Cfg c; shards S;
+    Cfg c; shards S; ColiSnapshotManifest manifest;
     int ebits, dbits;                            /* bit expert / bit densa */
     QT embed, lm_head; float *final_norm;
     Layer *L;
@@ -263,12 +271,19 @@ static void qt_cuda_reset(QT *t){
     t->cuda_failed=0;
 }
 static int qt_cuda_upload(QT *t){
-    const void *weights = t->fmt==0 ? (const void*)t->qf
-                        : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4)
+        return coli_cuda_tensor_upload_nvfp4(&t->cuda,t->q4,t->block_scales,
+            t->tensor_scale,t->input_scale,t->scale_layout,t->I,t->O,t->cuda_device);
+    const void *weights = t->fmt==COLI_TENSOR_F32 ? (const void*)t->qf
+                        : t->fmt==COLI_TENSOR_INT8_ROW ? (const void*)t->q8
+                        : t->fmt==COLI_TENSOR_BF16 ? (const void*)t->bf16 : (const void*)t->q4;
     return coli_cuda_tensor_upload(&t->cuda,weights,t->s,t->fmt,t->I,t->O,t->cuda_device);
 }
 static int qt_cuda_wrap_host(QT *t,int device){
     if(t->cuda)return 1;
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4){t->cuda_device=device;
+        return coli_cuda_tensor_wrap_host_nvfp4(&t->cuda,t->q4,t->block_scales,
+            t->tensor_scale,t->input_scale,t->scale_layout,t->I,t->O,device);}
     const void *weights=t->fmt==1?(const void*)t->q8:
                         t->fmt==2?(const void*)t->q4:NULL;
     if(!weights||!t->s)return 0;
@@ -276,8 +291,11 @@ static int qt_cuda_wrap_host(QT *t,int device){
     return coli_cuda_tensor_wrap_host(&t->cuda,weights,t->s,t->fmt,t->I,t->O,device);
 }
 static int qt_cuda_update(QT *t){
-    const void *weights=t->fmt==0?(const void*)t->qf:
-                        t->fmt==1?(const void*)t->q8:(const void*)t->q4;
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4)
+        return coli_cuda_tensor_update_nvfp4(t->cuda,t->q4,t->block_scales,t->tensor_scale,t->input_scale);
+    const void *weights=t->fmt==COLI_TENSOR_F32?(const void*)t->qf:
+                        t->fmt==COLI_TENSOR_INT8_ROW?(const void*)t->q8:
+                        t->fmt==COLI_TENSOR_BF16?(const void*)t->bf16:(const void*)t->q4;
     return coli_cuda_tensor_update(t->cuda,weights,t->s);
 }
 static void cuda_stats_print(void){
@@ -303,6 +321,9 @@ static void cuda_stats_print(void){
       if(p)fprintf(stderr,"[CUDA] VRAM expert cache: %llu promotion, %llu eviction, "
           "%.2f GB uploaded in %.1f ms\n",(unsigned long long)p,(unsigned long long)e,
           ub/1e9,us/1e3); }
+    {uint64_t n=0,g=0,f=0,e=0;coli_cuda_nvfp4_stats(&n,&g,&f,&e);
+      if(n||g||f||e)fprintf(stderr,"[CUDA] NVFP4: native %llu | generic %llu | native-unavailable %llu | failures %llu\n",
+        (unsigned long long)n,(unsigned long long)g,(unsigned long long)f,(unsigned long long)e);}
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -1103,15 +1124,29 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * this cache. Nested OpenMP calls stay on CPU because each device context
      * intentionally owns one synchronous scratch stream in this stage. */
     if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && !omp_in_parallel()){
-        const void *weights = w->fmt==0 ? (const void*)w->qf
-                            : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+        if(w->fmt==COLI_TENSOR_MODELOPT_NVFP4){
+            if(coli_cuda_matmul_nvfp4(&w->cuda,y,x,w->q4,w->block_scales,w->tensor_scale,
+                    w->input_scale,w->scale_layout,S,w->I,w->O,w->cuda_device))return;
+            w->cuda_failed=1;fprintf(stderr,"[CUDA] native NVFP4 tensor [%d,%d] disabled after backend failure\n",w->O,w->I);
+        }else{
+        const void *weights = w->fmt==COLI_TENSOR_F32 ? (const void*)w->qf
+                            : w->fmt==COLI_TENSOR_INT8_ROW ? (const void*)w->q8
+                            : w->fmt==COLI_TENSOR_BF16 ? (const void*)w->bf16 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device)) return;
         w->cuda_failed=1;
         fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
             w->O,w->I,w->cuda_device);
+        }
     }
 #endif
-    if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
+    if(w->fmt==COLI_TENSOR_F32){ matmul(y,x,w->qf,S,w->I,w->O); return; }
+    if(w->fmt==COLI_TENSOR_BF16){ coli_matmul_bf16_ref(y,x,w->bf16,S,w->I,w->O); return; }
+    if(w->fmt==COLI_TENSOR_MODELOPT_NVFP4){
+        if(!coli_matmul_nvfp4_w4a32_ref(y,x,w->q4,w->block_scales,w->tensor_scale,
+                                       w->scale_layout,S,w->I,w->O)){
+            fprintf(stderr,"invalid native NVFP4 tensor [%d,%d]\n",w->O,w->I); exit(1); }
+        return;
+    }
     /* fmt=4: grouped int4 — always use the exact grouped kernel (no IDOT approximation,
      * since the whole point of grouped scales is better quality). */
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
@@ -1370,7 +1405,9 @@ static float *g_inj_v=NULL;
 static float g_inj_s=1.0f;
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
-    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->bf16=NULL;
+    t->s=NULL; t->block_scales=NULL; t->tensor_scale=0; t->input_scale=0;
+    t->scale_layout=COLI_SCALE_NONE;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
     else if(bits>=3){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
@@ -1571,6 +1608,18 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
             st_read_raw(&m->S,name,t->q4,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         st_read_f32(&m->S,sn,t->s,drop);
+    } else if(m->manifest.present && m->manifest.resident_format==COLI_TENSOR_BF16){
+        st_tensor *src=st_find(&m->S,name);int64_t expected=(int64_t)O*I*2;
+        if(!src||src->dtype!=0||src->nbytes!=expected){
+            fprintf(stderr,"native faithful snapshot requires BF16 tensor %s [%d,%d]\n",name,O,I);exit(1);}
+        if(t->fmt!=COLI_TENSOR_BF16||!t->bf16){
+            t->fmt=COLI_TENSOR_BF16;t->O=O;t->I=I;t->gs=0;
+            t->qf=NULL;t->q8=NULL;t->q4=NULL;t->s=NULL;t->block_scales=NULL;
+            t->bf16=malloc((size_t)expected);if(!t->bf16){fprintf(stderr,"OOM BF16 tensor\n");exit(1);}
+        }
+        st_read_raw(&m->S,name,t->bf16,drop);
+    } else if(m->manifest.present){
+        fprintf(stderr,"native compact snapshot requires explicit INT8 tensor %s and .qs\n",name);exit(1);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32(&m->S,name,t->qf,drop);
@@ -1632,6 +1681,11 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
+    { char error[256]; int rc=coli_manifest_load(snap,&m->manifest,error,sizeof(error));
+      if(rc<0){ fprintf(stderr,"invalid snapshot manifest: %s\n",error); exit(1); }
+      if(rc>0) fprintf(stderr,"[snapshot] v%d native NVFP4, resident %s, source %s@%s\n",
+          m->manifest.version,m->manifest.resident_format==COLI_TENSOR_BF16?"bf16":"int8",
+          m->manifest.repository,m->manifest.revision); }
     load_cfg(&m->c,snap); st_init(&m->S,snap);
     Cfg *c=&m->c; char nm[256]; int H=c->n_heads, D=c->hidden;
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
@@ -1891,6 +1945,85 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     }
     return 0;
 }
+static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288],int fatal){
+    Cfg *c=&m->c; int I=c->moe_inter,D=c->hidden;
+    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+    st_tensor *tw[3],*ts[3],*tt[3],*ti[3]; char side[360];
+    int64_t slab_need=0;
+    for(int k=0;k<3;k++){
+        tw[k]=st_find(&m->S,nm[k]);
+        snprintf(side,sizeof(side),"%.287s.nvfp4_scale",nm[k]);ts[k]=st_find(&m->S,side);
+        snprintf(side,sizeof(side),"%.287s.nvfp4_tensor_scale",nm[k]);tt[k]=st_find(&m->S,side);
+        snprintf(side,sizeof(side),"%.287s.nvfp4_input_scale",nm[k]);ti[k]=st_find(&m->S,side);
+        int64_t wb=(int64_t)OO[k]*((II[k]+1)/2);
+        int64_t sb=(int64_t)coli_nvfp4_cutlass_scale_bytes(OO[k],II[k]);
+        if(!tw[k]||!ts[k]||!tt[k]||!ti[k]||tw[k]->dtype!=3||ts[k]->dtype!=3||
+           tt[k]->dtype!=2||ti[k]->dtype!=2||tw[k]->nbytes!=wb||ts[k]->nbytes!=sb||
+           tt[k]->nbytes!=4||ti[k]->nbytes!=4){
+            fprintf(stderr,"invalid native NVFP4 expert metadata: layer %d expert %d projection %d\n",layer,eid,k);
+            if(fatal)exit(1);return -1;
+        }
+        if(INT64_MAX-slab_need<wb+sb){if(fatal)exit(1);return -1;} slab_need+=wb+sb;
+    }
+    if(!s->slab||slab_need>s->slab_cap){
+#ifdef COLI_METAL
+        if(s->slab&&g_metal_enabled)coli_metal_unregister(s->slab);
+#endif
+        compat_aligned_free(s->slab);s->slab=NULL;s->slab_cap=0;
+        size_t alloc=((size_t)slab_need+4095)&~(size_t)4095;
+        if(posix_memalign((void**)&s->slab,4096,alloc)){fprintf(stderr,"OOM native NVFP4 slab\n");if(fatal)exit(1);return -1;}
+        s->slab_cap=alloc;
+#ifdef COLI_METAL
+        if(g_metal_enabled)coli_metal_register(s->slab,alloc);
+#else
+        numa_slab_bind(s->slab,alloc);
+#endif
+    }
+    if(!s->fslab||s->fslab_cap<6){
+#ifdef COLI_METAL
+        if(s->fslab&&g_metal_enabled)coli_metal_unregister(s->fslab);
+#endif
+        free(s->fslab);s->fslab=malloc(6*sizeof(float));s->fslab_cap=s->fslab?6:0;
+        if(!s->fslab){fprintf(stderr,"OOM native NVFP4 scalar slab\n");if(fatal)exit(1);return -1;}
+#ifdef COLI_METAL
+        if(g_metal_enabled)coli_metal_register(s->fslab,6*sizeof(float));
+#else
+        numa_slab_bind(s->fslab,6*sizeof(float));
+#endif
+    }
+    int64_t pos=0,total=0;
+    for(int k=0;k<3;k++){
+        int64_t wb=tw[k]->nbytes,sb=ts[k]->nbytes;
+        if(pread_full(tw[k]->fd,s->slab+pos,wb,tw[k]->off,"pread NVFP4 weight")){if(fatal)exit(1);return -1;}
+        uint8_t *weight=s->slab+pos;pos+=wb;
+        if(pread_full(ts[k]->fd,s->slab+pos,sb,ts[k]->off,"pread NVFP4 scales")){if(fatal)exit(1);return -1;}
+        uint8_t *scales=s->slab+pos;pos+=sb;
+        if(pread_full(tt[k]->fd,&s->fslab[k*2],4,tt[k]->off,"pread NVFP4 tensor scale")||
+           pread_full(ti[k]->fd,&s->fslab[k*2+1],4,ti[k]->off,"pread NVFP4 input scale")){
+            if(fatal)exit(1);return -1;
+        }
+        if(!isfinite(s->fslab[k*2])||s->fslab[k*2]<=0||s->fslab[k*2]>=1||
+           !isfinite(s->fslab[k*2+1])||s->fslab[k*2+1]<=0){
+            fprintf(stderr,"invalid native NVFP4 tensor/input scale: layer %d expert %d projection %d\n",layer,eid,k);
+            if(fatal)exit(1);return -1;
+        }
+        /* Validate every FP8 scale byte now, never lazily reinterpret malformed data. */
+        for(int64_t z=0;z<sb;z++){float v=coli_e4m3fn_f32(scales[z]);
+            /* CUTLASS padding bytes are zero; logical scale positions must be positive. */
+            if(isnan(v)){fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
+        for(int o=0;o<OO[k];o++)for(int g=0;g<(II[k]+15)/16;g++){
+            float v=coli_e4m3fn_f32(scales[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
+            if(!isfinite(v)||v<=0){fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
+        qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
+        qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;
+        qt[k]->O=OO[k];qt[k]->I=II[k];qt[k]->gs=COLI_NVFP4_GROUP_SIZE;
+        qt[k]->q4=weight;qt[k]->block_scales=scales;qt[k]->tensor_scale=s->fslab[k*2];
+        qt[k]->input_scale=s->fslab[k*2+1];qt[k]->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;
+        total+=wb+sb+8;
+    }
+    atomic_fetch_add_explicit(&g_prof_io,total,memory_order_relaxed);
+    s->eid=eid;return 0;
+}
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
@@ -1900,6 +2033,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+    if(m->manifest.present)return expert_load_native(m,layer,eid,s,nm,fatal);
     char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
     if(!st_has(&m->S,qn)){                       /* fallback: tensori pieni, quantizza a runtime.
                                                   * Reachable ONLY for unquantized models (no .qs);
@@ -1940,6 +2074,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
                 if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
                 if(gs>0) fmt=4;
                 qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
+                qt[k]->bf16=NULL;qt[k]->block_scales=NULL;qt[k]->tensor_scale=0;qt[k]->input_scale=0;
+                qt[k]->scale_layout=COLI_SCALE_NONE;
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
@@ -2068,6 +2204,8 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
         if(fmt==2) gs=detect_group_size(OO[k],II[k],tq[k]->nbytes);
         if(gs>0) fmt=4;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
+        qt[k]->bf16=NULL;qt[k]->block_scales=NULL;qt[k]->tensor_scale=0;qt[k]->input_scale=0;
+        qt[k]->scale_layout=COLI_SCALE_NONE;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
     s->eid=eid; return 0;
@@ -2253,6 +2391,8 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         int64_t nb=l->tw[k]->nbytes;
         int fmt=(nb==(int64_t)OO[k]*II[k])?1:(nb==(int64_t)OO[k]*((II[k]+1)/2))?2:3;
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        qt[k]->bf16=NULL;qt[k]->block_scales=NULL;qt[k]->tensor_scale=0;qt[k]->input_scale=0;
+        qt[k]->scale_layout=COLI_SCALE_NONE;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
     if(publish_eid) s->eid=l->eid;
@@ -2337,6 +2477,10 @@ static void *pipe_worker(void *arg){
 static void pipe_init(Model *m){
     if(g_pp.started) return;
 #ifdef __linux__
+    if(g_uring&&m->manifest.present){
+        fprintf(stderr,"[NVFP4] io_uring record loader not engaged; using validated threaded pread fallback\n");
+        g_uring=0;
+    }
     if(g_uring){
         if(uring_batch_init(&g_ub_pipe)){ perror("URING=1 io_uring_setup"); exit(1); }
         g_pp.m=m; g_pp.started=1; return;
@@ -2415,7 +2559,8 @@ static int64_t expert_lru_release(ESlot *s){
     compat_aligned_free(s->slab); free(s->fslab);
     s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
     QT *q[3]={&s->g,&s->u,&s->d};
-    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->bf16=NULL;
+        q[k]->s=NULL;q[k]->block_scales=NULL;q[k]->tensor_scale=0;q[k]->input_scale=0;q[k]->scale_layout=COLI_SCALE_NONE; }
     s->eid=-1; s->used=0;
     return bytes;
 }
@@ -2441,7 +2586,8 @@ static void expert_host_release(Model *m, ESlot *s){
      * re-alloc and never reaches here with an aligned fslab on _WIN32). */
     compat_aligned_free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
     QT *q[3]={&s->g,&s->u,&s->d};
-    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+    for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->bf16=NULL;
+        q[k]->s=NULL;q[k]->block_scales=NULL;q[k]->tensor_scale=0;q[k]->input_scale=0;q[k]->scale_layout=COLI_SCALE_NONE; }
     m->resident_bytes-=bytes; if(m->resident_bytes<0) m->resident_bytes=0;
 }
 static void expert_host_ensure(Model *m, int layer, ESlot *s){
@@ -2456,7 +2602,12 @@ static void expert_prefetch(Model *m, int layer, int eid){
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]); st_prefetch(&m->S,nm);
-        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch(&m->S,qs);
+        char qs[340];
+        if(m->manifest.present){
+            snprintf(qs,sizeof(qs),"%.299s.nvfp4_scale",nm);st_prefetch(&m->S,qs);
+            snprintf(qs,sizeof(qs),"%.299s.nvfp4_tensor_scale",nm);st_prefetch(&m->S,qs);
+            snprintf(qs,sizeof(qs),"%.299s.nvfp4_input_scale",nm);st_prefetch(&m->S,qs);
+        }else{snprintf(qs,sizeof(qs),"%.299s.qs",nm);st_prefetch(&m->S,qs);}
     }
 }
 
@@ -3918,7 +4069,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             int cuda_expert=e->g.cuda&&e->u.cuda&&e->d.cuda;
             if(g_cuda_enabled && cuda_expert) m->gpu_expert_calls++;
-            if(group_enabled && g_cuda_enabled && cuda_expert &&
+            if(group_enabled && g_cuda_enabled && cuda_expert && e->g.fmt!=COLI_TENSOR_MODELOPT_NVFP4 &&
                !omp_in_parallel()){
                 group_e[ngroup]=e; group_n[ngroup]=nr; group_miss[ngroup]=qof[j]>=0;
                 for(int r=0;r<nr;r++){ group_row[(int64_t)ngroup*S+r]=rows[r]; group_weight[(int64_t)ngroup*S+r]=rw[r]; }
@@ -3928,7 +4079,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
-            if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
+            if((!group_enabled||e->g.fmt==COLI_TENSOR_MODELOPT_NVFP4) && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
                e->d.cuda_eligible && !omp_in_parallel() &&
                coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
@@ -7163,8 +7314,12 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
         for(int k=0;k<3;k++){
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight",c->first_dense,suf[k]);
             eb+=st_nbytes(&m->S,nm);
-            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
-            int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;
+            if(m->manifest.present){
+                const char *side[]={"nvfp4_scale","nvfp4_tensor_scale","nvfp4_input_scale"};
+                for(int z=0;z<3;z++){snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.%s",c->first_dense,suf[k],side[z]);
+                    int64_t q=st_nbytes(&m->S,nm);if(q>0)eb+=q;}
+            }else{snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.0.%s.weight.qs",c->first_dense,suf[k]);
+                int64_t q=st_nbytes(&m->S,nm); if(q>0) eb+=q;}
         }
     }
     if(eb<=0) eb = tbytes(c->moe_inter,c->hidden,ebits)*2 + tbytes(c->hidden,c->moe_inter,ebits);

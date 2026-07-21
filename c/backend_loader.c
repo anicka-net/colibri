@@ -52,9 +52,19 @@ typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *
                                            const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_wrap_host)(ColiCudaTensor **tensor, const void *weights,
                                               const float *scales, int fmt, int I, int O, int device);
+typedef int            (*fn_tensor_upload_nvfp4)(ColiCudaTensor **tensor, const uint8_t *weights,
+                                                 const uint8_t *block_scales, float tensor_scale,
+                                                 float input_scale, int scale_layout,
+                                                 int I, int O, int device);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
                                     int fmt, int S, int I, int O, int device);
+typedef int            (*fn_matmul_nvfp4)(ColiCudaTensor **tensor, float *y, const float *x,
+                                          const uint8_t *weights, const uint8_t *block_scales,
+                                          float tensor_scale, float input_scale, int scale_layout,
+                                          int S, int I, int O, int device);
+typedef void           (*fn_nvfp4_stats)(uint64_t *native_calls, uint64_t *generic_calls,
+                                         uint64_t *fallback_native_unavailable, uint64_t *failures);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
 typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
@@ -115,6 +125,9 @@ typedef int (*fn_pipe_sync)(int device);
 typedef int (*fn_pipe_upload)(int device,void *dst,const void *src,size_t bytes);
 typedef int (*fn_shared_mlp_w4a16)(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S);
 typedef int (*fn_tensor_update)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef int (*fn_tensor_update_nvfp4)(ColiCudaTensor *tensor, const uint8_t *weights,
+                                      const uint8_t *block_scales, float tensor_scale,
+                                      float input_scale);
 
 /* Resolved pointers, plus a flag so we attempt the load at most once. */
 static struct {
@@ -135,7 +148,11 @@ static struct {
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
     fn_tensor_wrap_host tensor_wrap_host;
+    fn_tensor_upload_nvfp4 tensor_upload_nvfp4;
+    fn_tensor_upload_nvfp4 tensor_wrap_host_nvfp4;
     fn_matmul          matmul;
+    fn_matmul_nvfp4    matmul_nvfp4;
+    fn_nvfp4_stats     nvfp4_stats;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
     fn_tensor_device   tensor_device;
@@ -175,6 +192,7 @@ static struct {
     fn_pipe_upload pipe_upload;
     fn_shared_mlp_w4a16 shared_mlp_w4a16;
     fn_tensor_update tensor_update;
+    fn_tensor_update_nvfp4 tensor_update_nvfp4;
 } g_cuda;
 
 /* Resolve the DLL and all 11 symbols. Returns 1 on success, 0 otherwise.
@@ -242,7 +260,11 @@ static int coli_cuda_load(void){
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
     RESOLVE(tensor_wrap_host, fn_tensor_wrap_host)
+    RESOLVE(tensor_upload_nvfp4, fn_tensor_upload_nvfp4)
+    RESOLVE(tensor_wrap_host_nvfp4, fn_tensor_upload_nvfp4)
     RESOLVE(matmul,         fn_matmul)
+    RESOLVE(matmul_nvfp4,   fn_matmul_nvfp4)
+    RESOLVE(nvfp4_stats,    fn_nvfp4_stats)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
     RESOLVE(tensor_device,  fn_tensor_device)
@@ -282,6 +304,7 @@ static int coli_cuda_load(void){
     RESOLVE(pipe_upload, fn_pipe_upload)
     RESOLVE(shared_mlp_w4a16, fn_shared_mlp_w4a16)
     RESOLVE(tensor_update, fn_tensor_update)
+    RESOLVE(tensor_update_nvfp4, fn_tensor_update_nvfp4)
     #undef RESOLVE
 
     g_cuda.available = 1;
@@ -377,11 +400,48 @@ int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor, const void *weights,
     return g_cuda.tensor_wrap_host(tensor, weights, scales, fmt, I, O, device);
 }
 
+int coli_cuda_tensor_upload_nvfp4(ColiCudaTensor **tensor, const uint8_t *weights,
+                                  const uint8_t *block_scales, float tensor_scale,
+                                  float input_scale, int scale_layout,
+                                  int I, int O, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.tensor_upload_nvfp4(tensor,weights,block_scales,tensor_scale,input_scale,
+                                      scale_layout,I,O,device);
+}
+
+int coli_cuda_tensor_wrap_host_nvfp4(ColiCudaTensor **tensor, const uint8_t *weights,
+                                     const uint8_t *block_scales, float tensor_scale,
+                                     float input_scale, int scale_layout,
+                                     int I, int O, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.tensor_wrap_host_nvfp4(tensor,weights,block_scales,tensor_scale,input_scale,
+                                         scale_layout,I,O,device);
+}
+
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device){
     if(!g_cuda.available) return 0;
     return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device);
+}
+
+int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor, float *y, const float *x,
+                           const uint8_t *weights, const uint8_t *block_scales,
+                           float tensor_scale, float input_scale, int scale_layout,
+                           int S, int I, int O, int device){
+    if(!g_cuda.available) return 0;
+    return g_cuda.matmul_nvfp4(tensor,y,x,weights,block_scales,tensor_scale,input_scale,
+                               scale_layout,S,I,O,device);
+}
+
+void coli_cuda_nvfp4_stats(uint64_t *native_calls, uint64_t *generic_calls,
+                           uint64_t *fallback_native_unavailable, uint64_t *failures){
+    if(!g_cuda.available){
+        if(native_calls)*native_calls=0; if(generic_calls)*generic_calls=0;
+        if(fallback_native_unavailable)*fallback_native_unavailable=0;
+        if(failures)*failures=0; return;
+    }
+    g_cuda.nvfp4_stats(native_calls,generic_calls,fallback_native_unavailable,failures);
 }
 
 void coli_cuda_tensor_free(ColiCudaTensor *tensor){
@@ -597,6 +657,13 @@ int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCudaTensor *up, ColiCud
 int coli_cuda_tensor_update(ColiCudaTensor *tensor, const void *weights, const float *scales){
     if(!g_cuda.available){ return 0; }
     return g_cuda.tensor_update(tensor, weights, scales);
+}
+
+int coli_cuda_tensor_update_nvfp4(ColiCudaTensor *tensor, const uint8_t *weights,
+                                  const uint8_t *block_scales, float tensor_scale,
+                                  float input_scale){
+    if(!g_cuda.available){ return 0; }
+    return g_cuda.tensor_update_nvfp4(tensor,weights,block_scales,tensor_scale,input_scale);
 }
 
 #endif /* _WIN32 */

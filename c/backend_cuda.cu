@@ -17,7 +17,11 @@
 struct ColiCudaTensor {
     void *weights;
     float *scales;
+    uint8_t *block_scales;
     size_t weight_bytes;
+    size_t block_scale_bytes;
+    float tensor_scale,input_scale;
+    int scale_layout;
     int fmt, I, O, device;
     int tracked;
     int host_backed;
@@ -56,6 +60,8 @@ typedef struct {
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
 static int g_nctx;
 static uint64_t g_group_calls,g_group_experts,g_group_rows;
+static uint64_t g_nvfp4_native_calls,g_nvfp4_generic_calls;
+static uint64_t g_nvfp4_fallback_native_unavailable,g_nvfp4_failures;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
 static std::mutex g_group_stats_mu;
 
@@ -85,19 +91,24 @@ static int select_ctx(DeviceContext *ctx) {
 }
 
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
-    if (fmt == 0) return (size_t)I * sizeof(float);
-    if (fmt == 1) return (size_t)I;
-    if (fmt == 2) return (size_t)(I + 1) / 2;
-    if (fmt == 3) return (size_t)(I + 3) / 4;
+    if (fmt == COLI_TENSOR_F32) return (size_t)I * sizeof(float);
+    if (fmt == COLI_TENSOR_INT8_ROW) return (size_t)I;
+    if (fmt == COLI_TENSOR_INT4_ROW) return (size_t)(I + 1) / 2;
+    if (fmt == COLI_TENSOR_INT2_ROW) return (size_t)(I + 3) / 4;
+    if (fmt == COLI_TENSOR_BF16) return (size_t)I * sizeof(uint16_t);
     return 0;
 }
 
 __device__ static float weight_at(const void *weights, int fmt, size_t row, int i) {
     const uint8_t *base = static_cast<const uint8_t *>(weights) + row;
-    if (fmt == 0) return reinterpret_cast<const float *>(base)[i];
-    if (fmt == 1) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
+    if (fmt == COLI_TENSOR_F32) return reinterpret_cast<const float *>(base)[i];
+    if (fmt == COLI_TENSOR_INT8_ROW) return static_cast<float>(reinterpret_cast<const int8_t *>(base)[i]);
+    if (fmt == COLI_TENSOR_BF16) {
+        uint32_t bits = static_cast<uint32_t>(reinterpret_cast<const uint16_t *>(base)[i]) << 16;
+        return __uint_as_float(bits);
+    }
     const uint8_t *q = base;
-    if (fmt == 2) {
+    if (fmt == COLI_TENSOR_INT4_ROW) {
         uint8_t v = q[i >> 1];
         int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n&8?n-16:n);
     }
@@ -114,6 +125,37 @@ __device__ static float group_weight_at(const void *weights,int fmt,size_t row,i
 
 __device__ static float decode_group_s4(int n,int offset_s4){
     return static_cast<float>(offset_s4?n-8:(n^8)-8);
+}
+
+__device__ static float e2m1_value(uint8_t code){
+    const float mag[8]={0.f,.5f,1.f,1.5f,2.f,3.f,4.f,6.f};
+    return code&8?-mag[code&7]:mag[code&7];
+}
+__device__ static float e4m3fn_value(uint8_t v){
+    int sign=v&0x80?-1:1,exp=(v>>3)&15,mant=v&7;
+    if(exp==15&&mant==7)return NAN;
+    float x=exp?ldexpf(1.f+(float)mant/8.f,exp-7):ldexpf((float)mant,-9);
+    return sign*x;
+}
+__host__ __device__ static size_t nvfp4_scale_bytes(int O,int I){
+    return (size_t)((O+127)/128)*(size_t)((I+63)/64)*512;
+}
+__device__ static size_t nvfp4_scale_offset(int o,int group,int I){
+    int kt=(I+63)/64,om=o/128,oi=o%128,kg=group/4,gi=group%4;
+    return ((size_t)om*kt+kg)*512+(size_t)(oi%32)*16+(size_t)(oi/32)*4+gi;
+}
+__global__ static void nvfp4_w4a32(float *y,const float *x,const uint8_t *weights,
+        const uint8_t *block_scales,float tensor_scale,int scale_layout,int S,int I,int O){
+    int o=blockIdx.x,s=blockIdx.y;if(o>=O||s>=S)return;float sum=0.f;
+    size_t rb=(size_t)(I+1)/2;const uint8_t *wr=weights+(size_t)o*rb;
+    const float *xs=x+(size_t)s*I;
+    for(int i=threadIdx.x;i<I;i+=blockDim.x){uint8_t q=wr[i>>1];q=(i&1)?q>>4:q&15;
+        size_t si=scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4
+            ?nvfp4_scale_offset(o,i/16,I):(size_t)o*((I+15)/16)+(size_t)i/16;
+        sum+=xs[i]*e2m1_value(q)*e4m3fn_value(block_scales[si]);}
+    __shared__ float part[256];part[threadIdx.x]=sum;__syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n)part[threadIdx.x]+=part[threadIdx.x+n];__syncthreads();}
+    if(!threadIdx.x)y[(size_t)s*O+o]=part[0]*tensor_scale;
 }
 
 __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
@@ -169,7 +211,19 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
         __syncthreads();
     }
     if (!threadIdx.x)
-        y[(size_t)s * O + o] = partial[0] * (fmt ? scales[o] : 1.0f);
+        y[(size_t)s * O + o] = partial[0] *
+            ((fmt == COLI_TENSOR_INT8_ROW || fmt == COLI_TENSOR_INT4_ROW ||
+              fmt == COLI_TENSOR_INT2_ROW) ? scales[o] : 1.0f);
+}
+
+static void tensor_matmul_launch(float *y,const float *x,const ColiCudaTensor *t,
+                                  int S,cudaStream_t stream=0){
+    dim3 grid((unsigned)t->O,(unsigned)S);
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4)
+        nvfp4_w4a32<<<grid,256,0,stream>>>(y,x,(const uint8_t*)t->weights,t->block_scales,
+            t->tensor_scale,t->scale_layout,S,t->I,t->O);
+    else quant_matmul<<<grid,256,0,stream>>>(y,x,t->weights,t->scales,t->fmt,S,t->I,t->O,
+            row_bytes(t->fmt,t->I));
 }
 
 __global__ static void silu_mul(float *gate, const float *up, size_t n) {
@@ -617,7 +671,9 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     DeviceContext *ctx = find_ctx(device);
     if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    int scaled = fmt == COLI_TENSOR_INT8_ROW || fmt == COLI_TENSOR_INT4_ROW ||
+                 fmt == COLI_TENSOR_INT2_ROW;
+    if (!rb || (scaled && !scales)) return 0;
     if (*tensor) {
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
@@ -630,9 +686,9 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         coli_cuda_tensor_free(t);
         return 0;
     }
-    if(fmt==2){offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
+    if(fmt==COLI_TENSOR_INT4_ROW){offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
-    if (fmt) {
+    if (scaled) {
         if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
             !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
@@ -641,7 +697,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     }
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + (fmt ? (size_t)O * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (scaled ? (size_t)O * sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -652,7 +708,8 @@ extern "C" int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor,
     DeviceContext *ctx=find_ctx(device);
     if(!tensor||*tensor||!weights||I<1||O<1||!select_ctx(ctx))return 0;
     size_t rb=row_bytes(fmt,I);
-    if(!rb||(fmt&&!scales))return 0;
+    int scaled=fmt==COLI_TENSOR_INT8_ROW||fmt==COLI_TENSOR_INT4_ROW||fmt==COLI_TENSOR_INT2_ROW;
+    if(!rb||(scaled&&!scales))return 0;
     int pageable=0,host_pt=0;
     if(cudaDeviceGetAttribute(&pageable,cudaDevAttrPageableMemoryAccess,device)!=cudaSuccess||
        cudaDeviceGetAttribute(&host_pt,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device)!=cudaSuccess||
@@ -665,20 +722,60 @@ extern "C" int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor,
     return 1;
 }
 
+static int tensor_init_nvfp4(ColiCudaTensor **tensor,const uint8_t *weights,
+        const uint8_t *block_scales,float tensor_scale,float input_scale,int scale_layout,
+        int I,int O,int device,int host_backed){
+    DeviceContext *ctx=find_ctx(device);
+    if(!tensor||!weights||!block_scales||I<1||O<1||!isfinite(tensor_scale)||tensor_scale<=0||
+       tensor_scale>=1||!isfinite(input_scale)||input_scale<=0||
+       (scale_layout!=COLI_SCALE_ROW_MAJOR_G16&&scale_layout!=COLI_SCALE_CUTLASS_SM1XX_128X4)||
+       !select_ctx(ctx))return 0;
+    if(*tensor){ColiCudaTensor *t=*tensor;return t->fmt==COLI_TENSOR_MODELOPT_NVFP4&&
+        t->I==I&&t->O==O&&t->device==device&&t->scale_layout==scale_layout;}
+    if(host_backed){int pageable=0,host_pt=0;
+        if(cudaDeviceGetAttribute(&pageable,cudaDevAttrPageableMemoryAccess,device)!=cudaSuccess||
+           cudaDeviceGetAttribute(&host_pt,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device)!=cudaSuccess||
+           !pageable||!host_pt)return 0;}
+    ColiCudaTensor *t=(ColiCudaTensor*)std::calloc(1,sizeof(*t));if(!t)return 0;
+    t->fmt=COLI_TENSOR_MODELOPT_NVFP4;t->I=I;t->O=O;t->device=device;t->scale_layout=scale_layout;
+    t->tensor_scale=tensor_scale;t->input_scale=input_scale;t->weight_bytes=(size_t)O*((I+1)/2);
+    t->block_scale_bytes=scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4
+        ?nvfp4_scale_bytes(O,I):(size_t)O*((I+15)/16);
+    if(host_backed){t->weights=(void*)weights;t->block_scales=(uint8_t*)block_scales;t->host_backed=1;}
+    else if(!cuda_ok(cudaMalloc(&t->weights,t->weight_bytes),"NVFP4 weight allocation")||
+            !cuda_ok(cudaMalloc(&t->block_scales,t->block_scale_bytes),"NVFP4 scale allocation")||
+            !cuda_ok(cudaMemcpy(t->weights,weights,t->weight_bytes,cudaMemcpyHostToDevice),"NVFP4 weight upload")||
+            !cuda_ok(cudaMemcpy(t->block_scales,block_scales,t->block_scale_bytes,cudaMemcpyHostToDevice),"NVFP4 scale upload")){
+        coli_cuda_tensor_free(t);g_nvfp4_failures++;return 0;
+    }else{t->tracked=1;ctx->tensor_count++;ctx->tensor_bytes+=t->weight_bytes+t->block_scale_bytes;}
+    *tensor=t;return 1;
+}
+
+extern "C" int coli_cuda_tensor_upload_nvfp4(ColiCudaTensor **tensor,const uint8_t *weights,
+        const uint8_t *block_scales,float tensor_scale,float input_scale,int scale_layout,
+        int I,int O,int device){return tensor_init_nvfp4(tensor,weights,block_scales,tensor_scale,
+            input_scale,scale_layout,I,O,device,0);}
+extern "C" int coli_cuda_tensor_wrap_host_nvfp4(ColiCudaTensor **tensor,const uint8_t *weights,
+        const uint8_t *block_scales,float tensor_scale,float input_scale,int scale_layout,
+        int I,int O,int device){return tensor_init_nvfp4(tensor,weights,block_scales,tensor_scale,
+            input_scale,scale_layout,I,O,device,1);}
+
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (!tensor || tensor->host_backed || !weights || (tensor->fmt && !scales)) return 0;
+    int scaled=tensor && (tensor->fmt==COLI_TENSOR_INT8_ROW||tensor->fmt==COLI_TENSOR_INT4_ROW||
+                          tensor->fmt==COLI_TENSOR_INT2_ROW);
+    if (!tensor || tensor->host_backed || !weights || (scaled && !scales)) return 0;
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
     if (!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,
                             cudaMemcpyHostToDevice),"tensor refresh")) return 0;
-    if(tensor->fmt==2){
+    if(tensor->fmt==COLI_TENSOR_INT4_ROW){
         offset_to_signed_s4<<<(unsigned)((tensor->weight_bytes+255)/256),256>>>(
             (uint8_t*)tensor->weights,tensor->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
-    return !tensor->fmt || cuda_ok(cudaMemcpy(tensor->scales,scales,
+    return !scaled || cuda_ok(cudaMemcpy(tensor->scales,scales,
         (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
 }
 
@@ -701,6 +798,31 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     return 1;
 }
 
+extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,float *y,const float *x,
+        const uint8_t *weights,const uint8_t *block_scales,float tensor_scale,float input_scale,
+        int scale_layout,int S,int I,int O,int device){
+    if(S<1||!coli_cuda_tensor_upload_nvfp4(tensor,weights,block_scales,tensor_scale,input_scale,
+                                           scale_layout,I,O,device)){g_nvfp4_failures++;return 0;}
+    ColiCudaTensor *t=*tensor;DeviceContext *ctx=find_ctx(device);if(!select_ctx(ctx))return 0;
+    size_t xb=(size_t)S*I*sizeof(float),yb=(size_t)S*O*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,yb)||
+       !cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"NVFP4 input upload"))return 0;
+    nvfp4_w4a32<<<dim3((unsigned)O,(unsigned)S),256>>>(ctx->y,ctx->x,(const uint8_t*)t->weights,
+        t->block_scales,t->tensor_scale,t->scale_layout,S,I,O);
+    if(!cuda_ok(cudaGetLastError(),"generic NVFP4 W4A32 launch")||
+       !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"NVFP4 output download")){
+        g_nvfp4_failures++;return 0;}
+    g_nvfp4_generic_calls++;g_nvfp4_fallback_native_unavailable++;return 1;
+}
+
+extern "C" void coli_cuda_nvfp4_stats(uint64_t *native_calls,uint64_t *generic_calls,
+        uint64_t *fallback_native_unavailable,uint64_t *failures){
+    if(native_calls)*native_calls=g_nvfp4_native_calls;
+    if(generic_calls)*generic_calls=g_nvfp4_generic_calls;
+    if(fallback_native_unavailable)*fallback_native_unavailable=g_nvfp4_fallback_native_unavailable;
+    if(failures)*failures=g_nvfp4_failures;
+}
+
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
                                       const float *x, int S) {
@@ -716,17 +838,20 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
         !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
-    dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
-    quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
-        gate->fmt,S,D,I,row_bytes(gate->fmt,D));
-    quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
-        up->fmt,S,D,I,row_bytes(up->fmt,D));
+    tensor_matmul_launch(ctx->gate,ctx->x,gate,S);
+    tensor_matmul_launch(ctx->up,ctx->x,up,S);
     size_t n=(size_t)S*I;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
-    quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
-        down->fmt,S,I,D,row_bytes(down->fmt,I));
+    tensor_matmul_launch(ctx->y,ctx->gate,down,S);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
-        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
+        !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) {
+        if(gate->fmt==COLI_TENSOR_MODELOPT_NVFP4)g_nvfp4_failures++;
+        return 0;
+    }
+    if(gate->fmt==COLI_TENSOR_MODELOPT_NVFP4){
+        g_nvfp4_generic_calls++;
+        g_nvfp4_fallback_native_unavailable++;
+    }
     return 1;
 }
 
@@ -1215,17 +1340,35 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
-        size_t bytes = tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * sizeof(float) : 0);
+        int scaled=tensor->fmt==COLI_TENSOR_INT8_ROW||tensor->fmt==COLI_TENSOR_INT4_ROW||
+                   tensor->fmt==COLI_TENSOR_INT2_ROW;
+        size_t bytes = tensor->weight_bytes + tensor->block_scale_bytes +
+            (scaled?(size_t)tensor->O*sizeof(float):0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
     if (!tensor->host_backed && tensor->weights) cudaFree(tensor->weights);
     if (!tensor->host_backed && tensor->scales) cudaFree(tensor->scales);
+    if (!tensor->host_backed && tensor->block_scales) cudaFree(tensor->block_scales);
     std::free(tensor);
 }
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
-    return tensor ? tensor->weight_bytes + (tensor->fmt ? (size_t)tensor->O * sizeof(float) : 0) : 0;
+    if(!tensor)return 0;
+    int scaled=tensor->fmt==COLI_TENSOR_INT8_ROW||tensor->fmt==COLI_TENSOR_INT4_ROW||
+               tensor->fmt==COLI_TENSOR_INT2_ROW;
+    return tensor->weight_bytes+tensor->block_scale_bytes+
+        (scaled?(size_t)tensor->O*sizeof(float):0);
+}
+
+extern "C" int coli_cuda_tensor_update_nvfp4(ColiCudaTensor *tensor,const uint8_t *weights,
+        const uint8_t *block_scales,float tensor_scale,float input_scale){
+    if(!tensor||tensor->fmt!=COLI_TENSOR_MODELOPT_NVFP4||tensor->host_backed||!weights||!block_scales||
+       !isfinite(tensor_scale)||tensor_scale<=0||tensor_scale>=1||!isfinite(input_scale)||input_scale<=0)return 0;
+    DeviceContext *ctx=find_ctx(tensor->device);if(!select_ctx(ctx))return 0;
+    if(!cuda_ok(cudaMemcpy(tensor->weights,weights,tensor->weight_bytes,cudaMemcpyHostToDevice),"NVFP4 weight refresh")||
+       !cuda_ok(cudaMemcpy(tensor->block_scales,block_scales,tensor->block_scale_bytes,cudaMemcpyHostToDevice),"NVFP4 scale refresh"))return 0;
+    tensor->tensor_scale=tensor_scale;tensor->input_scale=input_scale;return 1;
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "tensor_format.h"
 
 /* COLI_CUDA_DLLEXPORT marks functions exported from coli_cuda.dll on Windows.
  * Define COLI_CUDA_BUILDING_DLL when compiling the .cu into the DLL (so the
@@ -47,10 +48,18 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_nvfp4(ColiCudaTensor **tensor,
+                            const uint8_t *weights, const uint8_t *block_scales,
+                            float tensor_scale, float input_scale, int scale_layout,
+                            int I, int O, int device);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_host_nvfp4(ColiCudaTensor **tensor,
+                            const uint8_t *weights, const uint8_t *block_scales,
+                            float tensor_scale, float input_scale, int scale_layout,
+                            int I, int O, int device);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
- * fmt matches QT in glm.c: 0=f32, 1=int8, 2=int4, 3=int2.
+ * fmt is a ColiTensorFormat from tensor_format.h.
  * The first successful call uploads W and its row scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
@@ -58,6 +67,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
                      int fmt, int S, int I, int O, int device);
+COLI_CUDA_DLLEXPORT int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
+                     float *y, const float *x, const uint8_t *weights,
+                     const uint8_t *block_scales, float tensor_scale,
+                     float input_scale, int scale_layout,
+                     int S, int I, int O, int device);
+COLI_CUDA_DLLEXPORT void coli_cuda_nvfp4_stats(uint64_t *native_calls,
+                     uint64_t *generic_calls, uint64_t *fallback_native_unavailable,
+                     uint64_t *failures);
 
 /* Fused expert pipeline: y = down(silu(gate(x)) * up(x)).  All three tensors
  * must already be resident on one device.  Activations cross PCIe once in
@@ -115,6 +132,9 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 /* Replace a resident tensor's contents without reallocating its device slot. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                             const void *weights, const float *scales);
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_update_nvfp4(ColiCudaTensor *tensor,
+                            const uint8_t *weights, const uint8_t *block_scales,
+                            float tensor_scale, float input_scale);
 
 /* ---- resident-pipeline primitives (Inc.0): device-pointer entry points ---- */
 COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes);
