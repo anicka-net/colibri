@@ -1010,6 +1010,7 @@ class APIServer(ThreadingHTTPServer):
                         continue
                     self.model_size += stat.st_size
                     self.model_modified = max(self.model_modified, int(stat.st_mtime))
+        self.model_modified = min(self.model_modified, self.created)
         self.watchdog_lock = threading.Lock()
         self.watchdog_active = 0
         self.response_history_lock = threading.Lock()

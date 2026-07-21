@@ -1,3 +1,4 @@
+import calendar
 import json
 import os
 import signal
@@ -47,7 +48,8 @@ class NativeServerTest(unittest.TestCase):
         cls.model_dir = Path(cls.runtime_tmp.name) / "model"
         cls.model_dir.mkdir()
         (cls.model_dir / "weights.bin").write_bytes(b"x" * 123)
-        os.utime(cls.model_dir / "weights.bin", (1700000000, 1700000000))
+        future = int(time.time()) + 86400
+        os.utime(cls.model_dir / "weights.bin", (future, future))
         (cls.model_dir / ".coli_usage").write_bytes(b"runtime state")
         web = Path(cls.web_tmp.name)
         (web / "index.html").write_text("native dashboard", encoding="utf-8")
@@ -202,7 +204,10 @@ class NativeServerTest(unittest.TestCase):
             self.assertEqual(model["name"], "glm-test")
             self.assertRegex(model["digest"], r"^sha256:[0-9a-f]{64}$")
             self.assertEqual(model["size"], 123)
-            self.assertEqual(model["modified_at"], "2023-11-14T22:13:20Z")
+            modified = calendar.timegm(time.strptime(model["modified_at"],
+                                                      "%Y-%m-%dT%H:%M:%SZ"))
+            self.assertGreaterEqual(modified, time.time() - 10)
+            self.assertLessEqual(modified, time.time() + 1)
         with self.request("/api/show", {"model": "glm-test"}) as response:
             shown = json.load(response)
         self.assertIn("completion", shown["capabilities"])

@@ -3058,6 +3058,8 @@ int coli_server_run(const coli_server_config *c) {
   s.c = *c;
   s.created = time(NULL);
   model_metadata(s.c.model, &s.model_size, &s.model_modified);
+  if (s.model_modified > s.created)
+    s.model_modified = s.created;
   pthread_mutex_init(&s.sched_mu, NULL);
   pthread_cond_init(&s.sched_cv, NULL);
   pthread_mutex_init(&s.history_mu, NULL);
