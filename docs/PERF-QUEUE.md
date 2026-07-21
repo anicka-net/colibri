@@ -87,6 +87,22 @@ Longer-term, genuinely concurrent rows still need a resident ragged chain:
    The resident-ragged path lands only if it beats isolated scheduling without
    changing DSA selections or cross-session state.
 
+### Dual-Spark RDMA transport (measured 2026-07-21)
+
+Both direct CX7 cables recovered after the physical power cycle and negotiate
+200 Gb/s.  One stream sustains 105.3/105.0 Gb/s RDMA write on the two ports;
+the addressed port sustains 80.6 Gb/s RDMA read.  Concurrent writes deliver
+92.55 + 91.59 = **184.14 Gb/s (23.02 GB/s)** in either host direction.
+Two-byte RDMA write latency is 1.47 us typical, 1.55 us p99, 1.90 us p99.9.
+The current netdev MTU exposes RDMA MTU 1024, so jumbo-frame configuration may
+raise the ceiling further.
+
+Recipe: `rocep1s0f1` uses RoCEv2 GID 3 and the 169.254/16 link-local addresses.
+`roceP2p1s0f1` has no IP address and uses RoCEv1 GID 0; perftest's TCP control
+channel can use the management address while RDMA data stays on that device.
+The direct transport is fast enough to justify a remote expert-cache/compute
+prototype; the remaining question is scheduling and transfer granularity.
+
 ### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: IndexShare, decode-attention attribution (inc.6 ruled out selection cost)
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
@@ -112,10 +128,10 @@ pays attention twice.
   index_topk_freq refresh — and lifting the pipe2 gate past index_topk.
   (Original plan, for reference: `--indexer` re-downloads shards
   to keep a few GB (resumable per shard).  Run it on the multi-GB/s host, not
-  the 1 Gbps ones; the few-GB output then crosses the ~100 Mbps host-to-host
-  link in minutes (never move the raw shards between machines).  The fast host
-  has limited disk — fine for extraction (one ~5 GB shard in flight, deleted
-  after conversion; output a few GB); anything bulk belongs on the RAID host.
+  the 1 Gbps ones.  The management LAN remains slow, while the direct CX7 path
+  now sustains 23.0 GB/s aggregate.  The fast host has limited disk — fine for
+  extraction (one ~5 GB shard in flight, deleted after conversion; output a
+  few GB); anything bulk belongs on the RAID host.
 - Integration: the CPU DSA paths exist, but the fused pipe2 chain has no index
   support and the pipe gate disables itself past `index_topk` when `has_dsa`.
 - IndexShare for drafts comes nearly free once the above lands.
