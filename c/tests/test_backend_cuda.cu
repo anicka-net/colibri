@@ -1,9 +1,11 @@
 #include "../backend_cuda.h"
+#include "../nvfp4.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef _WIN32
 /* MSVC has no POSIX setenv/unsetenv */
@@ -229,9 +231,49 @@ int main(int argc, char **argv) {
     unsetenv("COLI_CUDA_TC_INT4");
     unsetenv("COLI_CUDA_TC_MIN_ROWS");
     coli_cuda_tensor_free(g4);coli_cuda_tensor_free(u4);coli_cuda_tensor_free(d4);
+
+    /* Native ModelOpt NVFP4: the same fixture exercises a single GEMM, fused
+       expert MLP, and routed grouping. On SM120/121 compare native W4A4 with
+       the software oracle; elsewhere require exact generic W4A32 behavior. */
+    enum { NI=32,NO=32,NS=2 };
+    uint8_t nw[NO*NI/2],nscale[512];float nx[NS*NI],ngot[NS*NO],nref[NS*NO];
+    std::memset(nscale,0,sizeof(nscale));
+    for(int i=0;i<(int)sizeof(nw);i++)nw[i]=(uint8_t)(((i+1)&15)|(((i*3+5)&15)<<4));
+    for(int i=0;i<NS*NI;i++)nx[i]=std::sin((float)(i+1)*.11f)*1.5f;
+    for(int o=0;o<NO;o++)for(int g=0;g<NI/16;g++)
+        nscale[coli_nvfp4_cutlass_scale_offset(o,g,NI)]=0x38;
+    ColiCudaTensor *ng=nullptr,*nu=nullptr,*nd=nullptr;uint64_t native0=0,native1=0;
+    coli_cuda_nvfp4_stats(&native0,nullptr,nullptr,nullptr);
+    if(!coli_cuda_matmul_nvfp4(&ng,ngot,nx,nw,nscale,.25f,.5f,
+          COLI_SCALE_CUTLASS_SM1XX_128X4,NS,NI,NO,d0))return 1;
+    coli_cuda_nvfp4_stats(&native1,nullptr,nullptr,nullptr);
+    if(native1>native0){
+        if(!coli_matmul_nvfp4_w4a4_ref(nref,nx,nw,nscale,.25f,.5f,
+              COLI_SCALE_CUTLASS_SM1XX_128X4,NS,NI,NO)||
+           !relative_rms(ngot,nref,NS*NO,.12f))return 1;
+        std::fprintf(stderr,"native NVFP4 GEMM oracle: ok\n");
+    }else{
+        if(!coli_matmul_nvfp4_w4a32_ref(nref,nx,nw,nscale,.25f,
+              COLI_SCALE_CUTLASS_SM1XX_128X4,NS,NI,NO)||
+           !close_enough(ngot,nref,NS*NO))return 1;
+        std::fprintf(stderr,"generic NVFP4 GEMM oracle: ok\n");
+    }
+    if(!coli_cuda_tensor_upload_nvfp4(&nu,nw,nscale,.25f,.5f,
+          COLI_SCALE_CUTLASS_SM1XX_128X4,NI,NO,d0)||
+       !coli_cuda_tensor_upload_nvfp4(&nd,nw,nscale,.25f,.5f,
+          COLI_SCALE_CUTLASS_SM1XX_128X4,NI,NO,d0))return 1;
+    float nmlp[NS*NI],ngroup[NS*NI];
+    if(!coli_cuda_expert_mlp(ng,nu,nd,nmlp,nx,NS))return 1;
+    ColiCudaTensor *ngs[2]={ng,ng},*nus[2]={nu,nu},*nds[2]={nd,nd};
+    if(!coli_cuda_expert_group(ngs,nus,nds,group_rows,2,ngroup,nx,
+                               nullptr,nullptr,0,0,0,nullptr)||
+       !close_enough(ngroup,nmlp,NS*NI))return 1;
+    std::fprintf(stderr,"grouped NVFP4 expert parity: ok\n");
+    coli_cuda_tensor_free(ng);coli_cuda_tensor_free(nu);coli_cuda_tensor_free(nd);
+
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    uint64_t want_groups=5+(host8_ok?1:0)+(host_ok?1:0);
+    uint64_t want_groups=6+(host8_ok?1:0)+(host_ok?1:0);
     if(group_calls!=want_groups||group_experts!=want_groups*2||group_total_rows!=want_groups*2) return 1;
 
     coli_cuda_stats(-1, &count, &bytes);

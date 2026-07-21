@@ -278,6 +278,19 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh tests/t
 	"$(NVCC)" $(NVCCFLAGS) -DCOLI_CUDA_TEST backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
+cuda-nvfp4-layout-test: tests/test_nvfp4_cutlass_layout.cu backend_cuda_nvfp4_cutlass.cuh nvfp4.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr -DCOLI_CUTLASS_NVFP4 \
+		-I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include $< -o nvfp4_layout_test$(EXE)
+	./nvfp4_layout_test$(EXE)
+
+cuda-nvfp4-test: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh tests/test_nvfp4_cuda.cu
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr -DCOLI_CUTLASS_NVFP4 \
+		-I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
+		backend_cuda.cu tests/test_nvfp4_cuda.cu -o nvfp4_cuda_test$(EXE)
+	./nvfp4_cuda_test$(EXE)
+
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
@@ -445,4 +458,4 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all glm cuda-test cuda-bench cuda-peer-bench cuda-dll portable test-c test-python test-native test check clean install uninstall bench
+.PHONY: all glm cuda-test cuda-nvfp4-layout-test cuda-nvfp4-test cuda-bench cuda-peer-bench cuda-dll portable test-c test-python test-native test check clean install uninstall bench

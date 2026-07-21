@@ -17,6 +17,8 @@ FILES = [
     "tests/fake_mux_engine", "tests/fake_mux_engine.exe",
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
+    "nvfp4_cuda_test", "nvfp4_cuda_test.exe",
+    "nvfp4_layout_test", "nvfp4_layout_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",

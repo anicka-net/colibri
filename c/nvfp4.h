@@ -25,6 +25,17 @@ static inline float coli_e4m3fn_f32(uint8_t value) {
     return sign * magnitude;
 }
 
+static inline uint8_t coli_f32_e4m3fn_positive(float value) {
+    if(!isfinite(value)||value<=0.f)return 0;
+    if(value>=448.f)return 0x7e;
+    uint8_t best=1;float error=fabsf(value-coli_e4m3fn_f32(best));
+    for(int raw=2;raw<=0x7e;raw++){
+        float next=fabsf(value-coli_e4m3fn_f32((uint8_t)raw));
+        if(next<error){best=(uint8_t)raw;error=next;}
+    }
+    return best;
+}
+
 static inline float coli_e2m1_f32(uint8_t code) {
     static const float lut[16] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -118,7 +129,8 @@ static inline int coli_matmul_nvfp4_w4a4_ref(
         int end=(g+1)*COLI_NVFP4_GROUP_SIZE;if(end>I)end=I;float amax=0.f;
         for(int i=g*COLI_NVFP4_GROUP_SIZE;i<end;i++)
             amax=fmaxf(amax,fabsf(x[(size_t)s*I+i]));
-        float scale=amax>0.f?amax/(6.f*input_scale):1.f;scales[(size_t)s*groups+g]=scale;
+        float scale=amax>0.f?amax/(6.f*input_scale):1.f;
+        scales[(size_t)s*groups+g]=coli_e4m3fn_f32(coli_f32_e4m3fn_positive(scale));
         for(int i=g*COLI_NVFP4_GROUP_SIZE;i<end;i++){
             uint8_t q=coli_f32_e2m1(x[(size_t)s*I+i]/(scale*input_scale));
             qx[(size_t)s*((I+1)/2)+i/2]|=(uint8_t)(q<<((i&1)*4));

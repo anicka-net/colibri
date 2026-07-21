@@ -566,6 +566,11 @@ static int nvfp4_native_launch(float *y,const float *x,const ColiCudaTensor *t,
        t->scale_layout!=COLI_SCALE_CUTLASS_SM1XX_128X4){
         g_nvfp4_fallback_native_unavailable++;return 0;
     }
+    const char *enabled=getenv("COLI_NVFP4_NATIVE");
+    if(enabled&&!atoi(enabled)){g_nvfp4_fallback_native_unavailable++;return 0;}
+    int min_rows=getenv("COLI_NVFP4_NATIVE_MIN_ROWS")?
+        atoi(getenv("COLI_NVFP4_NATIVE_MIN_ROWS")):1;
+    if(S<min_rows){g_nvfp4_fallback_shape++;return 0;}
     size_t qb=coli_nvfp4_native::activation_bytes(S,t->I);
     size_t sb=coli_nvfp4_native::scale_bytes(S,t->O,t->I);
     if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
@@ -904,6 +909,14 @@ extern "C" void coli_cuda_nvfp4_fallback_stats(uint64_t *shape,uint64_t *rejecte
     if(rejected)*rejected=g_nvfp4_fallback_rejected;
     if(launch)*launch=g_nvfp4_fallback_launch;
 }
+extern "C" int coli_cuda_nvfp4_native_capable(int device){
+#ifdef COLI_CUTLASS_NVFP4
+    DeviceContext *ctx=find_ctx(device);
+    return ctx&&ctx->compute_major==12&&(ctx->compute_minor==0||ctx->compute_minor==1);
+#else
+    (void)device;return 0;
+#endif
+}
 
 extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
                                       ColiCudaTensor *down, float *y,
@@ -1090,7 +1103,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if (!first) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0;
     GroupDesc host[64]; if(count>64) return 0;
-    int all_s4=1,all_device=1;
+    int all_s4=1,all_nvfp4=1,any_nvfp4=0,all_device=1;
     for(int c=0;c<count;c++){
         ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
         if(!g||!u||!d||rows[c]<1||g->device!=device||u->device!=device||d->device!=device||
@@ -1099,9 +1112,16 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                  g->fmt,u->fmt,d->fmt,rows[c],total,
                  g->host_backed,u->host_backed,d->host_backed};
         all_s4&=g->fmt==2&&u->fmt==2&&d->fmt==2;
+        all_nvfp4&=g->fmt==COLI_TENSOR_MODELOPT_NVFP4&&
+                    u->fmt==COLI_TENSOR_MODELOPT_NVFP4&&
+                    d->fmt==COLI_TENSOR_MODELOPT_NVFP4;
+        any_nvfp4|=g->fmt==COLI_TENSOR_MODELOPT_NVFP4||
+                    u->fmt==COLI_TENSOR_MODELOPT_NVFP4||
+                    d->fmt==COLI_TENSOR_MODELOPT_NVFP4;
         all_device&=!g->host_backed&&!u->host_backed&&!d->host_backed;
         total+=rows[c]; if(rows[c]>max_rows) max_rows=rows[c];
     }
+    if(any_nvfp4&&!all_nvfp4)return 0;
     DeviceContext *ctx=find_ctx(device); if(!select_ctx(ctx)) return 0;
     size_t xb=(size_t)total*D*sizeof(float), ib=(size_t)total*I*sizeof(float);
     if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->y,&ctx->y_cap,xb)||
@@ -1138,7 +1158,22 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     tc=tc&&all_s4&&all_device&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
-    if(tc){
+    if(all_nvfp4){
+        /* Routed rows are already contiguous per expert. Keep the immutable
+         * expert records independently addressable and dispatch each problem
+         * on the common stream; tensor_matmul_launch selects CUTLASS W4A4 or
+         * the visible generic W4A32 fallback for every projection. */
+        int off=0;
+        for(int c=0;c<count;c++){
+            int r=rows[c];
+            tensor_matmul_launch(ctx->gate+(size_t)off*I,ctx->x+(size_t)off*D,gates[c],r,ctx->stream);
+            tensor_matmul_launch(ctx->up+(size_t)off*I,ctx->x+(size_t)off*D,ups[c],r,ctx->stream);
+            silu_mul<<<(unsigned)(((size_t)r*I+255)/256),256,0,ctx->stream>>>(
+                ctx->gate+(size_t)off*I,ctx->up+(size_t)off*I,(size_t)r*I);
+            tensor_matmul_launch(ctx->y+(size_t)off*D,ctx->gate+(size_t)off*I,downs[c],r,ctx->stream);
+            off+=r;
+        }
+    }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
            !reserve(&ctx->qscale,&ctx->qscale_cap,(size_t)(total+7)*sizeof(float)))return 0;

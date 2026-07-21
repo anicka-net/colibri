@@ -325,7 +325,12 @@ static void cuda_stats_print(void){
           ub/1e9,us/1e3); }
     {uint64_t n=0,g=0,f=0,e=0;coli_cuda_nvfp4_stats(&n,&g,&f,&e);
       if(n||g||f||e)fprintf(stderr,"[CUDA] NVFP4: native %llu | generic %llu | native-unavailable %llu | failures %llu\n",
-        (unsigned long long)n,(unsigned long long)g,(unsigned long long)f,(unsigned long long)e);}
+        (unsigned long long)n,(unsigned long long)g,(unsigned long long)f,(unsigned long long)e);
+      uint64_t shape=0,rejected=0,launch=0;
+      coli_cuda_nvfp4_fallback_stats(&shape,&rejected,&launch);
+      if(shape||rejected||launch)fprintf(stderr,
+        "[CUDA] NVFP4 native fallbacks: shape %llu | rejected %llu | launch %llu\n",
+        (unsigned long long)shape,(unsigned long long)rejected,(unsigned long long)launch);}
     {uint64_t q=0,r=0,f=0;coli_cuda_kv_fp8_stats(&q,&r,&f);
       if(q||r||f)fprintf(stderr,"[CUDA] FP8 KV: quantized rows %llu | reader rows %llu | fallbacks %llu\n",
         (unsigned long long)q,(unsigned long long)r,(unsigned long long)f);}
