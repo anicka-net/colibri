@@ -6016,6 +6016,18 @@ int main(int argc, char **argv){
         setenv("COLI_OMP_TUNED","1",1);
 #ifdef __linux__
         fprintf(stderr,"[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        /* #471: execv PRESERVES the CPU affinity mask. If the user exported
+         * OMP_PROC_BIND/OMP_PLACES, libgomp's constructor already bound THIS thread to
+         * place 0 (one core's SMT siblings) before main() ran; the re-exec'd image would
+         * inherit that 1-core mask, enumerate OMP_PLACES=cores inside it, and jail the
+         * whole team on one core (measured ~20x slowdown). Reset to all online CPUs so
+         * the fresh libgomp binds from the full set — the user's OMP_* env still wins. */
+        { cpu_set_t all; CPU_ZERO(&all);
+          long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+          if(ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
+          for(long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
+          if(sched_setaffinity(0, sizeof(all), &all) != 0)
+              perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
         execv("/proc/self/exe", argv);         /* returns only on failure -> fall through and run untuned */
         perror("[OMP] execv self-reexec failed, running untuned");
 #endif
