@@ -70,6 +70,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_REMOTE
+#include "remote_expert.h"
+#endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
 #include <omp.h>
@@ -303,6 +306,9 @@ static void cuda_stats_print(void){
       if(p)fprintf(stderr,"[CUDA] VRAM expert cache: %llu promotion, %llu eviction, "
           "%.2f GB uploaded in %.1f ms\n",(unsigned long long)p,(unsigned long long)e,
           ub/1e9,us/1e3); }
+#ifdef COLI_REMOTE
+    coli_remote_expert_stats(stderr);
+#endif
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -1355,7 +1361,7 @@ static void xcrc_emit(int layer,const float *src,int S,int D){
     uint64_t h=1469598103934665603ULL;
     const unsigned char *b=(const unsigned char*)src;
     for(size_t z=0;z<(size_t)S*D*4;z+=64){ h^=b[z]; h*=1099511628211ULL; }
-    double t2=0; for(int s=S-4;s<S;s++){ double n2=0;
+    double t2=0; for(int s=S>4?S-4:0;s<S;s++){ double n2=0;
         for(int j=0;j<D;j+=8){ float v=src[(int64_t)s*D+j]; n2+=(double)v*v; }
         t2+=n2; }
     fprintf(stderr,"[XCRC] L%02d %016llx tail4 %.6e\n",layer,(unsigned long long)h,t2);
@@ -3751,7 +3757,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
-    for(int base=0;base<nu;base+=64){
+    int routed_remote=0;
+#if defined(COLI_REMOTE) && defined(COLI_CUDA)
+    if(g_cuda_pipe>=2 && coli_remote_expert_enabled(layer,S)){
+        double tr=now_s();
+        routed_remote=coli_remote_expert_run(layer,x,S,uniq,nu,idxs,ws,keff,K,D,out);
+        if(routed_remote){ double dt=now_s()-tr; m->t_emm+=dt; if(g_prof)m->t_egpu+=dt; }
+    }
+#endif
+    if(!routed_remote) for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
@@ -4875,7 +4889,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                     int pok=pipe_layer_cuda(m,l,i,x_dev,S,pos_base,nrm,tmp);
                     if(!l->sparse){ if(pok)g_pipe_dense_ok++; else g_pipe_dense_fb++; }
                     if(pok){
-                        if(g_xcrc && S>=8){   /* probe anche sotto PIPE2 (il tail del loop e' saltato) */
+                        if(g_xcrc){           /* probe anche sotto PIPE2 (il tail del loop e' saltato) */
                             static float *cb=NULL; static size_t cc=0;
                             if(cc<xb){ free(cb); cb=malloc(xb); cc=xb; }
                             if(cb && coli_cuda_pipe_download(dev,x_dev,cb,xb)) xcrc_emit(i,cb,S,D);
@@ -4926,7 +4940,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
          * PIPE2 emette prima del suo continue).  Il download nel ramo PIPE2
          * forza il drain dello stream: se il jitter SPARISCE col probe attivo,
          * la race sta nell'overlap asincrono al confine di layer. */
-        if(g_xcrc && S>=8
+        if(g_xcrc
 #ifdef COLI_CUDA
            && x_dev_on<0
 #endif
@@ -5443,6 +5457,10 @@ static void stops_arm(const Cfg *c, int tok_eos){ stops_arm_tok(c,tok_eos,NULL);
  * killing the engine; :more can continue the interrupted answer. Armed only
  * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
 static volatile sig_atomic_t g_intr=0;
+/* Benchmark-only replay control: run the normal forward/routing path while
+ * keeping both sides of a performance A/B on the same continuation. */
+static const int *g_force_ref=NULL;
+static int g_force_ref_n=0;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
 static void intr_install(void){
@@ -5472,7 +5490,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
-        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
+        int next=(g_force_ref && emitted<g_force_ref_n)
+            ? g_force_ref[emitted] : pick_tok(logit,V,carry_ban);
+        carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         gr_feed(next);                                  /* il walker segue l'output emesso */
@@ -8381,8 +8401,13 @@ int main(int argc, char **argv){
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
+    if(getenv("FORCE_REF") && atoi(getenv("FORCE_REF"))){
+        if(g_temp>0){ fprintf(stderr,"FORCE_REF requires TEMP=0\n"); return 2; }
+        g_force_ref=full+np; g_force_ref_n=n_new;
+    }
     ProfBase pb; prof_base(&m,&pb);
     double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
+    g_force_ref=NULL; g_force_ref_n=0;
     int match=0;
     printf("\nReference (oracle): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
     printf("\nGLM C engine      : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }

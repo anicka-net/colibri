@@ -104,6 +104,38 @@ channel can use the management address while RDMA data stays on that device.
 The direct transport is fast enough to justify a remote expert-cache/compute
 prototype; the remaining question is scheduling and transfer granularity.
 
+### Remote complete-layer tier (measured 2026-07-21) — CLEARS GATE
+
+The smallest exact integration assigns six complete sparse layers (4–9) to
+deepthought. Those layers had the weakest historical coverage in
+pondermatic's 30 GB hot tier (5.6–11.7%). A 1,536-expert compact pack is
+29.05 GB. Pondermatic sends one normalized activation row plus the eight
+expert ids per layer; deepthought returns eight individual expert outputs,
+and pondermatic applies the existing router weights in the existing union
+order. The worker uses registered host buffers and the existing grouped CUDA
+ABI; no GPUDirect or general scheduler.
+
+Two order-reversed runs used the same 43-token prompt, frozen `.coli_usage`,
+PIPE2, TC gather off, and a forced exact 128-token continuation:
+
+| Order | Local wall | Remote wall | Gain | Local p50 | Remote p50 |
+|---|---:|---:|---:|---:|---:|
+| off → on | 127.10 s | 117.30 s | **7.7%** | 693.1 ms | 607.0 ms |
+| on → off | 125.29 s | 117.60 s | **6.1%** | 688.1 ms | 610.9 ms |
+
+Both sides replayed 128/128 exact tokens. Mean wall gain is **6.9%** and mean
+p50 gain **11.8%**. The remote worker served 762 layer calls / 6,096 expert
+rows per run at 683–684 us CUDA compute and 720 us end-to-end per call, with
+zero fallback. Expert-read wait fell from a mean 85.0 s to 75.3 s while
+pondermatic's CUDA resident set stayed fixed at 39.18 GB.
+
+Control: doubling pondermatic's local expert tier from 30 to 60 GB improved
+p50 876.7→770.4 ms and cut read wait 113.7→95.5 s, but orchestration rose
+6.2→54.2 s and total decode regressed 360.2→374.0 s. The win depends on
+independent remote capacity, not merely loading more experts into the first
+Spark. Missing or stalled workers disable the remote path within the bounded
+timeout and fall back locally; a no-worker smoke replayed 2/2 exact tokens.
+
 ### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: IndexShare, decode-attention attribution (inc.6 ruled out selection cost)
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048

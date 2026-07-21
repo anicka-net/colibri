@@ -18,6 +18,7 @@ FILES = [
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
+    "remote-expert-worker", "remote-expert-worker.exe", "remote_expert.o",
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
 ]
