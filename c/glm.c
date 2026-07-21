@@ -3424,7 +3424,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 }
             }
         }
-        if(!cuda_core)
+        if(!cuda_core){
         if(kvs&&g_cuda_enabled&&getenv("COLI_CUDA_ATTN")&&atoi(getenv("COLI_CUDA_ATTN"))&&
            !dnsel&&l->kv_b.cuda_eligible&&l->o.cuda_eligible&&
            qt_cuda_upload(&l->kv_b)&&qt_cuda_upload(&l->o)){
@@ -3484,6 +3484,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         coli_kv_row(ks->Rc[layer],st0,c->qk_rope),H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
             }
+        }
         }
 #endif
         if(!cuda_core){

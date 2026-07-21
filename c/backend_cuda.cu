@@ -1912,7 +1912,8 @@ __global__ static void gemv_f32_kernel(float *__restrict__ y, const float *__res
 
 template<typename KT>
 __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
-        const KT *latent,const KT *rope,const int *sel,int ns,
+        const KT *latent,const KT *rope,const float *latent_scale,const float *rope_scale,
+        const int *sel,int ns,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale);
 static int dsa_decode_tcgather(int device,float *ctx,const float *q,
