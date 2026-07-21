@@ -44,6 +44,11 @@ class NativeServerTest(unittest.TestCase):
                    OMP_PROC_BIND="false", COLI_ENGINE_OMP_PROC_BIND="spread")
         cls.web_tmp = tempfile.TemporaryDirectory()
         cls.runtime_tmp = tempfile.TemporaryDirectory()
+        cls.model_dir = Path(cls.runtime_tmp.name) / "model"
+        cls.model_dir.mkdir()
+        (cls.model_dir / "weights.bin").write_bytes(b"x" * 123)
+        os.utime(cls.model_dir / "weights.bin", (1700000000, 1700000000))
+        (cls.model_dir / ".coli_usage").write_bytes(b"runtime state")
         web = Path(cls.web_tmp.name)
         (web / "index.html").write_text("native dashboard", encoding="utf-8")
         outside = web.parent / (web.name + "-private")
@@ -54,7 +59,7 @@ class NativeServerTest(unittest.TestCase):
         env["XDG_RUNTIME_DIR"] = cls.runtime_tmp.name
         cls.server_env = env
         cls.process = subprocess.Popen([
-            str(ROOT / "coli-native"), "serve", "--model", "/fake",
+            str(ROOT / "coli-native"), "serve", "--model", str(cls.model_dir),
             "--host", "127.0.0.1", "--port", str(cls.port),
             "--model-id", "glm-test", "--model-alias", "glm-public",
             "--hidden-model-alias", "glm-hidden", "--api-key", "secret",
@@ -196,6 +201,8 @@ class NativeServerTest(unittest.TestCase):
             model = json.load(response)["models"][0]
             self.assertEqual(model["name"], "glm-test")
             self.assertRegex(model["digest"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(model["size"], 123)
+            self.assertEqual(model["modified_at"], "2023-11-14T22:13:20Z")
         with self.request("/api/show", {"model": "glm-test"}) as response:
             shown = json.load(response)
         self.assertIn("completion", shown["capabilities"])

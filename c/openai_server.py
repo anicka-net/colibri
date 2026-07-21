@@ -981,7 +981,7 @@ class APIServer(ThreadingHTTPServer):
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
                  kv_slots=1, model_aliases=(), hidden_model_aliases=(),
-                 context_length=None, default_thinking=False):
+                 context_length=None, default_thinking=False, model_path=None):
         super().__init__(address, APIHandler)
         self.engine = engine
         self.model_id = model_id
@@ -996,6 +996,20 @@ class APIServer(ThreadingHTTPServer):
         self.kv_slots = kv_slots
         self.cors_origins = tuple(cors_origins)
         self.created = int(time.time())
+        self.model_size = 0
+        self.model_modified = 0
+        if model_path:
+            for root, dirs, files in os.walk(model_path):
+                dirs[:] = [name for name in dirs if not name.startswith(".coli")]
+                for name in files:
+                    if name.startswith(".coli"):
+                        continue
+                    try:
+                        stat = os.stat(os.path.join(root, name))
+                    except OSError:
+                        continue
+                    self.model_size += stat.st_size
+                    self.model_modified = max(self.model_modified, int(stat.st_mtime))
         self.watchdog_lock = threading.Lock()
         self.watchdog_active = 0
         self.response_history_lock = threading.Lock()
@@ -1211,13 +1225,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"version": "colibri-1.0"}, request_id)
             elif path in ("/api/tags", "/api/ps"):
                 created_at = datetime.datetime.fromtimestamp(
-                    self.server.created, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+                    self.server.model_modified or self.server.created,
+                    datetime.timezone.utc).isoformat().replace("+00:00", "Z")
                 models = [{"name": model_id, "model": model_id,
-                           "modified_at": created_at, "size": 0,
+                           "modified_at": created_at, "size": self.server.model_size,
                            # Ollama's CLI slices the first 12 digest bytes when
                            # rendering `ollama list`; short IDs panic in older
                            # releases.
-                           "digest": "sha256:636f6c6962726900000000000000000000000000000000000000000000000000",
+                           "digest": "sha256:bb43a640f04c8e5504a8fbc8c6980455029f3e8fc1dedff10bcd04f94c4f4319",
                            "details": {
                                "format": "colibri", "family": "glm", "families": ["glm"],
                                "parameter_size": "744B", "quantization_level": "Q4"}}
@@ -2062,7 +2077,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2", api_key=None,
     # milliseconds rather than loading hundreds of GB and leaking a child.
     server = APIServer((host, port), None, model_id, api_key, max_tokens, origins,
                        max_queue, queue_timeout, kv_slots, model_aliases,
-                       hidden_model_aliases, context_length, default_thinking)
+                       hidden_model_aliases, context_length, default_thinking, model)
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:

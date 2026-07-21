@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -216,6 +217,8 @@ typedef struct {
   int active, queued, watchdog_active;
   unsigned long admitted, completed, rejected, timed_out, cancelled;
   time_t created;
+  unsigned long long model_size;
+  time_t model_modified;
   pthread_mutex_t history_mu;
   response_entry *history_head, *history_tail;
   int history_count;
@@ -229,6 +232,36 @@ static volatile sig_atomic_t signal_listener = -1;
 static _Thread_local char response_origin[512];
 static _Thread_local char response_path[1024];
 static _Thread_local char response_request_id[96];
+
+static void model_metadata(const char *path, unsigned long long *size,
+                           time_t *modified) {
+  struct stat st;
+  if (lstat(path, &st))
+    return;
+  if (S_ISREG(st.st_mode)) {
+    if (st.st_size > 0 && *size <= ULLONG_MAX - (unsigned long long)st.st_size)
+      *size += (unsigned long long)st.st_size;
+    if (st.st_mtime > *modified)
+      *modified = st.st_mtime;
+    return;
+  }
+  if (!S_ISDIR(st.st_mode))
+    return;
+  DIR *dir = opendir(path);
+  if (!dir)
+    return;
+  struct dirent *entry;
+  while ((entry = readdir(dir))) {
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+        !strncmp(entry->d_name, ".coli", 5))
+      continue;
+    char child[PATH_MAX];
+    if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) <
+        (int)sizeof(child))
+      model_metadata(child, size, modified);
+  }
+  closedir(dir);
+}
 
 static int http_debug_enabled(void) {
   const char *value = getenv("COLI_DEBUG_HTTP");
@@ -2588,7 +2621,11 @@ static void ollama_discovery(server *s, int fd, int ps) {
      full, sha256-shaped value even though Colibri does not manage Ollama
      manifests, so older clients do not panic on a short compatibility ID. */
   static const char digest[] =
-      "sha256:636f6c6962726900000000000000000000000000000000000000000000000000";
+      "sha256:bb43a640f04c8e5504a8fbc8c6980455029f3e8fc1dedff10bcd04f94c4f4319";
+  char modified[32] = "1970-01-01T00:00:00Z";
+  struct tm utc;
+  if (s->model_modified && gmtime_r(&s->model_modified, &utc))
+    strftime(modified, sizeof(modified), "%Y-%m-%dT%H:%M:%SZ", &utc);
   buf b = {0};
   b_add(&b, "{\"models\":[{");
   if (ps) {
@@ -2596,7 +2633,7 @@ static void ollama_discovery(server *s, int fd, int ps) {
     b_json(&b, s->c.model_id);
     b_add(&b, ",\"model\":");
     b_json(&b, s->c.model_id);
-    b_add(&b, ",\"size\":0,\"digest\":");
+    b_printf(&b, ",\"size\":%llu,\"digest\":", s->model_size);
     b_json(&b, digest);
     b_add(&b, ",\"expires_at\":\"9999-12-31T23:59:59Z\",\"size_vram\":0");
   } else {
@@ -2604,7 +2641,9 @@ static void ollama_discovery(server *s, int fd, int ps) {
     b_json(&b, s->c.model_id);
     b_add(&b, ",\"model\":");
     b_json(&b, s->c.model_id);
-    b_add(&b, ",\"modified_at\":\"1970-01-01T00:00:00Z\",\"size\":0,\"digest\":");
+    b_add(&b, ",\"modified_at\":");
+    b_json(&b, modified);
+    b_printf(&b, ",\"size\":%llu,\"digest\":", s->model_size);
     b_json(&b, digest);
     b_add(&b,
           ",\"details\":{\"format\":\"safetensors\",\"family\":\"glm\","
@@ -3018,6 +3057,7 @@ int coli_server_run(const coli_server_config *c) {
   server s = {0};
   s.c = *c;
   s.created = time(NULL);
+  model_metadata(s.c.model, &s.model_size, &s.model_modified);
   pthread_mutex_init(&s.sched_mu, NULL);
   pthread_cond_init(&s.sched_cv, NULL);
   pthread_mutex_init(&s.history_mu, NULL);
