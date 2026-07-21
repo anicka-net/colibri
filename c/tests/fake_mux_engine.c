@@ -62,6 +62,10 @@ int main(void) {
                                                      : "deferred-ok")
           : strstr(prompt, "native tool syntax")
               ? "I'll look that up.<tool_call>lookup(**q**: \"finch\")"
+          : strstr(prompt, "multiple tools")
+              ? "<tool_call>lookup<arg_key>q</arg_key><arg_value>bird</"
+                "arg_value></tool_call><tool_call>lookup<arg_key>q</arg_key>"
+                "<arg_value>fish</arg_value></tool_call>"
           : strstr(prompt, "# Tools")
               ? "<tool_call>lookup<arg_key>q</arg_key><arg_value>bird</"
                 "arg_value></tool_call>"

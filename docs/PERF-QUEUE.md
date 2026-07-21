@@ -35,6 +35,20 @@ tensor-core **0.378–0.386 s/request** versus scalar **0.444–0.451 s/request*
 expert-tier hits. A padded S=1 tensor-core output projection measured slower
 (~176 ms phase), so only the absorption decomposition uses WMMA.
 
+The first default-on version still launched scalar absorption after a
+successful TC gather and then cleared that launch's error.  The corrected path
+uses the gathered context directly, retains the cached GEMV, and checks scalar
+fallback launches normally.  Treat the pre-fix H100 number above as
+provisional until it is repeated on the corrected control flow.
+
+Corrected GB10 measurement used a frozen usage file and a 2,701-token prompt.
+TC-off/TC-on generated identical first-32-token continuations; over 128 greedy
+tokens the trajectories diverged after token 35.  TC gather engaged 9,906 rows
+with zero fallback, cut attention 48.8 -> 37.4 s and decode p50 846.1 -> 791.5
+ms, but wall time improved only 376.0 -> 371.5 s (**1.2%**).  That misses the
+5% production gate, so the GB10 service keeps
+`COLI_DSA_DECODE_TCGATHER=0`.
+
 Implementation gotcha: timestamp-preserving deployment could leave a newer
 remote `backend_cuda.o` and silently reuse stale code. CUDA validation builds
 must use `make -B` (or remove the object) after source synchronization.
@@ -622,6 +636,13 @@ prefill), 64 greedy output tokens: **p50 485.5 -> 221.5 ms/forward**, or about
 DSA fallbacks; the old outer projection/RoPE bucket fell from 171.4 s/668 tok
 to exactly 0.  The remaining attention cost is resident DSA, especially
 selected absorb+o_proj (7.08 s/64 tok, ~111 ms/token).
+
+The matched GB10 result also clears the deployment gate.  With a frozen usage
+file, a 2,701-token prompt, and a fixed 128-token continuation, candidate
+PIPE0 matched the preceding build (453.5 vs 451.5/451.7 s decode), while PIPE2
+repeated at 364.0 and 360.2 s: about **20% faster decode** and **19% faster
+wall-clock**.  All controlled runs executed the same 128-token continuation;
+PIPE2 recorded 384/384 dense engagements and zero fallback.
 
 #### Increment 8 — device-side top-k for prefill selection (landed, default ON)
 `COLI_DSA_DEVTOPK=1` (default; `=0` restores the host top-k) moves the

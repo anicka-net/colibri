@@ -1961,35 +1961,37 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
         if(tc_ok)coli_dsac_tcg_rows+=(uint64_t)S;
         else coli_dsac_tcg_fb+=(uint64_t)S;
     }
-    /* loop 2: absorb + o_proj per row (over the selection when active) */
+    /* loop 2: scalar absorb fallback + o_proj per row */
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         float *qQs=qQ+(size_t)s*H*qh;
         float *cxrow=tc_ok?tc_ctx+(size_t)s*H*vh:cx;
-        if(selm&&!tc_ok){
-            int ns=dsa->nsel[s];
-            size_t smem_sel=(size_t)(2*kv_lora+ns+256)*sizeof(float);
-            if(f16) attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cxrow,qQs,
-                hLc,hRc,dsel_d+(size_t)s*dsa->topk,ns,
-                kvb->weights,kvb->scales,kvb->fmt,
-                H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
-            else attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cxrow,qQs,
-                d_Lc,d_Rc,dsel_d+(size_t)s*dsa->topk,ns,
-                kvb->weights,kvb->scales,kvb->fmt,
-                H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
-        }else if(f16)
-            absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
-                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
-                hLc,hRc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
-        else
-            absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
-                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
-                d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
-        /* WMMA completion can leave a stale per-thread launch status even
-         * after every TC launch was checked.  Clear it at the stage boundary;
-         * the canonical downloads below still synchronize and report real
-         * execution failures. */
-        if(tc_ok)(void)cudaGetLastError();
+        if(!tc_ok){
+            if(selm){
+                int ns=dsa->nsel[s];
+                size_t smem_sel=(size_t)(2*kv_lora+ns+256)*sizeof(float);
+                if(f16) attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cxrow,qQs,
+                    hLc,hRc,dsel_d+(size_t)s*dsa->topk,ns,
+                    kvb->weights,kvb->scales,kvb->fmt,
+                    H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
+                else attention_absorb_sel_kernel<<<H,256,smem_sel>>>(cxrow,qQs,
+                    d_Lc,d_Rc,dsel_d+(size_t)s*dsa->topk,ns,
+                    kvb->weights,kvb->scales,kvb->fmt,
+                    H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
+            }else if(f16)
+                absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
+                    (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                    hLc,hRc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
+            else
+                absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
+                    (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                    d_Lc,d_Rc,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
+            if(!cuda_ok(cudaGetLastError(),"chain selected absorb"))return 0;
+        }else{
+            /* Preserve the H100 WMMA stage-boundary clear.  Every TC launch
+             * was checked above; later downloads still report execution errors. */
+            (void)cudaGetLastError();
+        }
         if(tc_ok)gemv_q4_cached<<<((unsigned)D+3)/4,128>>>(aout+(size_t)s*D,cxrow,
             (const uint8_t*)o_proj->weights,o_proj->scales,H*vh,D);
         else gemv_q4<<<((unsigned)D+7)/8,256,smem_o>>>(aout+(size_t)s*D,cxrow,
