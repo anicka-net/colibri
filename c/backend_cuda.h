@@ -142,7 +142,12 @@ COLI_CUDA_DLLEXPORT float *coli_cuda_pipe_scratch(int device,int slot,size_t byt
  * host canonical caches stay exact fp32.  Shadow pointers remain float* in
  * every signature (opaque to the host); ALL element offsets into a shadow must
  * go through these helpers or be byte-scaled by the element size (2 or 4). */
-COLI_CUDA_DLLEXPORT int coli_cuda_kv_f16(void);
+/* Effective shadow dtype after COLI_KV_DTYPE precedence and legacy fallback:
+ * 0=fp32, 1=fp16, 2=fp8 E4M3. Invalid settings make CUDA initialization fail. */
+COLI_CUDA_DLLEXPORT int coli_cuda_kv_dtype(void);
+COLI_CUDA_DLLEXPORT int coli_cuda_kv_f16(void); /* compatibility: dtype==fp16 */
+COLI_CUDA_DLLEXPORT void coli_cuda_kv_fp8_stats(uint64_t *quantized_rows,
+                            uint64_t *reader_rows,uint64_t *fallbacks);
 /* Upload host fp32 rows into a shadow at element offset, converting if f16. */
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload_kv(int device,void *dst,const float *src,
                             size_t elems,size_t elem_off);
@@ -150,6 +155,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload_kv(int device,void *dst,const floa
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d_kv(int device,void *dst,int dpitch,
                             const float *src,int spitch,int width,int height,
                             size_t elem_off);
+/* FP8-aware row writers. scale_dst is required only for fp8 and contains one
+ * fp32 scale per row. Values and scales are completed on the same stream. */
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_upload_kv_rows(int device,void *dst,
+                            float *scale_dst,const float *src,int rows,int width,
+                            int row_off);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d_kv_rows(int device,void *dst,
+                            float *scale_dst,const float *src,int spitch,
+                            int rows,int width,int row_off);
 /* DSA selection support for the fused chain (phase 2 inc.2).  All-or-nothing:
  * pass NULL to keep the dense absorb.  On indexer-FULL layers the ix_* tensors
  * are set and the chain computes the new k_idx row + selection scores on the
@@ -161,6 +174,7 @@ typedef struct {
     const ColiCudaTensor *ix_wq, *ix_wk, *ix_wp;  /* NULL on 'shared' layers */
     const float *knw_dev, *knb_dev;   /* k_norm LayerNorm weight/bias, device [hd] */
     float *d_Ic;                      /* device index-key shadow [max_t, hd] */
+    float *d_Ic_scale;                /* fp8 only: one scale per Ic row */
     int nh, hd, topk;
     int *sel, *nsel;                  /* host [S*topk] / [S]; refreshed on FULL layers */
     float *iscore_host;               /* host staging [S*(pos_base+S)] for score rows */
@@ -187,7 +201,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_attn_chain_v2(int device,
         const ColiCudaTensor *kva, const ColiCudaTensor *kvb,
         const ColiCudaTensor *o_proj,
         const float *w_in, const float *w_qa, const float *w_kva, const float *w_post,
-        float *d_Lc, float *d_Rc,
+        float *d_Lc, float *d_Rc, float *d_Lc_scale, float *d_Rc_scale,
         int D, int H, int q_lora, int kv_lora,
         int qk_nope, int qk_rope, int vh,
         int S, int pos_base, int kv_start,
@@ -227,6 +241,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,fl
         float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_sel(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q,const float *latent_dev,const float *rope_dev,
+        const float *latent_scale,const float *rope_scale,
         const int *sel,int ns,int H,int Q,int R,int V,int K,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
                              const float *src,size_t bytes);
@@ -239,6 +254,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor
  * ignored). */
 COLI_CUDA_DLLEXPORT int coli_cuda_prefill_attn_gemm(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
+        const float *latent_scale,const float *rope_scale,
         int S,int H,int Q,int R,int V,int K,int T,float scale,
         const int *sel_host,int sB0,int sel_topk);
 /* DSA prefill indexer pass: k_idx for the S new rows into the device Ic shadow

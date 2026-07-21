@@ -40,8 +40,9 @@ int main(void){
     assert(adaptive_cap_target(&m,10)==41);
     g_adaptive_cap_highwater=90;
     assert(adaptive_cap_target(&m,10)==27);
-    assert(cuda_ic_shadow_bytes_for(2,128,131072,1)==134217728.0);
-    assert(cuda_ic_shadow_bytes_for(2,128,131072,3)==402653184.0);
+    assert(cuda_ic_shadow_bytes_for(2,128,131072,1,4,0)==134217728.0);
+    assert(cuda_ic_shadow_bytes_for(2,128,131072,3,4,0)==402653184.0);
+    assert(cuda_ic_shadow_bytes_for(2,128,131072,1,1,4)==34603008.0);
     assert(cuda_ic_shadow_layer_eligible(1,1,1)); /* dense and sparse resident layers */
     assert(!cuda_ic_shadow_layer_eligible(0,1,1)); /* SHARED indexer */
     assert(!cuda_ic_shadow_layer_eligible(1,0,1)); /* resident path unavailable */

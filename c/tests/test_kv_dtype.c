@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "../kv_dtype.h"
 
@@ -20,5 +21,27 @@ int main(void){
     if(roundtrip[0]!=-448||roundtrip[8]!=448||roundtrip[4]!=0)return 5;
     float bad[]={NAN};if(!isnan(coli_kv_fp8_quantize_row(encoded,bad,1)))return 6;
     if(coli_kv_fp8_dequantize_row(roundtrip,encoded,1,0))return 7;
+    /* Long-context shadow oracle: values and their per-row scales remain
+     * finite across 4k/32k boundaries, including an exact rewind overwrite. */
+    const int width=17,max_rows=32768;
+    uint8_t *values=malloc((size_t)max_rows*width);float *scales=malloc((size_t)max_rows*4);
+    float *src=malloc((size_t)width*4),*dst=malloc((size_t)width*4);
+    if(!values||!scales||!src||!dst)return 8;
+    for(int r=0;r<max_rows;r++){
+        for(int i=0;i<width;i++)src[i]=sinf((float)(r*19+i)*0.013f)*(1.f+(r%31));
+        scales[r]=coli_kv_fp8_quantize_row(values+(size_t)r*width,src,width);
+        if(!isfinite(scales[r])||scales[r]<=0||
+           !coli_kv_fp8_dequantize_row(dst,values+(size_t)r*width,width,scales[r]))return 9;
+        float tol=scales[r]*32.f+1e-6f;
+        for(int i=0;i<width;i++)if(!isfinite(dst[i])||fabsf(dst[i]-src[i])>tol)return 10;
+    }
+    int rewind=4096;
+    for(int r=rewind;r<rewind+7;r++){
+        for(int i=0;i<width;i++)src[i]=(float)(r-rewind+1)*(i-8);
+        scales[r]=coli_kv_fp8_quantize_row(values+(size_t)r*width,src,width);
+        if(!coli_kv_fp8_dequantize_row(dst,values+(size_t)r*width,width,scales[r]))return 11;
+        for(int i=0;i<width;i++)if(!isfinite(dst[i]))return 12;
+    }
+    free(values);free(scales);free(src);free(dst);
     puts("kv dtype: ok");return 0;
 }
