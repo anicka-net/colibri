@@ -155,9 +155,13 @@ def main() -> None:
     parser.add_argument("--source-revision", required=True,
                         help="exact immutable source commit, never a branch name")
     parser.add_argument("--n-layers", type=int, default=78)
+    parser.add_argument("--expected-shards", type=int, default=0,
+                        help="refuse partial input until exactly this many model shards exist")
     args = parser.parse_args()
     source_shards = sorted(args.indir.glob("*.safetensors"))
     if not source_shards: raise SystemExit(f"no Safetensors shards in {args.indir}")
+    if args.expected_shards and len(source_shards) != args.expected_shards:
+        raise SystemExit(f"expected {args.expected_shards} Safetensors shards, found {len(source_shards)}")
     shared=args.outdir/"shared-experts"; faithful=args.outdir/"faithful"; compact=args.outdir/"compact"
     for directory in (shared,faithful,compact): directory.mkdir(parents=True,exist_ok=True)
     _, _, save_file = dependencies()
