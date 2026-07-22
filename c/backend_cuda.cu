@@ -517,6 +517,43 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
         ctx[((size_t)s*H+h)*V+v]=a*row_scale_at(wscale,fmt,row);}
 }
 
+/* Constant-shared-memory correctness path for contexts whose score vector no
+ * longer fits in a block.  Thread 0 performs an online softmax and accumulates
+ * the latent expectation without materializing T scores; projection remains
+ * parallel.  Long-context high-throughput paths use DSA/tensor-core kernels,
+ * but ordinary attention must remain correct for every supported context. */
+template<typename KT>
+__global__ static void attention_absorb_online_kernel(float *ctx,const float *q,
+        const KT *latent,const KT *rope,const float *latent_scale,const float *rope_scale,
+        const void *weights,const float *wscale,
+        int fmt,int S,int H,int Q,int R,int V,int K,int T,float scale){
+    int s=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,nt=T-S+s+1,rbase=h*(Q+V);
+    if(s>=S||nt<1)return;
+    extern __shared__ float sm[];float *qa=sm,*cl=qa+K;
+    const float *qs=q+((size_t)s*H+h)*(Q+R);
+    for(int k=tid;k<K;k+=blockDim.x){float a=0;for(int d=0;d<Q;d++)
+        a+=qs[d]*weight_at(weights,fmt,(size_t)(rbase+d)*row_bytes(fmt,K),k)*
+          row_scale_at(wscale,fmt,rbase+d);qa[k]=a;cl[k]=0.f;}
+    __syncthreads();
+    if(tid==0){
+        float mx=-3.402823466e+38F,z=0.f;
+        for(int t=0;t<nt;t++){
+            float score=0.f;
+            for(int k=0;k<K;k++)score+=qa[k]*kv_at(latent,latent_scale,t,K,k);
+            for(int d=0;d<R;d++)score+=qs[Q+d]*kv_at(rope,rope_scale,t,R,d);
+            score*=scale;
+            float nm=fmaxf(mx,score),old=(z==0.f)?0.f:expf(mx-nm),add=expf(score-nm);
+            for(int k=0;k<K;k++)cl[k]=cl[k]*old+add*kv_at(latent,latent_scale,t,K,k);
+            z=z*old+add;mx=nm;
+        }
+        float inv=1.f/z;for(int k=0;k<K;k++)cl[k]*=inv;
+    }
+    __syncthreads();
+    for(int v=tid;v<V;v+=blockDim.x){int row=rbase+Q+v;float a=0;size_t rb=row_bytes(fmt,K);
+        for(int k=0;k<K;k++)a+=cl[k]*weight_at(weights,fmt,(size_t)row*rb,k);
+        ctx[((size_t)s*H+h)*V+v]=a*row_scale_at(wscale,fmt,row);}
+}
+
 /* Independent KV sequence per row. latent/rope are packed as [S,T,*], while
  * lengths selects the valid prefix for each row. */
 __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
@@ -2566,11 +2603,17 @@ static int absorb_batch_shadow_launch(DeviceContext *dc,float *ctx,const float *
     size_t shared;
     if(kv_dtype_mode()==2){
         if(!latent_scale||!rope_scale){g_kv_fp8_fallbacks++;return 0;}
-        if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel<uint8_t>,
-                           &dc->absorb_attr_set_fp8))return 0;
-        attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx,q_dev,
-            (const uint8_t*)latent_dev,(const uint8_t*)rope_dev,latent_scale,rope_scale,
-            w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        if(absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel<uint8_t>,
+                          &dc->absorb_attr_set_fp8))
+            attention_absorb_batch_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx,q_dev,
+                (const uint8_t*)latent_dev,(const uint8_t*)rope_dev,latent_scale,rope_scale,
+                w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        else{
+            shared=(size_t)2*K*sizeof(float);
+            attention_absorb_online_kernel<<<dim3(H,S),256,shared,dc->stream>>>(ctx,q_dev,
+                (const uint8_t*)latent_dev,(const uint8_t*)rope_dev,latent_scale,rope_scale,
+                w->weights,w->scales,w->fmt,S,H,Q,R,V,K,T,scale);
+        }
         g_kv_fp8_reader_rows+=(uint64_t)T;
     }else if(kv_f16_mode()){
         if(!absorb_smem_ok(dc,K,T,&shared,(const void*)attention_absorb_batch_kernel<__half>,

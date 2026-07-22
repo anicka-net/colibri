@@ -220,6 +220,44 @@ int main(int argc, char **argv) {
         coli_cuda_pipe_free(d0,dl);coli_cuda_pipe_free(d0,dr);
         coli_cuda_pipe_free(d0,dls);coli_cuda_pipe_free(d0,drs);
         std::fprintf(stderr,"FP8 KV BF16 attention reader: ok\n");
+
+        /* Long-context shadow gate: exercise the real 32k row quantizers and
+           dequantizing attention reader, including their scale arrays.  Zero
+           KV has an exact finite zero result independent of softmax rounding. */
+        constexpr int LT=32768;
+        float *ll=(float*)std::calloc((size_t)LT*4,sizeof(float));
+        float *lr=(float*)std::calloc((size_t)LT*2,sizeof(float));
+        void *lld=coli_cuda_pipe_alloc(d0,(size_t)LT*4);
+        void *lrd=coli_cuda_pipe_alloc(d0,(size_t)LT*2);
+        float *lls=(float*)coli_cuda_pipe_alloc(d0,(size_t)LT*sizeof(float));
+        float *lrs=(float*)coli_cuda_pipe_alloc(d0,(size_t)LT*sizeof(float));
+        if(!ll||!lr||!lld||!lrd||!lls||!lrs){
+            std::fprintf(stderr,"FP8 KV 32k allocation failed\n");return 1;
+        }
+        if(!coli_cuda_pipe_upload_kv_rows(d0,lld,lls,ll,LT,4,0)){
+            std::fprintf(stderr,"FP8 KV 32k latent quantization failed\n");return 1;
+        }
+        if(!coli_cuda_pipe_upload_kv_rows(d0,lrd,lrs,lr,LT,2,0)){
+            std::fprintf(stderr,"FP8 KV 32k rope quantization failed\n");return 1;
+        }
+        if(!coli_cuda_attention_absorb_kvdev(atbf,actx,aq,(const float*)lld,
+                (const float*)lrd,lls,lrs,1,2,2,2,4,LT,1.f)){
+            std::fprintf(stderr,"FP8 KV 32k attention reader failed\n");return 1;
+        }
+        if(!std::isfinite(actx[0])||!std::isfinite(actx[1])||
+           std::fabs(actx[0])>1e-6f||std::fabs(actx[1])>1e-6f){
+            std::fprintf(stderr,"FP8 KV 32k result invalid: %g %g\n",actx[0],actx[1]);return 1;
+        }
+        coli_cuda_kv_fp8_stats(&qrows,&rrows,&fb);
+        if(qrows!=6+2u*LT||rrows!=3u+LT||fb){
+            std::fprintf(stderr,"FP8 KV 32k counters invalid: q=%llu r=%llu fallback=%llu\n",
+                (unsigned long long)qrows,(unsigned long long)rrows,(unsigned long long)fb);
+            return 1;
+        }
+        std::free(ll);std::free(lr);
+        coli_cuda_pipe_free(d0,lld);coli_cuda_pipe_free(d0,lrd);
+        coli_cuda_pipe_free(d0,lls);coli_cuda_pipe_free(d0,lrs);
+        std::fprintf(stderr,"FP8 KV 32k shadow/reader: ok\n");
     }
     coli_cuda_tensor_free(atbf);
 

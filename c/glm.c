@@ -2252,13 +2252,17 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
  * them in one syscall, and reaps CQEs on demand.  The kernel, rather than a set
  * of blocking pthreads, owns the I/O concurrency. */
 #define URING_LOAD_MAX 64
-#define URING_REQ_MAX  512
+#define URING_REQ_MAX  1024
 typedef struct {
     int load, expect;
 } UringRead;
 typedef struct {
     Model *m; ESlot *s; int layer,eid,fatal;
-    st_tensor *tw[3],*tq[3]; int64_t pos[3];
+    st_tensor *tw[3],*tq[3],*tt[3],*ti[3];
+    int64_t pos[3],scale_pos[3],tensor_pos[3],input_pos[3];
+    int64_t src_pos[3],src_scale_pos[3];
+    void *iobuf; size_t iobuf_cap;
+    int native,native_coalesced;
     int pending,done,finalized,error;
 } UringLoad;
 typedef struct {
@@ -2300,14 +2304,90 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
     char nm[3][288],qn[300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
-    snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
-    if(g_mmap || !st_has(&m->S,qn))
-        return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
+    if(g_mmap) return uring_load_error(l,ENOTSUP,"URING is incompatible with mmap"),li;
 #ifdef COLI_CUDA
     if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
     if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
     if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
+    if(m->manifest.present){
+        Cfg *c=&m->c; int I=c->moe_inter,D=c->hidden;
+        int OO[3]={I,I,D},II[3]={D,D,I}; int64_t slab_need=0;
+        char side[360]; l->native=1;
+        for(int k=0;k<3;k++){
+            l->tw[k]=st_find(&m->S,nm[k]);
+            snprintf(side,sizeof(side),"%.287s.nvfp4_scale",nm[k]);l->tq[k]=st_find(&m->S,side);
+            snprintf(side,sizeof(side),"%.287s.nvfp4_tensor_scale",nm[k]);l->tt[k]=st_find(&m->S,side);
+            snprintf(side,sizeof(side),"%.287s.nvfp4_input_scale",nm[k]);l->ti[k]=st_find(&m->S,side);
+            int64_t wb=(int64_t)OO[k]*((II[k]+1)/2);
+            int64_t sb=(int64_t)coli_nvfp4_cutlass_scale_bytes(OO[k],II[k]);
+            if(!l->tw[k]||!l->tq[k]||!l->tt[k]||!l->ti[k]||
+               l->tw[k]->dtype!=3||l->tq[k]->dtype!=3||l->tt[k]->dtype!=2||l->ti[k]->dtype!=2||
+               l->tw[k]->nbytes!=wb||l->tq[k]->nbytes!=sb||
+               l->tt[k]->nbytes!=4||l->ti[k]->nbytes!=4||INT64_MAX-slab_need<wb+sb)
+                return uring_load_error(l,EINVAL,"invalid native NVFP4 io_uring metadata"),li;
+            slab_need+=wb+sb;
+        }
+        st_tensor *part[12];int np=0;
+        for(int k=0;k<3;k++){part[np++]=l->tw[k];part[np++]=l->tq[k];part[np++]=l->tt[k];part[np++]=l->ti[k];}
+        for(int a=0;a<np;a++)for(int z=a+1;z<np;z++)if(part[z]->off<part[a]->off){st_tensor *t=part[a];part[a]=part[z];part[z]=t;}
+        int contiguous=1;for(int a=1;a<np;a++)if(part[a]->fd!=part[0]->fd||
+            part[a-1]->off+part[a-1]->nbytes!=part[a]->off)contiguous=0;
+        int64_t record_off=part[0]->off;
+        int64_t record_span=part[np-1]->off+part[np-1]->nbytes-record_off;
+        if(contiguous){slab_need=record_span;l->native_coalesced=1;}
+        if(!s->slab||slab_need>s->slab_cap){
+            compat_aligned_free(s->slab);s->slab=NULL;s->slab_cap=0;
+            size_t alloc=((size_t)slab_need+4095)&~(size_t)4095;
+            if(posix_memalign((void**)&s->slab,4096,alloc))
+                return uring_load_error(l,ENOMEM,"io_uring native expert slab"),li;
+            s->slab_cap=alloc;numa_slab_bind(s->slab,alloc);
+        }
+        if(!s->fslab||s->fslab_cap<6){
+            free(s->fslab);s->fslab=malloc(6*sizeof(float));s->fslab_cap=s->fslab?6:0;
+            if(!s->fslab) return uring_load_error(l,ENOMEM,"io_uring native scalar slab"),li;
+            numa_slab_bind(s->fslab,6*sizeof(float));
+        }
+        if(contiguous){
+            size_t packed=0;
+            for(int k=0;k<3;k++){
+                l->src_pos[k]=l->tw[k]->off-record_off;
+                l->src_scale_pos[k]=l->tq[k]->off-record_off;
+                packed=(packed+15)&~(size_t)15;l->pos[k]=(int64_t)packed;packed+=(size_t)l->tw[k]->nbytes;
+                packed=(packed+15)&~(size_t)15;l->scale_pos[k]=(int64_t)packed;packed+=(size_t)l->tq[k]->nbytes;
+                l->tensor_pos[k]=l->tt[k]->off-record_off;l->input_pos[k]=l->ti[k]->off-record_off;
+            }
+            if(packed>s->slab_cap)
+                return uring_load_error(l,EOVERFLOW,"io_uring native packed expert slab"),li;
+            int dfd=g_direct?st_direct_fd(&m->S,part[0]->fd):-1;
+            size_t len=dfd>=0?(((size_t)record_span+4095)&~(size_t)4095):(size_t)record_span;
+            if(posix_memalign(&l->iobuf,4096,(len+4095)&~(size_t)4095))
+                return uring_load_error(l,ENOMEM,"io_uring native record staging"),li;
+            l->iobuf_cap=(len+4095)&~(size_t)4095;
+            if(uring_add_read(b,li,dfd>=0?dfd:part[0]->fd,l->iobuf,len,record_off,(size_t)record_span))
+                return uring_load_error(l,errno,"io_uring native coalesced record read"),li;
+            return li;
+        }
+        int64_t o=0;
+        for(int k=0;k<3;k++){
+            l->pos[k]=o;
+            if(uring_add_read(b,li,l->tw[k]->fd,s->slab+o,(size_t)l->tw[k]->nbytes,
+                              l->tw[k]->off,(size_t)l->tw[k]->nbytes))
+                return uring_load_error(l,errno,"io_uring native weight read"),li;
+            o+=l->tw[k]->nbytes;l->scale_pos[k]=o;
+            if(uring_add_read(b,li,l->tq[k]->fd,s->slab+o,(size_t)l->tq[k]->nbytes,
+                              l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+                return uring_load_error(l,errno,"io_uring native block-scale read"),li;
+            o+=l->tq[k]->nbytes;
+            if(uring_add_read(b,li,l->tt[k]->fd,&s->fslab[k*2],4,l->tt[k]->off,4)||
+               uring_add_read(b,li,l->ti[k]->fd,&s->fslab[k*2+1],4,l->ti[k]->off,4))
+                return uring_load_error(l,errno,"io_uring native tensor-scale read"),li;
+        }
+        return li;
+    }
+    snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    if(!st_has(&m->S,qn))
+        return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
         size_t n=strnlen(nm[k],sizeof(nm[k]));
@@ -2408,6 +2488,45 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     UringLoad *l=&b->load[li]; ESlot *s=l->s;
     if(l->finalized) return 0;
     if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
+    if(l->native){
+        Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden;
+        QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+        int64_t total=0;
+        for(int k=0;k<3;k++){
+            if(l->native_coalesced){
+                memcpy(s->slab+l->pos[k],(uint8_t*)l->iobuf+l->src_pos[k],(size_t)l->tw[k]->nbytes);
+                memcpy(s->slab+l->scale_pos[k],(uint8_t*)l->iobuf+l->src_scale_pos[k],(size_t)l->tq[k]->nbytes);
+                memcpy(&s->fslab[k*2],(uint8_t*)l->iobuf+l->tensor_pos[k],4);
+                memcpy(&s->fslab[k*2+1],(uint8_t*)l->iobuf+l->input_pos[k],4);
+            }
+            uint8_t *bs=s->slab+l->scale_pos[k]; int64_t sb=l->tq[k]->nbytes;
+            float ts=s->fslab[k*2],is=s->fslab[k*2+1];
+            if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
+                return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
+            for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z])))
+                return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
+            for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
+                float v=coli_e4m3fn_f32(bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
+                if(!isfinite(v)||v<=0)
+                    return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
+            }
+            qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
+            qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;qt[k]->O=OO[k];qt[k]->I=II[k];
+            qt[k]->gs=COLI_NVFP4_GROUP_SIZE;qt[k]->q4=s->slab+l->pos[k];
+            qt[k]->block_scales=bs;qt[k]->tensor_scale=ts;qt[k]->input_scale=is;
+            qt[k]->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;
+            total+=l->tw[k]->nbytes+sb+8;
+        }
+        free(l->iobuf);l->iobuf=NULL;l->iobuf_cap=0;
+        if(g_drop) for(int k=0;k<3;k++){
+            posix_fadvise(l->tw[k]->fd,l->tw[k]->off,l->tw[k]->nbytes,POSIX_FADV_DONTNEED);
+            posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
+            posix_fadvise(l->tt[k]->fd,l->tt[k]->off,4,POSIX_FADV_DONTNEED);
+            posix_fadvise(l->ti[k]->fd,l->ti[k]->off,4,POSIX_FADV_DONTNEED);
+        }
+        atomic_fetch_add_explicit(&g_prof_io,total,memory_order_relaxed);
+        if(publish_eid)s->eid=l->eid;l->finalized=1;return 0;
+    }
     if(g_drop){
         int ord0=0; for(int k=1;k<3;k++) if(l->tw[k]->off<l->tw[ord0]->off) ord0=k;
         int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
@@ -2507,12 +2626,10 @@ static void *pipe_worker(void *arg){
 static void pipe_init(Model *m){
     if(g_pp.started) return;
 #ifdef __linux__
-    if(g_uring&&m->manifest.present){
-        fprintf(stderr,"[NVFP4] io_uring record loader not engaged; using validated threaded pread fallback\n");
-        g_uring=0;
-    }
     if(g_uring){
         if(uring_batch_init(&g_ub_pipe)){ perror("URING=1 io_uring_setup"); exit(1); }
+        if(m->manifest.present)
+            fprintf(stderr,"[NVFP4] complete-record io_uring loader active\n");
         g_pp.m=m; g_pp.started=1; return;
     }
 #endif

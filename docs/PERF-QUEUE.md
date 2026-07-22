@@ -942,3 +942,38 @@ I=2048/O=6144 (0.052 vs 0.123 ms). At S=64 the speedups are 62.01x and
 case through the generic W4A32 decoder. Repeat the build gate in the pinned
 CUDA 13.1 deployment container; CUDA 13.0 is an additional compatibility
 result, not a replacement for that pin.
+
+#### NVFP4 expert-record alignment follow-up (2026-07-22)
+
+The converted payload aligns each expert record to 4 KiB, but does not align
+every component independently: the two FP32 scalar scales make some following
+packed weights and block-scale arrays land at 8 mod 16. CUTLASS TMA requires
+16-byte input alignment. The compatibility loader therefore performs one
+coalesced direct io_uring read into an aligned staging record, then repacks the
+six persistent weight/scale arrays at 16-byte boundaries. This preserves large
+NVMe requests and correctness but adds a host memcpy and extra transient page
+traffic on every cache miss.
+
+Rebuild candidate: pad every packed weight and block-scale component to 16
+bytes while retaining a 4-KiB-aligned, direct-I/O-sized record. That permits
+io_uring to read directly into the immutable host-backed expert slab, removing
+the repack copy and its UVM/page-placement pressure. Measure staging-copy CPU,
+UVM worker CPU, achieved NVMe bandwidth, and end-to-end miss latency before
+deciding whether to regenerate the 427-GB shared payload.
+
+The first staged cap-16 measurement also held `UVM GPU1 BH` at 0% while the
+main process used roughly 1.25 CPU cores and the SSD delivered about 1.0--1.1
+GB/s. Besides the repack memcpy, native load finalization currently rescans
+every physical and logical FP8 block scale on every cache reload. Since expert
+records are immutable, cache a successful validation per tensor/record after
+the first load; retain full validation for the first publication and all
+metadata checks. Measure this separately from the aligned-format rebuild.
+
+Compatibility-path gate: faithful FP32-KV smoke, cap 16, `URING=1`,
+`DIRECT=1`, and host-backed CUDA experts completed in 452 s at 100% accuracy
+and `-0.28516 nat/token`, exactly matching the earlier faithful result. Swap did
+not grow and `UVM GPU1 BH` remained at 0% CPU; peak steady RSS was about 64 GB.
+Observed NVMe throughput rose from roughly 1.0 to 1.8 GB/s as queue depth grew
+from about 25 to 47. This is correctness evidence, not a performance win: the
+earlier pthread smoke took 181 s. Do not claim native-record io_uring faster
+until aligned direct placement and validation caching recover that regression.
