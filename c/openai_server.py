@@ -59,6 +59,24 @@ def error_object(error):
                       "param": error.param, "code": error.code}}
 
 
+def _engine_error(fields, message):
+    """Turn an engine ERROR frame into the right exception type.
+
+    CONTEXT_EXCEEDED is a client mistake, not a server fault: the prompt is longer than the
+    engine's context. Report it the way every OpenAI-compatible server does, so clients that
+    know how to compact a conversation actually get the chance to (previously the engine
+    silently truncated the prompt instead, which is #401)."""
+    if fields and fields[0] == "CONTEXT_EXCEEDED":
+        limit = fields[2] if len(fields) > 2 else "the context"
+        used = fields[1] if len(fields) > 1 else "?"
+        return APIError(400,
+                        f"This model's maximum context length is {limit} tokens, however your "
+                        f"messages resulted in at least {used} tokens. Please shorten the "
+                        f"conversation, or restart the server with a larger CTX.",
+                        "messages", "context_length_exceeded")
+    return RuntimeError(message)
+
+
 class GenerationScheduler:
     """Bounded FIFO admission for the engine's independent KV contexts."""
 
@@ -86,6 +104,7 @@ class GenerationScheduler:
     @contextlib.contextmanager
     def admit(self, cancelled=None, slot=None):
         ticket = object()
+        entry = (ticket, slot)          # (#B2) remember each waiter's target slot for fair, per-slot admission
         queued_at = time.monotonic()
         with self.condition:
             if self.closed:
@@ -95,31 +114,46 @@ class GenerationScheduler:
                 self.rejected += 1
                 raise APIError(429, "The inference queue is full.", None, "queue_full",
                                "rate_limit_error", {"Retry-After": "1"})
-            self.queue.append(ticket)
+            self.queue.append(entry)
             deadline = queued_at + self.queue_timeout
             while True:
                 if self.closed:
-                    self.queue.remove(ticket)
+                    self.queue.remove(entry)
                     self.condition.notify_all()
                     raise APIError(503, "The inference scheduler is shutting down.", None,
                                    "scheduler_closed", "server_error")
                 available = min(self.free_slots) if slot is None and self.free_slots else slot
-                if self.queue[0] is ticket and available in self.free_slots:
+                # (#B2) Admit as soon as our target slot is free AND no strictly-earlier
+                # waiter also wants it (an earlier waiter "wants" it if it is any-slot or
+                # pinned to the same slot). This replaces the old strict FIFO-head rule,
+                # which let a head pinned to a busy slot block every request behind it —
+                # even ones targeting a currently-free slot (head-of-line blocking).
+                # ponytail: O(queue) scan per wakeup — negligible at the default max_queue;
+                # switch to per-slot wait sets if max_queue is ever raised to thousands.
+                can_admit = available in self.free_slots
+                if can_admit:
+                    for t2, s2 in self.queue:
+                        if t2 is ticket:
+                            break
+                        if s2 is None or s2 == available:
+                            can_admit = False
+                            break
+                if can_admit:
                     break
                 if cancelled and cancelled():
-                    self.queue.remove(ticket)
+                    self.queue.remove(entry)
                     self.cancelled += 1
                     self.condition.notify_all()
                     raise ClientCancelled()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    self.queue.remove(ticket)
+                    self.queue.remove(entry)
                     self.timed_out += 1
                     self.condition.notify_all()
                     raise APIError(429, "Timed out waiting for the inference engine.", None,
                                    "queue_timeout", "rate_limit_error", {"Retry-After": "1"})
                 self.condition.wait(min(remaining, 0.25))
-            self.queue.popleft()
+            self.queue.remove(entry)
             self.free_slots.remove(available)
             self.active += 1
             self.admitted += 1
@@ -180,6 +214,8 @@ _BOX_RE  = re.compile(re.escape(BOX_START) + r"(.*?)" + re.escape(BOX_END), re.D
 _ARG_RE  = re.compile(r"<arg_key>([^<]*)</arg_key><arg_value>(.*?)</arg_value>", re.DOTALL)
 _NAME_RE = re.compile(r"\s*([A-Za-z0-9_.\-]+)")
 _TAG_RE  = re.compile(r"</?arg_key>|</?arg_value>")
+# A closing tag the model started but never finished ("</tool_cal", "</tool"), at end of reply.
+_PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?)?)?)?\Z")
 
 # De-mangler: opt-in recovery for heavily-quantized models that drop the
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
@@ -241,14 +277,41 @@ def _coerce_arg(value, declared):
     return parsed
 
 
+def _unclosed_tail(reply, tools):
+    """Body of a trailing <tool_call> that was never closed, or None.
+
+    Only returned when the recovery is unambiguous, so ordinary prose that merely mentions
+    "<tool_call>" can never be turned into a call. Both conditions must hold:
+      * the last BOX_START is not followed by a BOX_END (a closed box is the strict parser's job);
+      * the tail carries a complete <arg_key>..</arg_value> pair, OR it is exactly the name of a
+        tool the client declared (the zero-argument case).
+    """
+    start = reply.rfind(BOX_START)
+    if start < 0 or BOX_END in reply[start:]:
+        return None
+    inner = _PARTIAL_END_RE.sub("", reply[start + len(BOX_START):])
+    if _ARG_RE.search(inner):
+        return inner
+    declared = {(t.get("function", t) if isinstance(t, dict) else {}).get("name")
+                for t in (tools or []) if isinstance(t, dict)}
+    return inner if inner.strip() in declared else None
+
+
 def parse_tool_calls(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
     param_order = _tool_param_order(tools)
     param_types = _tool_param_types(tools)
     calls, salvaged = [], []
-    for match in _BOX_RE.finditer(reply):
-        inner = match.group(1)
+    # #401: a box the model opened but never closed -- it ran out of budget, or the closing tag
+    # came out mangled ("</tool_cal"). The call itself is often perfectly well-formed, but the
+    # strict regex needs BOTH tags, so the client used to get *zero* tool_calls. Recover the tail,
+    # but only when it is unambiguous (see _unclosed_tail) so prose can never fabricate a call.
+    boxes = [m.group(1) for m in _BOX_RE.finditer(reply)]
+    tail = _unclosed_tail(reply, tools)
+    if tail is not None:
+        boxes.append(tail)
+    for inner in boxes:
         name_match = _NAME_RE.match(inner)
         name = name_match.group(1) if name_match else inner.strip()
         args = {}
@@ -280,13 +343,17 @@ def parse_tool_calls(reply, tools=None):
                          "parsed -- output may be quantization-mangled; try COLI_TOOL_SALVAGE=1\n")
         sys.stderr.flush()
     text = _BOX_RE.sub("", reply)
+    if tail is not None:                       # drop the recovered tail from the visible content
+        text = text[:text.rindex(BOX_START)]
     if THINK_CLOSE in text:
         text = text.split(THINK_CLOSE, 1)[1]
     text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
     if calls:
-        dm = len(salvaged)
-        sys.stderr.write("[api] tool-calls: %d total, %d strict, %d de-mangled [%s]%s\n"
-                         % (len(calls), len(calls) - dm, dm, "CLEAN" if dm == 0 else "DE-MANGLED",
+        dm, rec = len(salvaged), (1 if tail is not None else 0)
+        sys.stderr.write("[api] tool-calls: %d total, %d strict, %d unclosed-recovered, "
+                         "%d de-mangled [%s]%s\n"
+                         % (len(calls), max(0, len(calls) - dm - rec), rec, dm,
+                            "CLEAN" if dm == 0 and rec == 0 else "RECOVERED",
                             (" -> " + ", ".join(salvaged)) if dm else ""))
         sys.stderr.flush()
     return text.strip(), calls
@@ -370,10 +437,46 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# Generic whitespace-tolerant JSON grammar for response_format {"type": "json_object"}.
+# Draft-source semantics: positions with one legal byte draft; jws points just keep
+# the walker alive through the model's own spacing (see docs/grammar-draft.md).
+GENERIC_JSON_GBNF = (
+    'root ::= jws jval jws\n'
+    'jval ::= jobj | jarr | jstr | jnum | "true" | "false" | "null"\n'
+    'jobj ::= "{" jws ( jstr jws ":" jws jval jws ( "," jws jstr jws ":" jws jval jws )* )? "}"\n'
+    'jarr ::= "[" jws ( jval jws ( "," jws jval jws )* )? "]"\n'
+    'jstr ::= "\\"" jchar* "\\""\n'
+    'jchar ::= [^"\\\\\\x00-\\x1f] | "\\\\" ( ["\\\\/bfnrt] | "u" jhex jhex jhex jhex )\n'
+    'jhex ::= [0-9a-fA-F]\n'
+    'jnum ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( ( "e" | "E" ) ( "+" | "-" )? [0-9]+ )?\n'
+    'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
+)
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     # `tools`/`functions` are handled by render_chat (declaration) + parse_tool_calls (output).
+    # Validate tools/functions structure early so malformed input fails with a clear error.
+    tools_raw = body.get("tools") or body.get("functions")
+    if tools_raw is not None:
+        if not isinstance(tools_raw, list):
+            raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
+        if not tools_raw:
+            raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
+        for idx, tool in enumerate(tools_raw):
+            if not isinstance(tool, dict):
+                raise APIError(400, f"Each tool must be an object, got {type(tool).__name__} at index {idx}.",
+                               f"tools.{idx}", "invalid_value")
+            fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+            if not isinstance(fn, dict):
+                raise APIError(400, f"Tool function must be an object at index {idx}.",
+                               f"tools.{idx}.function", "invalid_value")
+            if not fn.get("name"):
+                raise APIError(400, f"Each tool must have a `name` at index {idx}.",
+                               f"tools.{idx}.function.name", "invalid_value")
+            if not isinstance(fn["name"], str):
+                raise APIError(400, f"Tool `name` must be a string at index {idx}.",
+                               f"tools.{idx}.function.name", "invalid_value")
     choice = body.get("tool_choice")
     if choice is not None:
         if isinstance(choice, str):
@@ -403,10 +506,38 @@ def generation_options(body, limit):
         raise APIError(400, "Token penalties are not supported yet.", None, "unsupported_parameter")
     if body.get("seed") is not None:
         raise APIError(400, "Per-request seeds are not supported yet.", "seed", "unsupported_parameter")
+    # response_format -> optional per-request grammar for the engine's grammar-forced
+    # draft source (#70/#148). NEVER a sampling constraint: drafts are verified, so a
+    # schema the engine cannot compile degrades to "no speedup", not to an error and
+    # not to changed output. json_schema payloads are forwarded as-is (the engine
+    # compiles them via schema_gbnf.h); {"type": "gbnf"} is a raw-GBNF extension.
+    grammar = None
     response_format = body.get("response_format")
-    if response_format not in (None, {"type": "text"}):
-        raise APIError(400, "Only the default text response format is supported.",
-                       "response_format", "unsupported_parameter")
+    if response_format is not None and response_format != {"type": "text"}:
+        if not isinstance(response_format, dict) or "type" not in response_format:
+            raise APIError(400, "`response_format` must be an object with a `type`.",
+                           "response_format", "invalid_value")
+        ftype = response_format["type"]
+        if ftype == "json_object":
+            grammar = GENERIC_JSON_GBNF
+        elif ftype == "json_schema":
+            schema = (response_format.get("json_schema") or {}).get("schema")
+            if not isinstance(schema, dict):
+                raise APIError(400, "`response_format.json_schema.schema` must be an object.",
+                               "response_format", "invalid_value")
+            grammar = json.dumps(schema)
+        elif ftype == "gbnf":
+            grammar = response_format.get("grammar")
+            if not isinstance(grammar, str) or not grammar.strip():
+                raise APIError(400, "`response_format.grammar` must be a non-empty GBNF string.",
+                               "response_format", "invalid_value")
+        else:
+            raise APIError(400, "`response_format.type` must be \"text\", \"json_object\", "
+                                "\"json_schema\" or \"gbnf\".",
+                           "response_format", "unsupported_value")
+        if grammar is not None and len(grammar.encode("utf-8")) > (1 << 20):
+            raise APIError(400, "`response_format` grammar/schema exceeds 1 MiB.",
+                           "response_format", "invalid_value")
 
     maximum = body.get("max_completion_tokens")
     maximum_param = "max_completion_tokens"
@@ -433,7 +564,7 @@ def generation_options(body, limit):
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p)
+    return maximum, float(temperature), float(top_p), grammar
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -588,7 +719,7 @@ class Engine:
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
-                        events.put(("error", RuntimeError(message)))
+                        events.put(("error", _engine_error(fields[2:], message)))
                 else:
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
         except Exception as error:
@@ -597,12 +728,15 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None):
+                 cancelled=None, grammar=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
+        gpayload = grammar.encode("utf-8") if grammar else b""
+        if b"\0" in gpayload:
+            raise APIError(400, "NUL bytes are not supported in grammars.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def decode(data):
@@ -622,12 +756,13 @@ class Engine:
             self.next_request_id += 1
             self.pending[request_id] = events
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
-                  f"{temperature:.8g} {top_p:.8g}\n").encode()
+                  f"{temperature:.8g} {top_p:.8g}"
+                  + (f" {len(gpayload)}" if gpayload else "") + "\n").encode()
         try:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
-                self.process.stdin.write(header + payload + b"\n")
+                self.process.stdin.write(header + payload + gpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
             with self.pending_lock:
@@ -695,6 +830,8 @@ class APIServer(ThreadingHTTPServer):
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
+                   # request line/body can't pin a worker thread (and a slot) forever
     server_version = "colibri"
 
     def log_message(self, fmt, *args):
@@ -726,14 +863,40 @@ class APIHandler(BaseHTTPRequestHandler):
         if "*" not in self.server.cors_origins:
             self.send_header("Vary", "Origin")
 
+    LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
+
+    def _is_authed(self):
+        """True if no key is configured, or a correct Bearer key was presented."""
+        if not self.server.api_key:
+            return True
+        import hmac
+        provided = self.headers.get("Authorization", "")
+        return hmac.compare_digest(provided, f"Bearer {self.server.api_key}")
+
     def require_auth(self):
-        if self.server.api_key:
-            import hmac
-            provided = self.headers.get("Authorization", "")
-            expected = f"Bearer {self.server.api_key}"
-            if not hmac.compare_digest(provided, expected):
-                raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
-                               "authentication_error")
+        if not self._is_authed():
+            raise APIError(401, "Invalid or missing API key.", None, "invalid_api_key",
+                           "authentication_error")
+
+    def _check_host(self):
+        """DNS-rebinding guard: a web page can resolve a hostname to 127.0.0.1 and
+        drive this local server unless we pin the Host header to loopback / the bind
+        address. Rejects requests whose Host is anything else. (#SEC-7)"""
+        host = self.headers.get("Host", "")
+        if host.startswith("["):
+            name = host[1:].split("]", 1)[0]                       # [ipv6]:port
+        elif host.count(":") == 1:
+            name = host.rsplit(":", 1)[0]                          # host:port / ipv4:port
+        else:
+            name = host                                            # bare host / bracketless ipv6
+        name = name.strip().lower()
+        allowed = set(self.LOOPBACK_HOSTS)
+        try:
+            allowed.add(str(self.server.server_address[0]).strip("[]").lower())
+        except Exception:
+            pass
+        if name not in allowed:
+            raise APIError(403, "Host header not allowed.", None, "forbidden")
 
     def read_json(self):
         try:
@@ -791,20 +954,26 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
+            self._check_host()
             path = urlsplit(self.path).path
             if path == "/health":
-                payload = {"status": "ok", "scheduler": self.server.scheduler.snapshot(),
-                           "kv_slots": self.server.kv_slots}
-                tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
-                if tiers: payload["tiers"] = tiers
-                hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
-                if hwinfo: payload["hwinfo"] = hwinfo
+                # Liveness is always public; hardware/scheduler internals only when a
+                # request is authed (or no key set), so a configured key isn't leaked
+                # past a bare 200 to an unauthenticated probe. (#SEC-8)
+                payload = {"status": "ok"}
+                if self._is_authed():
+                    payload["scheduler"] = self.server.scheduler.snapshot()
+                    payload["kv_slots"] = self.server.kv_slots
+                    tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
+                    if tiers: payload["tiers"] = tiers
+                    hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
+                    if hwinfo: payload["hwinfo"] = hwinfo
                 self.send_json(200, payload, request_id)
                 return
             if path == "/experts":
-                eng = self.server.engine
                 payload = {"rows": 0, "cols": 0, "map": "", "hits": "", "seq": 0}
-                if eng and getattr(eng, "emap", None):
+                eng = self.server.engine
+                if self._is_authed() and eng and getattr(eng, "emap", None):   # (#SEC-8) hide routing telemetry unless authed
                     payload.update(eng.emap)
                     payload["hits"] = eng.hits or ""
                     payload["seq"] = eng.hits_seq
@@ -830,6 +999,13 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json(error.status, error_object(error), request_id, error.headers)
 
     def do_OPTIONS(self):
+        try:                                   # (#SEC-7) apply the Host guard uniformly, incl. CORS preflight
+            self._check_host()
+        except APIError:
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.send_cors_headers()
@@ -838,6 +1014,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         request_id = "req_" + uuid.uuid4().hex
         try:
+            self._check_host()
             self.require_auth()
             body = self.read_json()
             self.check_model(body)
@@ -863,7 +1040,7 @@ class APIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
-    def generation(self, body, prompt, request_id, chat):
+    def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -874,9 +1051,9 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
-        maximum, temperature, top_p = generation_options(body, self.server.max_tokens)
-        tools = (body.get("tools") or body.get("functions") or None) if chat else None
-        if body.get("tool_choice") == "none":
+        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        # tools and tool_choice come from chat_completion() already processed/filtered
+        if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -903,7 +1080,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 output = []
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, output.append, cache_slot,
-                    self.client_disconnected)
+                    self.client_disconnected, grammar=grammar)
                 text = "".join(output)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
@@ -1010,7 +1187,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         sp["buf"] = sp["buf"][flush:]
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_tools, cache_slot,
-                    lambda: not connected)
+                    lambda: not connected, grammar=grammar)
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
                 _content, calls = parse_tool_calls("".join(raw), tools)
@@ -1027,7 +1204,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     emit(chunk)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, emit_plain, cache_slot,
-                    lambda: not connected)
+                    lambda: not connected, grammar=grammar)
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
             ka_thread.join(timeout=2)
@@ -1038,11 +1215,12 @@ class APIHandler(BaseHTTPRequestHandler):
             if include_usage:
                 event([], self.usage(stats))
             if connected:
-                try:
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                except OSError:
-                    pass
+                with ka_lock:                          # (#B9) share the pump's lock so [DONE] can't interleave a keepalive write
+                    try:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except OSError:
+                        pass
             self.close_connection = True
 
     def client_disconnected(self):
@@ -1078,9 +1256,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
+        tool_choice = body.get("tool_choice")
         prompt = render_chat(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                             body.get("tool_choice"))
-        self.generation(body, prompt, request_id, True)
+                             tool_choice)
+        self.generation(body, prompt, request_id, True, tools, tool_choice)
 
     def completion(self, body, request_id):
         prompt = body.get("prompt")
@@ -1105,7 +1284,15 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
-        print("WARNING: API is listening beyond localhost without COLI_API_KEY", file=sys.stderr)
+        # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
+        # a compute-heavy API to the network. Refuse unless explicitly overridden.
+        if os.environ.get("COLI_ALLOW_INSECURE_BIND") == "1":
+            print("WARNING: binding %s beyond localhost with NO auth (COLI_ALLOW_INSECURE_BIND=1)" % host,
+                  file=sys.stderr)
+        else:
+            print("refusing to bind %s beyond localhost without COLI_API_KEY set "
+                  "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
+            sys.exit(1)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.

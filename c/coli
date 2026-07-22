@@ -15,6 +15,9 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
 Configuration through environment variables or flags (also valid after the subcommand):
   COLI_MODEL=<dir>   model directory (default /home/vincenzo/glm52_i4)
+  COLI_MODEL_MIRROR=<dir>  second copy of the model on another drive: expert reads
+                     are split across both SSDs (COLI_DISK_WEIGHTS=9,3 sets the
+                     primary,mirror bandwidth ratio; default: measured at startup)
   --ram N            RAM budget in GB (automatically sizes the expert cache)
   --repin N          adapt RAM/VRAM experts every N tokens
   --topp P           adaptive expert top-p             --topk N   fixed top-k
@@ -54,16 +57,20 @@ from version import __version__ as _version
 # guess is right (e.g. a custom packaging layout).
 _EXE = ".exe" if sys.platform == "win32" else ""
 _LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_here_colibri = os.path.join(HERE, "colibri" + _EXE)
 _here_glm = os.path.join(HERE, "glm" + _EXE)
 
 if os.environ.get("COLI_ENGINE"):
     GLM = os.environ["COLI_ENGINE"]
     TOOLS = os.path.join(os.path.dirname(GLM), "tools")
+elif os.path.exists(_here_colibri):
+    GLM = _here_colibri
+    TOOLS = os.path.join(HERE, "tools")
 elif os.path.exists(_here_glm):
     GLM = _here_glm
     TOOLS = os.path.join(HERE, "tools")
 else:
-    GLM = os.path.join(_LIBEXEC, "glm" + _EXE)
+    GLM = os.path.join(_LIBEXEC, "colibri" + _EXE)
     TOOLS = os.path.join(_LIBEXEC, "tools")
     sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
 
@@ -233,6 +240,55 @@ def env_for(a):
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
+        # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
+        # run CPU-only, even on a CUDA build with a GPU present — cuda_binary()
+        # returned False on Windows (see above), and nothing set COLI_CUDA without
+        # an explicit flag. Now that detection works, auto-enable the GPU when one
+        # is detected so `coli chat` Just Works. Scoped to Windows: Linux already
+        # has working detection + the explicit-flag UX, and changing bare-chat
+        # semantics there is out of scope. Falls back to CPU with a warning if
+        # nvidia-smi is missing (discover_gpus can't size VRAM without it).
+        # An explicit COLI_CUDA=0 in the environment must win over the implicit
+        # auto-enable: before this check, a Windows user setting COLI_CUDA=0 for
+        # a CPU baseline silently got a ~12.6 GB VRAM expert tier anyway (the
+        # engine's "CPU" rows were GPU-assisted). --gpu none remains the
+        # canonical hard off-switch (works on every platform, also clears the
+        # CUDA_* sizing vars).
+        if (sys.platform == "win32" and a.gpu is None and not a.vram
+                and e.get("COLI_CUDA") != "0"):
+            if cuda_binary():
+                from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
+                gpus = discover_gpus()
+                if gpus:
+                    e["COLI_CUDA"]="1"
+                    e.setdefault("COLI_GPUS", ",".join(str(g["index"]) for g in gpus))
+                    # Reuse the planner so the expert-tier VRAM budget is the real
+                    # free VRAM minus the 2 GB reserve — not a guess. Same machinery
+                    # as --auto-tier, just without requiring the user to pass it.
+                    ram,ctx,devices,vram_req = resource_request(a, e)
+                    try:
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        e.update(environment_for_plan(plan,e,cuda_enabled=True))
+                        vt=plan["tiers"]["vram"]
+                        names=",".join(g["name"].strip() for g in gpus)
+                        print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
+                              f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)
+                    except (OSError,ValueError,json.JSONDecodeError) as error:
+                        # Plan failed (e.g. model dir unreadable): don't block the
+                        # run, just leave the unsized COLI_CUDA=1 and let the engine
+                        # pick its own budget. Engine handles a missing budget.
+                        print(f"  {C.yel}[GPU] auto-enable: could not size VRAM ({error}); "
+                              f"using engine default{C.r}", file=sys.stderr)
+                else:
+                    print(f"  {C.yel}[GPU] coli_cuda.dll present but nvidia-smi not found on PATH "
+                          f"(cannot size VRAM); running CPU-only. Add nvidia-smi to PATH or pass "
+                          f"--vram N to enable CUDA.{C.r}", file=sys.stderr)
+            # else: CPU build (no coli_cuda.dll) — stay silent, CPU is correct.
+        elif e.get("COLI_CUDA") == "0":
+            # honoured off-switch: also drop stale device/sizing vars so the
+            # engine can't be re-enabled by leftovers (same as --gpu none).
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:
@@ -241,13 +297,13 @@ def env_for(a):
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
                 if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
                 e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
             if not cuda_binary():
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
             e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
@@ -421,8 +477,8 @@ def cmd_build(a):
     banner("build")
     if not os.path.exists(os.path.join(HERE, "Makefile")):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
-                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c glm.")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
+                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
+    sys.exit(subprocess.call(["make","-C",HERE,"colibri"]))
 
 def cmd_info(a):
     banner("info")
@@ -802,7 +858,7 @@ def cmd_stop(a):
             if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("glm","exe","olmoe"):
+            if comm in ("colibri","glm","exe","olmoe"):
                 env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
                 if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue
