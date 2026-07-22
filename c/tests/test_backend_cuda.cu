@@ -270,7 +270,7 @@ int main(int argc, char **argv) {
        !close_enough(ngroup,nmlp,NS*NI))return 1;
     uint64_t ngcalls=0,ngproblems=0,ngfallbacks=0;
     coli_cuda_nvfp4_grouped_stats(&ngcalls,&ngproblems,&ngfallbacks);
-    if(coli_cuda_nvfp4_native_capable(d0)&&(ngcalls!=3||ngproblems!=6||ngfallbacks))return 1;
+    if(native1>native0&&(ngcalls!=3||ngproblems!=6||ngfallbacks))return 1;
     std::fprintf(stderr,"grouped NVFP4 expert parity: ok\n");
     coli_cuda_tensor_free(ng);coli_cuda_tensor_free(nu);coli_cuda_tensor_free(nd);
 

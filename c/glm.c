@@ -2045,9 +2045,13 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
 }
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
-    /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
-     * Keep its tier assignment, but invalidate the old device weights. */
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+    /* ws[] slots are shared across layers. The same eid in another layer may
+     * have different tensor offsets inside the slab, so every reload must
+     * invalidate host wrappers that retain the old weight/scale pointers.
+     * Device-tier tensors keep their allocation for REPIN's in-place update. */
+    if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
+    if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
+    if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
@@ -2295,7 +2299,9 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     if(g_mmap || !st_has(&m->S,qn))
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
 #ifdef COLI_CUDA
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+    if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
+    if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
+    if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
@@ -6319,7 +6325,7 @@ static void repin_adapt(Model *m,int limit){
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
-            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            if(qt_cuda_update(&s->g) && qt_cuda_update(&s->u) && qt_cuda_update(&s->d)){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
