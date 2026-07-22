@@ -2273,12 +2273,17 @@ typedef struct {
 } UringBatch;
 static UringBatch g_ub_pipe, g_ub_pilot;
 
+static void uring_load_cleanup(UringLoad *l){
+    free(l->iobuf); l->iobuf=NULL; l->iobuf_cap=0;
+}
 static int uring_batch_init(UringBatch *b){
     if(b->started) return 0;
     if(coli_uring_init(&b->ring,URING_REQ_MAX)) return -1;
     b->started=1; return 0;
 }
 static void uring_batch_reset(UringBatch *b){
+    for(int i=0;i<b->nload;i++) if(b->load[i].done)
+        uring_load_cleanup(&b->load[i]);
     b->nload=0; b->nreq=0;
 }
 static int uring_load_error(UringLoad *l,int err,const char *what){
@@ -2487,7 +2492,10 @@ static int uring_wait_load(UringBatch *b,int li){
 static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     UringLoad *l=&b->load[li]; ESlot *s=l->s;
     if(l->finalized) return 0;
-    if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
+    if(uring_wait_load(b,li)<0){
+        if(l->done) uring_load_cleanup(l);
+        errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1;
+    }
     if(l->native){
         Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden;
         QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
@@ -2501,14 +2509,20 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             }
             uint8_t *bs=s->slab+l->scale_pos[k]; int64_t sb=l->tq[k]->nbytes;
             float ts=s->fslab[k*2],is=s->fslab[k*2+1];
-            if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
+            if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0){
+                uring_load_cleanup(l);
                 return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
-            for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z])))
+            }
+            for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z]))){
+                uring_load_cleanup(l);
                 return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
+            }
             for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
                 float v=coli_e4m3fn_f32(bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
-                if(!isfinite(v)||v<=0)
+                if(!isfinite(v)||v<=0){
+                    uring_load_cleanup(l);
                     return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
+                }
             }
             qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
             qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;qt[k]->O=OO[k];qt[k]->I=II[k];
@@ -2517,7 +2531,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             qt[k]->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;
             total+=l->tw[k]->nbytes+sb+8;
         }
-        free(l->iobuf);l->iobuf=NULL;l->iobuf_cap=0;
+        uring_load_cleanup(l);
         if(g_drop) for(int k=0;k<3;k++){
             posix_fadvise(l->tw[k]->fd,l->tw[k]->off,l->tw[k]->nbytes,POSIX_FADV_DONTNEED);
             posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);

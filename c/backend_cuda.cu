@@ -1765,9 +1765,9 @@ template<typename KT>
 __device__ static void absorption_body(
     float *__restrict__ ctx_out,
     const float *__restrict__ Q,
-    const uint8_t *__restrict__ kv_b_w,
+    const void *__restrict__ kv_b_w,
     const float *__restrict__ kv_b_s,
-    int kv_b_I,
+    int kv_b_fmt, int kv_b_I,
     const KT *__restrict__ Lc,
     const KT *__restrict__ Rc,
     const float *__restrict__ Lc_scale,
@@ -1785,7 +1785,7 @@ __device__ static void absorption_body(
     const float *qp = Q + (size_t)h * qh;
     const float *qr = qp + qk_nope;
     int nt = pos + 1 - kv_start;
-    int rb = kvl >> 1;
+    size_t rb = row_bytes(kv_b_fmt,kvl);
 
     extern __shared__ float smem[];
     float *s_qabs = smem;
@@ -1795,11 +1795,9 @@ __device__ static void absorption_body(
     for (int i = tid; i < kvl; i += blockDim.x) {
         float sum = 0.0f;
         for (int d = 0; d < qk_nope; d++) {
-            const uint8_t *rp = kv_b_w + (size_t)(rbase + d) * rb;
-            uint8_t v = rp[i >> 1];
-            int n = (i & 1) ? (v >> 4) : (v & 15);
-            float w = (float)((n ^ 8) - 8);
-            sum += qp[d] * w * kv_b_s[rbase + d];
+            int row=rbase+d;
+            sum += qp[d] * weight_at(kv_b_w,kv_b_fmt,(size_t)row*rb,i) *
+                   row_scale_at(kv_b_s,kv_b_fmt,row);
         }
         s_qabs[i] = sum;
     }
@@ -1895,27 +1893,23 @@ __device__ static void absorption_body(
     int r0v = qk_nope;
     for (int row = tid; row < vh; row += blockDim.x) {
         int krow = rbase + r0v + row;
-        const uint8_t *rp = kv_b_w + (size_t)krow * rb;
         float sum = 0.0f;
-        for (int i = 0; i < kvl; i++) {
-            uint8_t v = rp[i >> 1];
-            int n = (i & 1) ? (v >> 4) : (v & 15);
-            float w = (float)((n ^ 8) - 8);
-            sum += s_clat[i] * w;
-        }
-        ctx_out[(size_t)h * vh + row] = sum * kv_b_s[krow];
+        for (int i = 0; i < kvl; i++)
+            sum += s_clat[i] * weight_at(kv_b_w,kv_b_fmt,(size_t)krow*rb,i);
+        ctx_out[(size_t)h * vh + row] =
+            sum * row_scale_at(kv_b_s,kv_b_fmt,krow);
     }
 }
 template<typename KT>
 __global__ static void absorption_kernel(
     float *__restrict__ ctx_out, const float *__restrict__ Q,
-    const uint8_t *__restrict__ kv_b_w, const float *__restrict__ kv_b_s,
-    int kv_b_I, const KT *__restrict__ Lc, const KT *__restrict__ Rc,
+    const void *__restrict__ kv_b_w, const float *__restrict__ kv_b_s,
+    int kv_b_fmt, int kv_b_I, const KT *__restrict__ Lc, const KT *__restrict__ Rc,
     const float *__restrict__ Lc_scale,const float *__restrict__ Rc_scale,
     int H, int qk_nope, int qk_rope, int vh,
     int kv_start, int pos, float attn_scale)
 {
-    absorption_body(ctx_out, Q, kv_b_w, kv_b_s, kv_b_I, Lc, Rc,Lc_scale,Rc_scale,
+    absorption_body(ctx_out, Q, kv_b_w, kv_b_s, kv_b_fmt, kv_b_I, Lc, Rc,Lc_scale,Rc_scale,
                     H, qk_nope, qk_rope, vh, kv_start, pos, attn_scale);
 }
 __global__ static void add_vec_kernel(float *dst, const float *a, const float *b, int n) {
@@ -2358,16 +2352,16 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
                 H,qk_nope,qk_rope,vh,kv_lora,attn_scale);
         }else if(f16)
             absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
-                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                kvb->weights,kvb->scales,kvb->fmt,kv_lora,
                 hLc,hRc,nullptr,nullptr,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
         else if(fp8)
             absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
-                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                kvb->weights,kvb->scales,kvb->fmt,kv_lora,
                 (const uint8_t*)d_Lc,(const uint8_t*)d_Rc,d_Lc_scale,d_Rc_scale,
                 H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
         else
             absorption_kernel<<<H,256,abs_smem>>>(cxrow,qQs,
-                (const uint8_t*)kvb->weights,kvb->scales,kv_lora,
+                kvb->weights,kvb->scales,kvb->fmt,kv_lora,
                 d_Lc,d_Rc,nullptr,nullptr,H,qk_nope,qk_rope,vh,kv_start,pos,attn_scale);
         /* WMMA completion can leave a stale per-thread launch status even
          * after every TC launch was checked.  Clear it at the stage boundary;

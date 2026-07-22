@@ -348,7 +348,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
 
     vram = plan["tiers"]["vram"]
     devices = [device["index"] for device in vram["devices"]]
-    if not cuda_enabled or not devices or vram["budget_bytes"] <= 0:
+    if not cuda_enabled or not devices:
         return result
     if result.get("COLI_CUDA", "1") == "0":
         return result
