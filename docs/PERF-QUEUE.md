@@ -862,3 +862,21 @@ kernel called with device-resident q (no per-layer host round trip),
 (d) the pipe2 gate lifted.  The kernel/entry/loader plumbing from this
 increment is the building block; est. decode at 2.8k -> ~5.5+ tok/s flat
 in T (selection caps attended keys at 2048).
+
+#### GB10 native NVFP4 CUTLASS gate (2026-07-22, pondermatic)
+
+CUTLASS 4.5.1 single and pointer-array grouped NVFP4 kernels passed on GB10
+(`sm_121a`, CUDA 13.0.88). The production-shape gate covers both 6144x2048
+orientations, rows 1/2/8/16/64, and two-expert grouped gate/up/down dispatch:
+70 native problems total, 15 grouped launches covering 30 problems, with zero
+generic engagements, native-unavailable events, grouped fallbacks, or failures.
+The full backend CUDA harness also passes.
+
+Measured end-to-end `coli_cuda_matmul_nvfp4` latency (including host input and
+output copies) selected `COLI_NVFP4_NATIVE_MIN_ROWS=1`. At S=1, native is
+2.29x faster for I=6144/O=2048 (0.053 vs 0.120 ms) and 2.37x for
+I=2048/O=6144 (0.052 vs 0.123 ms). At S=64 the speedups are 62.01x and
+86.39x. A threshold of 2 is rejected: it would route the already-faster S=1
+case through the generic W4A32 decoder. Repeat the build gate in the pinned
+CUDA 13.1 deployment container; CUDA 13.0 is an additional compatibility
+result, not a replacement for that pin.

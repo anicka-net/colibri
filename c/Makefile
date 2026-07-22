@@ -291,6 +291,13 @@ cuda-nvfp4-test: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh t
 		backend_cuda.cu tests/test_nvfp4_cuda.cu -o nvfp4_cuda_test$(EXE)
 	./nvfp4_cuda_test$(EXE)
 
+cuda-nvfp4-bench: backend_cuda.cu backend_cuda.h backend_cuda_nvfp4_cutlass.cuh tests/bench_nvfp4_cuda.cu
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr -DCOLI_CUTLASS_NVFP4 \
+		-I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include \
+		backend_cuda.cu tests/bench_nvfp4_cuda.cu -o nvfp4_cuda_bench$(EXE)
+	./nvfp4_cuda_bench$(EXE)
+
 cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)

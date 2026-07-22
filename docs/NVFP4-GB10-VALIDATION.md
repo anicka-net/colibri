@@ -1,6 +1,7 @@
 # GB10 NVFP4 validation gate
 
-The native backend is compile-validated on Twilight with CUDA 13.3 and targets
+The native backend is compile-validated on Twilight with CUDA 13.3 and
+correctness-validated on pondermatic's GB10 with CUDA 13.0.88, targeting
 `sm_121a`. Deployment remains pinned to the CUDA 13.1 development container;
 repeat every build below there before using a converted snapshot.
 
@@ -17,11 +18,14 @@ make cuda-test CUDA_ARCH=sm_121a NVFP4_NATIVE=1
 
 `cuda-nvfp4-test` covers both production expert projections, `[S,6144] x
 [2048,6144]^T` and `[S,2048] x [6144,2048]^T`, for row counts 1, 2, 8, 16,
-and 64. It compares sampled outputs with the software W4A4 oracle and requires
-10 native engagements with zero generic, unavailable, or failure counts.
-The ordinary CUDA harness additionally checks single-GEMM and routed-group
-NVFP4 parity. Exit 77 means the machine has no supported NVIDIA device and is
-a skip, not a pass.
+and 64. It compares sampled outputs with the software W4A4 oracle, then checks
+two-expert grouped gate/up/down dispatch at production dimensions against
+independent native expert MLPs for the same row counts. The gate requires 70
+native problem engagements, 15 grouped launches covering 30 problems, and
+zero generic, unavailable, grouped-fallback, or failure counts. The ordinary
+CUDA harness additionally checks single-GEMM and routed-group NVFP4 parity.
+Exit 77 means the machine has no supported NVIDIA device and is a skip, not a
+pass.
 
 Run the generic control explicitly:
 
@@ -30,9 +34,9 @@ COLI_NVFP4_NATIVE=0 ./backend_cuda_test
 ```
 
 The engine accepts `COLI_NVFP4_NATIVE_MIN_ROWS=N`, allowing S=1 decode to stay
-on W4A32 while larger prefill batches use CUTLASS. Do not choose a threshold
-until both projection shapes have been measured on GB10. Record winning and
-rejected thresholds in `docs/PERF-QUEUE.md`.
+on W4A32 while larger prefill batches use CUTLASS. GB10 measurement selected
+the default threshold of 1; the rejected threshold is 2 because native S=1 is
+already more than twice as fast for both production projections.
 
 ## Snapshot and service gates
 
@@ -56,5 +60,4 @@ rejected thresholds in `docs/PERF-QUEUE.md`.
    deterministic-suite regression. Compact must remain within 0.02 nat/token
    and introduce no structural failures.
 
-Do not deploy to pondermatic until its existing RAM workload is confirmed safe
-to coexist or stop. Do not place the snapshot on deepthought.
+Do not place the snapshot on deepthought.

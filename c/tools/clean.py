@@ -18,6 +18,7 @@ FILES = [
     "backend_cuda.o", "backend_loader.o",
     "backend_cuda_test", "backend_cuda_test.exe",
     "nvfp4_cuda_test", "nvfp4_cuda_test.exe",
+    "nvfp4_cuda_bench", "nvfp4_cuda_bench.exe",
     "nvfp4_layout_test", "nvfp4_layout_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
     "backend_metal.o", "backend_metal_test",

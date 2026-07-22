@@ -69,6 +69,7 @@ static uint64_t g_group_calls,g_group_experts,g_group_rows;
 static uint64_t g_nvfp4_native_calls,g_nvfp4_generic_calls;
 static uint64_t g_nvfp4_fallback_native_unavailable,g_nvfp4_failures;
 static uint64_t g_nvfp4_fallback_shape,g_nvfp4_fallback_rejected,g_nvfp4_fallback_launch;
+static uint64_t g_nvfp4_grouped_calls,g_nvfp4_grouped_problems,g_nvfp4_grouped_fallbacks;
 static uint64_t g_kv_fp8_quantized_rows,g_kv_fp8_reader_rows,g_kv_fp8_fallbacks;
 static double g_group_h2d_ms,g_group_kernel_ms,g_group_d2h_ms;
 static std::mutex g_group_stats_mu;
@@ -909,6 +910,10 @@ extern "C" void coli_cuda_nvfp4_fallback_stats(uint64_t *shape,uint64_t *rejecte
     if(rejected)*rejected=g_nvfp4_fallback_rejected;
     if(launch)*launch=g_nvfp4_fallback_launch;
 }
+extern "C" void coli_cuda_nvfp4_grouped_stats(uint64_t *calls,uint64_t *problems,uint64_t *fallbacks){
+    if(calls)*calls=g_nvfp4_grouped_calls;if(problems)*problems=g_nvfp4_grouped_problems;
+    if(fallbacks)*fallbacks=g_nvfp4_grouped_fallbacks;
+}
 extern "C" int coli_cuda_nvfp4_native_capable(int device){
 #ifdef COLI_CUTLASS_NVFP4
     DeviceContext *ctx=find_ctx(device);
@@ -1159,10 +1164,49 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
     if(all_nvfp4){
-        /* Routed rows are already contiguous per expert. Keep the immutable
-         * expert records independently addressable and dispatch each problem
-         * on the common stream; tensor_matmul_launch selects CUTLASS W4A4 or
-         * the visible generic W4A32 fallback for every projection. */
+        int grouped_native=0;
+#ifdef COLI_CUTLASS_NVFP4
+        const char *ne=getenv("COLI_NVFP4_NATIVE");
+        grouped_native=all_device&&ctx->compute_major==12&&
+            (ctx->compute_minor==0||ctx->compute_minor==1)&&(!ne||atoi(ne));
+        for(int c=0;c<count&&grouped_native;c++)grouped_native=
+            gates[c]->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4&&
+            ups[c]->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4&&
+            downs[c]->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4;
+        if(grouped_native){
+            size_t qb=0,sb=0;int offsets[64];const uint8_t *wb[64],*ws[64];float alpha[64],input_scales[64];
+            for(int c=0,off=0;c<count;c++){offsets[c]=off;off+=rows[c];
+                qb+=coli_nvfp4_native::activation_bytes(rows[c],D);
+                sb+=coli_nvfp4_native::scale_bytes(rows[c],I,D);}
+            if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
+               !reserve(&ctx->qscale,&ctx->qscale_cap,sb))grouped_native=0;
+            int reason=0;
+            for(int pass=0;pass<2&&grouped_native;pass++){
+                for(int c=0;c<count;c++){ColiCudaTensor *t=pass?ups[c]:gates[c];
+                    wb[c]=(const uint8_t*)t->weights;ws[c]=t->block_scales;
+                    alpha[c]=t->tensor_scale*t->input_scale;input_scales[c]=t->input_scale;}
+                grouped_native=coli_nvfp4_native::run_group(pass?ctx->up:ctx->gate,ctx->x,
+                    ctx->qx,ctx->qscale,wb,ws,alpha,rows,offsets,count,I,D,
+                    input_scales,ctx->stream,&reason);
+            }
+            if(grouped_native){
+                silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
+                qb=sb=0;for(int c=0;c<count;c++){qb+=coli_nvfp4_native::activation_bytes(rows[c],I);
+                    sb+=coli_nvfp4_native::scale_bytes(rows[c],D,I);wb[c]=(const uint8_t*)downs[c]->weights;
+                    ws[c]=downs[c]->block_scales;alpha[c]=downs[c]->tensor_scale*downs[c]->input_scale;input_scales[c]=downs[c]->input_scale;}
+                if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||!reserve(&ctx->qscale,&ctx->qscale_cap,sb)||
+                   !coli_nvfp4_native::run_group(ctx->y,ctx->gate,ctx->qx,ctx->qscale,wb,ws,alpha,
+                    rows,offsets,count,D,I,input_scales,ctx->stream,&reason))grouped_native=0;
+            }
+            if(grouped_native){g_nvfp4_native_calls+=(uint64_t)count*3;
+                g_nvfp4_grouped_calls+=3;g_nvfp4_grouped_problems+=(uint64_t)count*3;}
+            else {if(reason==1)g_nvfp4_fallback_shape++;else if(reason==2)g_nvfp4_fallback_rejected++;
+                  else g_nvfp4_fallback_launch++;}
+        }
+#endif
+        /* Keep a correctness fallback for unsupported devices, rejected
+         * grouped shapes, and native launch failures. */
+        if(!grouped_native){g_nvfp4_grouped_fallbacks++;
         int off=0;
         for(int c=0;c<count;c++){
             int r=rows[c];
@@ -1172,6 +1216,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                 ctx->gate+(size_t)off*I,ctx->up+(size_t)off*I,(size_t)r*I);
             tensor_matmul_launch(ctx->y+(size_t)off*D,ctx->gate+(size_t)off*I,downs[c],r,ctx->stream);
             off+=r;
+        }
         }
     }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;

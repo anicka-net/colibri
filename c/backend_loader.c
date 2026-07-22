@@ -66,6 +66,7 @@ typedef int            (*fn_matmul_nvfp4)(ColiCudaTensor **tensor, float *y, con
 typedef void           (*fn_nvfp4_stats)(uint64_t *native_calls, uint64_t *generic_calls,
                                          uint64_t *fallback_native_unavailable, uint64_t *failures);
 typedef void           (*fn_nvfp4_fallback_stats)(uint64_t *shape,uint64_t *rejected,uint64_t *launch);
+typedef void           (*fn_nvfp4_grouped_stats)(uint64_t *calls,uint64_t *problems,uint64_t *fallbacks);
 typedef int            (*fn_nvfp4_native_capable)(int device);
 typedef void           (*fn_tensor_free)(ColiCudaTensor *tensor);
 typedef size_t         (*fn_tensor_bytes)(const ColiCudaTensor *tensor);
@@ -160,6 +161,7 @@ static struct {
     fn_matmul_nvfp4    matmul_nvfp4;
     fn_nvfp4_stats     nvfp4_stats;
     fn_nvfp4_fallback_stats nvfp4_fallback_stats;
+    fn_nvfp4_grouped_stats nvfp4_grouped_stats;
     fn_nvfp4_native_capable nvfp4_native_capable;
     fn_tensor_free     tensor_free;
     fn_tensor_bytes    tensor_bytes;
@@ -278,6 +280,7 @@ static int coli_cuda_load(void){
     RESOLVE(matmul_nvfp4,   fn_matmul_nvfp4)
     RESOLVE(nvfp4_stats,    fn_nvfp4_stats)
     RESOLVE(nvfp4_fallback_stats, fn_nvfp4_fallback_stats)
+    RESOLVE(nvfp4_grouped_stats, fn_nvfp4_grouped_stats)
     RESOLVE(nvfp4_native_capable, fn_nvfp4_native_capable)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)
@@ -465,6 +468,11 @@ void coli_cuda_nvfp4_stats(uint64_t *native_calls, uint64_t *generic_calls,
 void coli_cuda_nvfp4_fallback_stats(uint64_t *shape,uint64_t *rejected,uint64_t *launch){
     if(!g_cuda.available){if(shape)*shape=0;if(rejected)*rejected=0;if(launch)*launch=0;return;}
     g_cuda.nvfp4_fallback_stats(shape,rejected,launch);
+}
+
+void coli_cuda_nvfp4_grouped_stats(uint64_t *calls,uint64_t *problems,uint64_t *fallbacks){
+    if(!g_cuda.available){if(calls)*calls=0;if(problems)*problems=0;if(fallbacks)*fallbacks=0;return;}
+    g_cuda.nvfp4_grouped_stats(calls,problems,fallbacks);
 }
 
 int coli_cuda_nvfp4_native_capable(int device){

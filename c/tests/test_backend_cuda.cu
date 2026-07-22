@@ -268,13 +268,22 @@ int main(int argc, char **argv) {
     if(!coli_cuda_expert_group(ngs,nus,nds,group_rows,2,ngroup,nx,
                                nullptr,nullptr,0,0,0,nullptr)||
        !close_enough(ngroup,nmlp,NS*NI))return 1;
+    uint64_t ngcalls=0,ngproblems=0,ngfallbacks=0;
+    coli_cuda_nvfp4_grouped_stats(&ngcalls,&ngproblems,&ngfallbacks);
+    if(coli_cuda_nvfp4_native_capable(d0)&&(ngcalls!=3||ngproblems!=6||ngfallbacks))return 1;
     std::fprintf(stderr,"grouped NVFP4 expert parity: ok\n");
     coli_cuda_tensor_free(ng);coli_cuda_tensor_free(nu);coli_cuda_tensor_free(nd);
 
     uint64_t group_calls=0,group_experts=0,group_total_rows=0;
     coli_cuda_group_stats(&group_calls,&group_experts,&group_total_rows,nullptr,nullptr,nullptr);
-    uint64_t want_groups=6+(host8_ok?1:0)+(host_ok?1:0);
-    if(group_calls!=want_groups||group_experts!=want_groups*2||group_total_rows!=want_groups*2) return 1;
+    uint64_t want_groups=70+(host8_ok?1:0)+(host_ok?1:0);
+    if(group_calls!=want_groups||group_experts!=want_groups*2||group_total_rows!=want_groups*2){
+        std::fprintf(stderr,"group stats: got %llu/%llu/%llu, want %llu/%llu/%llu\n",
+            (unsigned long long)group_calls,(unsigned long long)group_experts,
+            (unsigned long long)group_total_rows,(unsigned long long)want_groups,
+            (unsigned long long)(want_groups*2),(unsigned long long)(want_groups*2));
+        return 1;
+    }
 
     coli_cuda_stats(-1, &count, &bytes);
     if (count != 7 || bytes != 166) {
