@@ -27,6 +27,22 @@ CPU-only by default.
 
 ## 1. Install the build tools
 
+> **Shortcut — skip sections 1 and 2 entirely.** Prebuilt archives are published
+> for **Linux, macOS and Windows** on the
+> [Releases page](https://github.com/JustVugg/colibri/releases): unpack one,
+> install [Python 3](https://www.python.org/downloads/), and jump straight to
+> [step 3](#3-get-the-model). The engine ships ready to run and the `coli`
+> launcher finds it next to itself — no compiler, no renaming, no configuration.
+>
+> ```bash
+> mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+> python3 coli info        # engine ready ✓
+> ```
+>
+> Build from source instead if you want the fastest binary for *your* CPU
+> (`ARCH=native` unlocks the vector instructions your chip actually has), or if
+> you plan to hack on the engine.
+
 ### Linux (Ubuntu / Debian)
 
 ```bash

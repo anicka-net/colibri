@@ -21,7 +21,7 @@ semantics**.
 
 ```
 $ ./coli chat
-  🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -202,19 +202,43 @@ scale-granularity/rotation ablations live in
 
 ## Get started
 
-> **New here, or on Windows?** The [Quick Start guide](docs/quickstart.md) walks
-> through install → build → model → first chat step by step for Linux, Windows,
-> and macOS. On **Windows** you don't even need to build: download the
-> `colibri-<version>-windows-x86_64.zip` from
-> [Releases](https://github.com/JustVugg/colibri/releases), unzip it, install
-> [Python 3](https://www.python.org/downloads/), and run `coli chat` — the
-> engine ships ready to run as `colibri.exe`, the launcher finds it by itself.
-> Full details in the [Windows section](docs/quickstart.md#windows).
+You need two things: **the program** (a few hundred KB) and **the model**
+(372 GB). Step-by-step for every platform in the
+[Quick Start guide](docs/quickstart.md).
 
-### 1. Get the model
+### 1. Get colibri
+
+**Download a prebuilt release** — Linux, macOS and Windows, no compiler needed.
+Take the archive for your platform from
+[Releases](https://github.com/JustVugg/colibri/releases) and unpack it:
+
+```bash
+mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+python3 coli info                         # engine ready ✓
+```
+
+Inside you get the engine (`colibri`, `colibri.exe` on Windows), the `coli`
+launcher and its Python helpers. Nothing to rename or configure — `coli` finds
+the engine next to itself. You only need
+[Python 3](https://www.python.org/downloads/) installed: the launcher and the
+API gateway are Python scripts, while the engine itself is pure C with zero
+dependencies.
+
+**Or build from source** — needs `gcc` (or clang) with OpenMP:
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri/c
+./setup.sh                                # checks gcc/OpenMP, builds, self-tests
+```
+
+Want `coli` on your PATH? From a checkout, `pip install -e .` registers it (the
+engine still lives in `c/` — an editable install from the clone, not a wheel).
+
+### 2. Get the model
 
 A pre-converted **GLM-5.2 int4** container is on Hugging Face — **use the
-version with the int8 MTP heads**:
+version with the int8 MTP heads**. It is about **372 GB**, so put it on a disk
+with the room, ideally a fast one:
 
 **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
 
@@ -226,11 +250,10 @@ Or convert from the FP8 source yourself — one resumable command that never nee
 the full 756 GB on disk at once:
 
 ```bash
-cd c && ./setup.sh                        # checks gcc/OpenMP, builds, self-tests
 ./coli convert --model /nvme/glm52_i4     # download+convert shard by shard (python, one-time)
 ```
 
-### 2. Run it
+### 3. Run it
 
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli chat     # RAM budget, cache and MTP auto-detected
@@ -240,21 +263,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # read-only readiness check
 ./coli serve --model /nvme/glm52_i4       # OpenAI-compatible API only
 ```
 
+On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
-**On Windows?** You don't need to build. Download the
-`colibri-<version>-windows-x86_64.zip` from
-[Releases](https://github.com/JustVugg/colibri/releases), unzip it, install
-[Python 3](https://www.python.org/downloads/), then run `coli chat` — the
-engine is already named `colibri.exe` and the launcher finds it next to
-itself. Full walkthrough in the [Quick Start guide](docs/quickstart.md#windows).
-
-Prefer a `coli` command on your PATH? From a checkout, `pip install -e .`
-registers it (the engine itself still lives in `c/` — this is an editable
-install from the clone, not a standalone wheel).
-
-### 3. Go deeper
+### 4. Go deeper
 
 | topic | doc |
 |---|---|

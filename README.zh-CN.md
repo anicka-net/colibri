@@ -14,7 +14,7 @@ Colibrì 是一套轻量、保持模型质量的 MoE 运行时，将 VRAM、RAM
 
 ```
 $ ./coli chat
-  🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -145,10 +145,38 @@ MTP head 必须是 **int8**（int4 head 的接受率会崩塌到 0–4%，见
 
 ## 开始使用
 
-### 1. 获取模型
+你需要两样东西：**程序本体**（几百 KB）和**模型**（372 GB）。各平台的分步
+指引见 [Quick Start 指南](docs/quickstart.md)。
+
+### 1. 获取 colibri
+
+**下载预编译版本**——Linux、macOS 与 Windows 均已提供，无需编译器。从
+[Releases](https://github.com/JustVugg/colibri/releases) 下载对应平台的压缩包并解压：
+
+```bash
+mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+python3 coli info                         # engine ready ✓
+```
+
+包内含引擎（`colibri`，Windows 上为 `colibri.exe`）、`coli` 启动器及其 Python
+辅助脚本。无需重命名或配置：`coli` 会自动找到同目录下的引擎。你只需安装
+[Python 3](https://www.python.org/downloads/)——启动器和 API gateway 是 Python
+脚本，而引擎本身是零依赖的纯 C 程序。
+
+**或者从源码构建**——需要带 OpenMP 的 `gcc`（或 clang）：
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri/c
+./setup.sh                                # 检查 gcc/OpenMP、构建并运行自测
+```
+
+想把 `coli` 加入 PATH？在 checkout 中执行 `pip install -e .` 即可注册（引擎仍位于
+`c/` 目录——这是从克隆目录做的可编辑安装，而非独立 wheel）。
+
+### 2. 获取模型
 
 Hugging Face 上已有预转换的 **GLM-5.2 int4** 容器——请务必使用
-**含 int8 MTP head 的版本**：
+**含 int8 MTP head 的版本**。它约为 **372 GB**，请放在空间足够的磁盘上，最好是快盘：
 
 **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
 
@@ -160,11 +188,10 @@ Hugging Face 上已有预转换的 **GLM-5.2 int4** 容器——请务必使用
 在磁盘上同时存放完整的 756 GB：
 
 ```bash
-cd c && ./setup.sh                        # 检查 gcc/OpenMP、构建并运行自测
 ./coli convert --model /nvme/glm52_i4     # 逐 shard 下载并转换（仅此一次需要 python）
 ```
 
-### 2. 运行
+### 3. 运行
 
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli chat     # 自动检测 RAM 预算、缓存与 MTP
@@ -174,9 +201,10 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # 只读就绪检查
 ./coli serve --model /nvme/glm52_i4       # 仅提供 OpenAI 兼容 API
 ```
 
+在 Windows 上同样使用这些命令，写作 `python coli chat --model D:\glm52_i4`。
 引擎运行时是纯 C——python 只供一次性转换工具与可选的 API gateway 使用。
 
-### 3. 深入了解
+### 4. 深入了解
 
 | 主题 | 文档 |
 |---|---|

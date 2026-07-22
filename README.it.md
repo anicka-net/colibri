@@ -15,7 +15,7 @@ precisione del modello né la semantica del router**.
 
 ```
 $ ./coli chat
-  🐦 colibrì v1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
+  🐦 colibri v1.1.0 — GLM-5.2 · 744B MoE · int4 · streaming CPU
   ✓ ready in 32s · resident 9.9 GB
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
@@ -161,10 +161,42 @@ int4 e le ablazioni su granularità delle scale e rotazione sono in
 
 ## Per iniziare
 
-### 1. Scarica il modello
+Ti servono due cose: **il programma** (poche centinaia di KB) e **il modello**
+(372 GB). Guida passo passo per tutte le piattaforme nella
+[Quick Start](docs/quickstart.md).
+
+### 1. Procurati colibri
+
+**Scarica una release già compilata** — Linux, macOS e Windows, nessun
+compilatore necessario. Prendi l'archivio della tua piattaforma dalla pagina
+[Releases](https://github.com/JustVugg/colibri/releases) e scompattalo:
+
+```bash
+mkdir colibri && tar xzf colibri-v1.1.0-linux-x86_64.tar.gz -C colibri && cd colibri
+python3 coli info                         # engine ready ✓
+```
+
+Dentro trovi il motore (`colibri`, `colibri.exe` su Windows), il launcher `coli`
+e i suoi script Python di supporto. Niente da rinominare o configurare: `coli`
+trova il motore accanto a sé. Serve solo avere
+[Python 3](https://www.python.org/downloads/) installato — il launcher e il
+gateway API sono script Python, mentre il motore è C puro senza dipendenze.
+
+**Oppure compila dai sorgenti** — servono `gcc` (o clang) con OpenMP:
+
+```bash
+git clone https://github.com/JustVugg/colibri && cd colibri/c
+./setup.sh                                # verifica gcc/OpenMP, compila, autotest
+```
+
+Vuoi `coli` nel PATH? Da un checkout, `pip install -e .` lo registra (il motore
+resta in `c/` — è un'installazione editabile dal clone, non un wheel).
+
+### 2. Scarica il modello
 
 Un container **GLM-5.2 int4** pre-convertito è su Hugging Face — **usa la
-versione con le teste MTP int8**:
+versione con le teste MTP int8**. Pesa circa **372 GB**, quindi mettilo su un
+disco che abbia lo spazio, meglio se veloce:
 
 **https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
 
@@ -176,11 +208,10 @@ Oppure converti tu stesso dalla sorgente FP8 — un unico comando riprendibile c
 non richiede mai i 756 GB completi su disco contemporaneamente:
 
 ```bash
-cd c && ./setup.sh                        # verifica gcc/OpenMP, compila, autotest
 ./coli convert --model /nvme/glm52_i4     # scarica e converti shard per shard (python, una tantum)
 ```
 
-### 2. Esegui
+### 3. Esegui
 
 ```bash
 COLI_MODEL=/nvme/glm52_i4 ./coli chat     # budget RAM, cache e MTP rilevati automaticamente
@@ -190,10 +221,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli doctor   # controllo di idoneità (sola lettura
 ./coli serve --model /nvme/glm52_i4       # solo API compatibile OpenAI
 ```
 
+Su Windows gli stessi comandi funzionano con `python coli chat --model D:\glm52_i4`.
 Il motore a runtime è puro C — python si usa solo per il convertitore (una tantum)
 e per il gateway API opzionale.
 
-### 3. Approfondisci
+### 4. Approfondisci
 
 | argomento | documento |
 |---|---|
