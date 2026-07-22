@@ -2777,6 +2777,8 @@ static void expert_prefetch(Model *m, int layer, int eid){
 static void qt_addrow(const QT *t, int row, float coef, float *acc){
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
+    if(t->fmt==COLI_TENSOR_BF16){ const uint16_t *w=t->bf16+(int64_t)row*I;
+        for(int i=0;i<I;i++) acc[i]+=coef*coli_bf16_f32(w[i]); return; }
     /* fmt=4 PRIMA del calcolo di c: s[] e' [O,ng] per-gruppo, s[row] sarebbe la scala
      * sbagliata. Senza questo ramo il fall-through int2 decodificava i nibble int4 come
      * coppie di valori a 2 bit — lo stesso bug di #298 sui kernel absorb CUDA, lato CPU.
@@ -2802,6 +2804,8 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     int I=t->I;
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
+        else if(t->fmt==COLI_TENSOR_BF16){ const uint16_t *w=t->bf16+(int64_t)row*I;
+            for(int i=0;i<I;i++) a+=(double)coli_bf16_f32(w[i])*x[i]; }
         else if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; float s=t->s[row];
             float acc=0; for(int i=0;i<I;i++) acc+=(float)w[i]*x[i]; a=acc*s; }
         else if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2); float s=t->s[row]; float acc=0;
