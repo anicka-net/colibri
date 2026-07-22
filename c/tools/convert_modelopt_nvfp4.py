@@ -161,6 +161,8 @@ def main() -> None:
                         help="refuse partial input until exactly this many model shards exist")
     parser.add_argument("--workers", type=int, default=1,
                         help="bounded concurrent shard conversions (results are committed in order)")
+    parser.add_argument("--index-offset", type=int, default=0,
+                        help="global output-shard index added to this input batch")
     args = parser.parse_args()
     source_shards = sorted(args.indir.glob("*.safetensors"))
     if not source_shards: raise SystemExit(f"no Safetensors shards in {args.indir}")
@@ -182,14 +184,14 @@ def main() -> None:
         fragments, faithful_tensors, compact_tensors = future.result()
         expert_records = merge_expert_records(pending, fragments)
         if expert_records:
-            payload=shared/f"experts-{index:05d}.safetensors"
+            payload=shared/f"experts-{index+args.index_offset:05d}.safetensors"
             offsets=nf.write_aligned_safetensors(payload,expert_records)
             if any(offset%4096 for offset in offsets.values()): raise AssertionError("unaligned expert record")
             link_exact(payload,faithful/payload.name); link_exact(payload,compact/payload.name)
         if faithful_tensors:
-            save_file(faithful_tensors,faithful/f"resident-{index:05d}.safetensors")
+            save_file(faithful_tensors,faithful/f"resident-{index+args.index_offset:05d}.safetensors")
         if compact_tensors:
-            save_file(compact_tensors,compact/f"resident-{index:05d}.safetensors")
+            save_file(compact_tensors,compact/f"resident-{index+args.index_offset:05d}.safetensors")
         print(f"[{index+1}/{len(source_shards)}] {shard.name}: {len(expert_records)} experts")
         item = next(source_iter, None)
         if item is not None:
