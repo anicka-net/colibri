@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from resource_plan import (
     GB,
@@ -13,6 +14,7 @@ from resource_plan import (
     environment_for_plan,
     format_plan,
     memory_available,
+    discover_gpus,
 )
 
 
@@ -65,6 +67,15 @@ class ResourcePlanTest(unittest.TestCase):
         # so the Linux-only path returned 0 and the expert cache was sized to
         # 0 slots/layer. The value must be a sane positive number of bytes.
         self.assertGreater(memory_available(), 0)
+
+    def test_discovers_unified_gpu_when_vram_query_is_na(self):
+        failed = subprocess.CalledProcessError(1, "nvidia-smi")
+        basic = subprocess.CompletedProcess([], 0, "0, NVIDIA GB10\n", "")
+        with mock.patch("resource_plan.subprocess.run", side_effect=[failed, basic]):
+            self.assertEqual(discover_gpus(), [{
+                "index": 0, "name": "NVIDIA GB10", "total_bytes": 0,
+                "free_bytes": 0, "unified_memory": True,
+            }])
 
     def test_builds_bounded_three_tier_plan(self):
         gpus = [{"index": 0, "name": "test-gpu", "total_bytes": 12 * GB,

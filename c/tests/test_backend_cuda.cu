@@ -1,4 +1,5 @@
 #include "../backend_cuda.h"
+#include "../kv_dtype.h"
 #include "../nvfp4.h"
 
 #include <cmath>
@@ -198,6 +199,61 @@ int main(int argc, char **argv) {
     if(!coli_cuda_attention_absorb(at,actx,aq,al,ar,1,2,2,2,4,3,1.f)||
        !close_enough(actx,aref,2))return 1;
     coli_cuda_tensor_free(at);
+    uint16_t abf16[16];
+    for(int i=0;i<16;i++){ uint32_t bits;std::memcpy(&bits,&aw[i],sizeof(bits));abf16[i]=(uint16_t)(bits>>16); }
+    ColiCudaTensor *atbf=nullptr;
+    if(!coli_cuda_tensor_upload(&atbf,abf16,nullptr,COLI_TENSOR_BF16,4,4,d0)||
+       !coli_cuda_attention_absorb(atbf,actx,aq,al,ar,1,2,2,2,4,3,1.f)||
+       !close_enough(actx,aref,2))return 1;
+    if(coli_cuda_kv_dtype()==COLI_KV_FP8_E4M3){
+        void *dl=coli_cuda_pipe_alloc(d0,sizeof(al)),*dr=coli_cuda_pipe_alloc(d0,sizeof(ar));
+        float *dls=(float*)coli_cuda_pipe_alloc(d0,3*sizeof(float));
+        float *drs=(float*)coli_cuda_pipe_alloc(d0,3*sizeof(float));
+        if(!dl||!dr||!dls||!drs||
+           !coli_cuda_pipe_upload_kv_rows(d0,dl,dls,al,3,4,0)||
+           !coli_cuda_pipe_upload_kv_rows(d0,dr,drs,ar,3,2,0)||
+           !coli_cuda_attention_absorb_kvdev(atbf,actx,aq,(const float*)dl,(const float*)dr,
+                dls,drs,1,2,2,2,4,3,1.f)||
+           !relative_rms(actx,aref,2,.03f))return 1;
+        uint64_t qrows=0,rrows=0,fb=0;coli_cuda_kv_fp8_stats(&qrows,&rrows,&fb);
+        if(qrows!=6||rrows!=3||fb)return 1;
+        coli_cuda_pipe_free(d0,dl);coli_cuda_pipe_free(d0,dr);
+        coli_cuda_pipe_free(d0,dls);coli_cuda_pipe_free(d0,drs);
+        std::fprintf(stderr,"FP8 KV BF16 attention reader: ok\n");
+    }
+    coli_cuda_tensor_free(atbf);
+
+    /* Faithful snapshots use BF16 resident attention tensors.  Exercise the
+       generic DSA prefill split (two causal rows + one selected row) against a
+       zero oracle in every configured KV-shadow dtype. */
+    {
+        constexpr int S=3,H=1,Q=16,R=16,V=16,K=16,T=3,TOPK=2;
+        uint16_t wk[H*(Q+V)*K]={},wo[V*H*V]={};
+        ColiCudaTensor *kw=nullptr,*ow=nullptr;
+        float q[S*H*(Q+R)]={},lh[T*K]={},rh[T*R]={},got[S*V]={};
+        int sel[S*TOPK]={0,0,0,0,0,1};
+        int kd=coli_cuda_kv_dtype(),esz=kd==COLI_KV_FP8_E4M3?1:kd==COLI_KV_FP16?2:4;
+        void *qd=coli_cuda_pipe_alloc(d0,sizeof(q));
+        void *ld=coli_cuda_pipe_alloc(d0,(size_t)T*K*esz);
+        void *rd=coli_cuda_pipe_alloc(d0,(size_t)T*R*esz);
+        float *ls=kd==COLI_KV_FP8_E4M3?(float*)coli_cuda_pipe_alloc(d0,T*sizeof(float)):nullptr;
+        float *rs=kd==COLI_KV_FP8_E4M3?(float*)coli_cuda_pipe_alloc(d0,T*sizeof(float)):nullptr;
+        void *od=coli_cuda_pipe_alloc(d0,sizeof(got));
+        if(!coli_cuda_tensor_upload(&kw,wk,nullptr,COLI_TENSOR_BF16,K,H*(Q+V),d0)||
+           !coli_cuda_tensor_upload(&ow,wo,nullptr,COLI_TENSOR_BF16,H*V,V,d0)||
+           !qd||!ld||!rd||!od||(kd==COLI_KV_FP8_E4M3&&(!ls||!rs))||
+           !coli_cuda_pipe_upload(d0,(float*)qd,q,sizeof(q)/sizeof(float))||
+           !coli_cuda_pipe_upload_kv_rows(d0,ld,ls,lh,T,K,0)||
+           !coli_cuda_pipe_upload_kv_rows(d0,rd,rs,rh,T,R,0)||
+           !coli_cuda_prefill_attn_gemm(kw,ow,(float*)od,(const float*)qd,
+                (const float*)ld,(const float*)rd,ls,rs,S,H,Q,R,V,K,T,1.f,sel,2,TOPK)||
+           !coli_cuda_pipe_download(d0,(const float*)od,got,sizeof(got)))return 1;
+        for(float value:got)if(value!=0.f||!std::isfinite(value))return 1;
+        coli_cuda_tensor_free(kw);coli_cuda_tensor_free(ow);
+        coli_cuda_pipe_free(d0,qd);coli_cuda_pipe_free(d0,ld);coli_cuda_pipe_free(d0,rd);
+        coli_cuda_pipe_free(d0,od);if(ls)coli_cuda_pipe_free(d0,ls);if(rs)coli_cuda_pipe_free(d0,rs);
+        std::fprintf(stderr,"BF16 generic DSA prefill split: ok\n");
+    }
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
        existing FP32-activation/s4-weight grouped implementation. */
@@ -270,7 +326,7 @@ int main(int argc, char **argv) {
        !close_enough(ngroup,nmlp,NS*NI))return 1;
     uint64_t ngcalls=0,ngproblems=0,ngfallbacks=0;
     coli_cuda_nvfp4_grouped_stats(&ngcalls,&ngproblems,&ngfallbacks);
-    if(coli_cuda_nvfp4_native_capable(d0)&&(ngcalls!=3||ngproblems!=6||ngfallbacks))return 1;
+    if(native1>native0&&(ngcalls!=3||ngproblems!=6||ngfallbacks))return 1;
     std::fprintf(stderr,"grouped NVFP4 expert parity: ok\n");
     coli_cuda_tensor_free(ng);coli_cuda_tensor_free(nu);coli_cuda_tensor_free(nd);
 

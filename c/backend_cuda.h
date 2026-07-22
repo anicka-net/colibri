@@ -237,12 +237,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,c
                           int spitch,int width,int height);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,
+        const float *latent_scale,const float *rope_scale,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_dev,
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,float *ctx,const float *q,
-        const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
+        const float *latent_dev,const float *rope_dev,const float *latent_scale,
+        const float *rope_scale,int H,int Q,int R,int V,int K,int T,
         float scale);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_sel(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q,const float *latent_dev,const float *rope_dev,
@@ -252,6 +254,7 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_
                              const float *src,size_t bytes);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
+        const float *latent_scale,const float *rope_scale,
         int S,int H,int Q,int R,int V,int K,int T,float scale);
 /* sel_host!=NULL: DSA prefill phase split — rows [sB0,S) absorb over their own
  * top-`sel_topk` list (absolute positions, kv_start must be 0), rows [0,sB0)

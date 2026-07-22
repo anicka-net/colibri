@@ -110,7 +110,7 @@ def convert_shard(path: pathlib.Path, n_layers: int):
                 continue
             if name.endswith(("_scale", "_scale_2", ".input_scale", "_input_scale", "_scale_inv")):
                 continue
-            kind = classify(name, n_layers)
+            kind = classify(name, n_layers, keep_idx=".self_attn.indexer." in name)
             if kind in ("skip", "consumed", "x"):
                 continue
             value = source.get_tensor(name).detach().cpu()
@@ -126,6 +126,39 @@ def convert_shard(path: pathlib.Path, n_layers: int):
             compact[name] = torch.from_numpy(q.view(np.int8).copy())
             compact[name + ".qs"] = torch.from_numpy(scale)
     return records, faithful, compact
+
+
+def convert_indexer_shard(path: pathlib.Path, n_layers: int):
+    """Build additive resident indexer shards for an already converted tree."""
+    torch, safe_open, _ = dependencies()
+    faithful, compact = {}, {}
+    with safe_open(path, framework="pt", device="cpu") as source:
+        keys = set(source.keys())
+        for name in source.keys():
+            if not is_runtime_indexer(name, n_layers):
+                continue
+            if name.endswith(("_scale", "_scale_2", ".input_scale", "_input_scale", "_scale_inv")):
+                continue
+            value = source.get_tensor(name).detach().cpu()
+            if value.ndim != 2:
+                faithful[name] = value.float().contiguous()
+                compact[name] = value.float().contiguous()
+                continue
+            full = torch.from_numpy(dequant(source, name, keys)).to(torch.bfloat16)
+            faithful[name] = full
+            q, scale = quant_int8(full.float().numpy(), 8)
+            compact[name] = torch.from_numpy(q.view(np.int8).copy())
+            compact[name + ".qs"] = torch.from_numpy(scale)
+    return faithful, compact
+
+
+def classify_layer(name: str) -> int:
+    match = re.match(r"^model\.layers\.(\d+)\.", name)
+    return int(match.group(1)) if match else -1
+
+
+def is_runtime_indexer(name: str, n_layers: int) -> bool:
+    return ".self_attn.indexer." in name and 0 <= classify_layer(name) < n_layers
 
 
 def merge_expert_records(pending, incoming):
@@ -168,6 +201,8 @@ def main() -> None:
                         help="bounded concurrent shard conversions (results are committed in order)")
     parser.add_argument("--index-offset", type=int, default=0,
                         help="global output-shard index added to this input batch")
+    parser.add_argument("--augment-indexer", action="store_true",
+                        help="add BF16/INT8 DSA indexer shards without touching existing payloads")
     args = parser.parse_args()
     source_shards = sorted(args.indir.glob("*.safetensors"))
     if not source_shards: raise SystemExit(f"no Safetensors shards in {args.indir}")
@@ -177,6 +212,24 @@ def main() -> None:
     shared=args.outdir/"shared-experts"; faithful=args.outdir/"faithful"; compact=args.outdir/"compact"
     for directory in (shared,faithful,compact): directory.mkdir(parents=True,exist_ok=True)
     _, _, save_file = dependencies()
+    if args.augment_indexer:
+        def write_indexer(index, shard, tensors):
+            ft, ct = tensors
+            if not ft: return 0
+            fp=faithful/f"indexer-{index+args.index_offset:05d}.safetensors"
+            cp=compact/f"indexer-{index+args.index_offset:05d}.safetensors"
+            if fp.exists() or cp.exists():
+                raise FileExistsError(f"refusing to replace existing indexer shard {index}")
+            save_file(ft,fp);save_file(ct,cp);return len(ft)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            jobs=[(i,s,executor.submit(convert_indexer_shard,s,args.n_layers))
+                  for i,s in enumerate(source_shards)]
+            total=0
+            for i,shard,future in jobs:
+                count=write_indexer(i,shard,future.result());total+=count
+                if count: print(f"[{i+1}/{len(source_shards)}] {shard.name}: {count} indexer tensors")
+        print(f"added {total} faithful/compact indexer tensors")
+        return
     pending = {}; jobs = collections.deque(); source_iter = iter(enumerate(source_shards))
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
       for _ in range(args.workers):

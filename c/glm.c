@@ -1878,6 +1878,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(e->fmt==COLI_TENSOR_BF16){
+        const uint16_t *q=e->bf16+(int64_t)tok*D;
+        for(int i=0;i<D;i++) x[i]=coli_bf16_f32(q[i]);
+        return;
+    }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
@@ -2045,9 +2050,13 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
 }
 static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
-    /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
-     * Keep its tier assignment, but invalidate the old device weights. */
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+    /* ws[] slots are shared across layers. The same eid in another layer may
+     * have different tensor offsets inside the slab, so every reload must
+     * invalidate host wrappers that retain the old weight/scale pointers.
+     * Device-tier tensors keep their allocation for REPIN's in-place update. */
+    if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
+    if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
+    if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
@@ -2295,7 +2304,9 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     if(g_mmap || !st_has(&m->S,qn))
         return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
 #ifdef COLI_CUDA
-    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
+    if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
+    if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
+    if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
@@ -3039,12 +3050,14 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
      * intero torna al percorso CPU (semantica completa) — MAI attenzione
      * densa sotto selezione. */
     const int *sel_arg=NULL; int sB0_arg=0, topk_arg=0;
+    const char *sel_fb="unknown";
+    #define PREFILL_SEL_FAIL(reason) do{ sel_fb=(reason); goto sel_fail; }while(0)
     int sel_need = m->has_dsa && layer<c->n_layers && st0==0 && !g_dsa_force &&
                    pos_base+S>c->index_topk;
     if(sel_need){
         dsc_enabled();
         int sB0=c->index_topk-pos_base; if(sB0<0) sB0=0;
-        if(!(dsa_chain_on() && S>4)) goto sel_fail;   /* S<=4 e' territorio della catena;
+        if(!(dsa_chain_on() && S>4)) PREFILL_SEL_FAIL("chain"); /* S<=4 e' territorio della catena;
                                                         * 5..15 riempie tile wmma a meta'
                                                         * ma batte di GRAN lunga la CPU
                                                         * O(T)/riga (append agentici!) */
@@ -3053,21 +3066,21 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
             if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
                !qt_cuda_upload(wq)||!qt_cuda_upload(wk)||!qt_cuda_upload(wp)||
                wq->cuda_device!=dev||wk->cuda_device!=dev||wp->cuda_device!=dev)
-                goto sel_fail;
+                PREFILL_SEL_FAIL("ix");
             float *knw=layer<256?pipe_ln_cache(dev,layer,5,m->ix_knw[layer],(size_t)c->index_hd):NULL;
             float *knb=layer<256?pipe_ln_cache(dev,layer,6,m->ix_knb[layer],(size_t)c->index_hd):NULL;
-            if(!knw||!knb) goto sel_fail;
+            if(!knw||!knb) PREFILL_SEL_FAIL("kn");
             float *d_ic=NULL;
             if(g_cuda_pipe){
-                if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
+                if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) PREFILL_SEL_FAIL("icsync");
                 d_ic=m->kv->cuda_Ic[layer];
             }else{
-                if(coli_cuda_kv_dtype()==COLI_KV_FP8_E4M3) goto sel_fail;
+                if(coli_cuda_kv_dtype()==COLI_KV_FP8_E4M3) PREFILL_SEL_FAIL("fp8-no-pipe");
                 size_t icb=(size_t)(pos_base+S)*c->index_hd*kv_esz();
                 d_ic=coli_cuda_pipe_scratch(dev,22,icb);
-                if(!d_ic) goto sel_fail;
+                if(!d_ic) PREFILL_SEL_FAIL("ic-scratch");
                 if(pos_base>0&&!coli_cuda_pipe_upload_kv(dev,d_ic,m->Ic[layer],
-                    (size_t)pos_base*c->index_hd,0)) goto sel_fail;
+                    (size_t)pos_base*c->index_hd,0)) PREFILL_SEL_FAIL("ic-upload");
             }
             ColiCudaDsaChain dsac; memset(&dsac,0,sizeof dsac);
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
@@ -3083,41 +3096,42 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
                     m->dsa_scap=(int64_t)S*dtopk;
                     m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                     m->dsa_nsel=malloc((size_t)S*sizeof(int));
-                    if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; goto sel_fail; }
+                    if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; PREFILL_SEL_FAIL("sel-alloc"); }
                 }
                 dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel; dsac.topk=dtopk;
                 if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
-                    goto sel_fail;
+                    PREFILL_SEL_FAIL("select-device");
                 for(int s2=0;s2<sB0;s2++) m->dsa_nsel[s2]=0;
             }else{
                 static float *pisc=NULL; static size_t pisc_cap=0;
                 size_t need=(size_t)(S-sB0)*(pos_base+S);
                 if(need>pisc_cap){
                     float *p=realloc(pisc,need*sizeof(float));
-                    if(!p) goto sel_fail;
+                    if(!p) PREFILL_SEL_FAIL("score-alloc");
                     pisc=p; pisc_cap=need;
                 }
                 dsac.iscore_host=pisc;
                 if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
-                    goto sel_fail;
-                if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
+                    PREFILL_SEL_FAIL("select-host");
+                if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) PREFILL_SEL_FAIL("topk");
             }
             if(g_cuda_pipe) m->kv->cuda_ic_valid[layer]=pos_base+S;
             if(g_dsc_on) g_dsc_pfull++;
         }else{
-            if(!m->dsa_nsel) goto sel_fail;
+            if(!m->dsa_nsel) PREFILL_SEL_FAIL("shared-empty");
             for(int s2=sB0;s2<S;s2++)
-                if(m->dsa_nsel[s2]!=c->index_topk) goto sel_fail;
+                if(m->dsa_nsel[s2]!=c->index_topk) PREFILL_SEL_FAIL("shared-shape");
             if(g_dsc_on) g_dsc_pshared++;
         }
         sel_arg=m->dsa_sel; sB0_arg=sB0; topk_arg=c->index_topk;
         if(0){
 sel_fail:
             if(g_dsc_on){ g_dsc_pfb++; if(g_dsc_pfb<=20)
-                fprintf(stderr,"[DSAC] prefill-fb li=%d\n",layer); }
+                fprintf(stderr,"[DSAC] prefill-fb %s li=%d\n",sel_fb,layer); }
             ok=0; goto done;
         }
     }
+    #undef PREFILL_SEL_FAIL
 #ifdef COLI_CUDA
     /* Negativo (2026-07-13): P2P a stella dal device di casa serializza ~95MB/layer
      * sul suo link PCIe — attention 26->41-44s. Resta opt-in per topologie NVLink. */
@@ -3161,7 +3175,7 @@ sel_fail:
             ok=coli_cuda_pipe_gemm(l->o.cuda,out_dev,ctx_full,S)&&coli_cuda_pipe_sync(dev);
         } else ok=0;
         if(!ok)
-            ok=coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+            ok=coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,kvls,kvrs,
                 S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
     } else
 #endif
@@ -3190,9 +3204,9 @@ sel_fail:
                 ok=coli_cuda_prefill_attn_gemm(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,kvls,kvrs,
                     S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale,NULL,0,0);
             if(!ok)
-                ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,kvls,kvrs,
                         S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
-                          :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
+                          :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,kvls,kvrs,
                         S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
         }
     }
@@ -3484,6 +3498,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         Q+(int64_t)s*H*qh,
                         (float*)((char*)ks->cuda_Lc[layer]+(size_t)st0*kvl*kv_esz()),
                         (float*)((char*)ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope*kv_esz()),
+                        ks->cuda_Lc_scale[layer]?ks->cuda_Lc_scale[layer]+st0:NULL,
+                        ks->cuda_Rc_scale[layer]?ks->cuda_Rc_scale[layer]+st0:NULL,
                         H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
                 if(!cuda_core)
@@ -4118,8 +4134,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
-            if((!group_enabled||e->g.fmt==COLI_TENSOR_MODELOPT_NVFP4) && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
-               e->d.cuda_eligible && !omp_in_parallel() &&
+            if((!group_enabled||e->g.fmt==COLI_TENSOR_MODELOPT_NVFP4) && g_cuda_enabled &&
+               e->g.cuda && e->u.cuda && e->d.cuda && !omp_in_parallel() &&
                coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -6319,7 +6335,7 @@ static void repin_adapt(Model *m,int limit){
         const char *tier="RAM";
 #ifdef COLI_CUDA
         if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
-            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+            if(qt_cuda_update(&s->g) && qt_cuda_update(&s->u) && qt_cuda_update(&s->d)){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);

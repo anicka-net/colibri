@@ -81,29 +81,38 @@ def build_requests(tk, docs_by_task, prefix=""):
     return reqs, meta, perq
 
 def score_accuracy(tasks, meta, perq, lp):
-    print(f"\n{'task':<18} {'n':>4} {'acc':>7} {'acc_norm':>9}")
+    print(f"\n{'task':<18} {'n':>4} {'acc':>7} {'acc_norm':>9} {'gold nat/tok':>13}")
     overall = []
+    all_gold_lp = 0.0
+    all_gold_tokens = 0
     for t in tasks:
         qs = [k for k in perq if k[0] == t]
-        acc = accn = 0
+        acc = accn = 0; gold_lp = 0.0; gold_tokens = 0
         for k in qs:
             ridx = perq[k]; gold = meta[ridx[0]][5]
+            gold_r = next(r for r in ridx if meta[r][2] == gold)
+            gold_lp += lp[gold_r]; gold_tokens += meta[gold_r][3]
             best  = max(ridx, key=lambda r: lp[r])
             bestn = max(ridx, key=lambda r: lp[r] / meta[r][4])    # acc_norm: per carattere
             acc  += (meta[best][2]  == gold)
             accn += (meta[bestn][2] == gold)
         n = len(qs)
         if not n: continue
-        print(f"{t:<18} {n:>4} {100*acc/n:>6.1f}% {100*accn/n:>8.1f}%")
+        npt = gold_lp / gold_tokens if gold_tokens else float("nan")
+        print(f"{t:<18} {n:>4} {100*acc/n:>6.1f}% {100*accn/n:>8.1f}% {npt:>13.5f}")
         overall.append(100 * accn / n)
+        all_gold_lp += gold_lp; all_gold_tokens += gold_tokens
         for mdl, sc in REFERENCE.get(t, {}).items():
             if sc is not None: print(f"{'  ref '+mdl:<18} {'':>4} {'':>7} {sc:>8.1f}%")
     if overall:
         print(f"\nMEAN acc_norm: {sum(overall)/len(overall):.1f}% across {len(overall)} tasks")
+    if all_gold_tokens:
+        print(f"AGGREGATE gold log-likelihood: {all_gold_lp/all_gold_tokens:.5f} nat/token "
+              f"over {all_gold_tokens} continuation tokens")
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--snap", required=True)
+    ap.add_argument("--snap")
     ap.add_argument("--glm", default="./glm")
     ap.add_argument("--data", default="./bench")
     ap.add_argument("--tasks", default="smoke")
@@ -121,6 +130,9 @@ def main():
         lp = [-3.0, -2.0, -5.0]                       # opt1 ha lp piu' alto -> acc sceglie 1 (=gold) OK
         score_accuracy(["t"], meta, perq, lp)
         print("selftest OK" if True else ""); return
+
+    if not a.snap:
+        ap.error("--snap is required unless --selftest is used")
 
     from tokenizers import Tokenizer
     tk = Tokenizer.from_file(os.path.join(a.snap, "tokenizer.json"))
