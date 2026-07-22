@@ -8,6 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "tools"))
 import nvfp4_format as nf
+from convert_modelopt_nvfp4 import merge_expert_records
 
 
 class Nvfp4FormatTest(unittest.TestCase):
@@ -78,6 +79,19 @@ class Nvfp4FormatTest(unittest.TestCase):
             nf.dequantize_modelopt(packed, np.zeros((1, 1), dtype=np.uint8), 0.5, 16)
         with self.assertRaisesRegex(ValueError, "shape"):
             nf.swizzle_scales_for_cutlass(np.ones((1, 2), dtype=np.uint8), 1, 16)
+
+    def test_expert_records_can_span_source_shards(self):
+        key = (12, 127)
+        def record(projection):
+            prefix = f"model.layers.12.mlp.experts.127.{projection}.weight"
+            return [(prefix, nf.tensor_bytes(np.asarray([1], dtype=np.uint8))),
+                    (prefix + ".nvfp4_scale", nf.tensor_bytes(np.asarray([0x38], dtype=np.uint8)))]
+        pending = {}
+        self.assertEqual(merge_expert_records(pending, {key: record("gate_proj")}), [])
+        self.assertIn(key, pending)
+        done = merge_expert_records(pending, {key: record("up_proj") + record("down_proj")})
+        self.assertEqual(len(done), 1)
+        self.assertNotIn(key, pending)
 
 
 if __name__ == "__main__":

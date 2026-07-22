@@ -118,14 +118,26 @@ def convert_shard(path: pathlib.Path, n_layers: int):
             q, scale = quant_int8(full.float().numpy(), 8)
             compact[name] = torch.from_numpy(q.view(np.int8).copy())
             compact[name + ".qs"] = torch.from_numpy(scale)
-    ordered = []
-    for key in sorted(records):
-        projections = records[key]
-        present = {name.split(".")[-2] for name, _ in projections if name.endswith(".weight")}
-        if present != {"gate_proj", "up_proj", "down_proj"}:
-            raise ValueError(f"{path}: expert {key} is split or incomplete: {sorted(present)}")
-        ordered.append(projections)
-    return ordered, faithful, compact
+    return records, faithful, compact
+
+
+def merge_expert_records(pending, incoming):
+    """Merge shard fragments and return expert records completed this shard."""
+    complete = []
+    for key in sorted(incoming):
+        records = pending.setdefault(key, [])
+        names = {name for name, _ in records}
+        duplicate = names.intersection(name for name, _ in incoming[key])
+        if duplicate:
+            raise ValueError(f"duplicate tensors for expert {key}: {sorted(duplicate)}")
+        records.extend(incoming[key])
+        present = {name.split(".")[-2] for name, _ in records if name.endswith(".weight")}
+        if present == {"gate_proj", "up_proj", "down_proj"}:
+            complete.append(records)
+            del pending[key]
+        elif not present.issubset({"gate_proj", "up_proj", "down_proj"}):
+            raise ValueError(f"invalid projections for expert {key}: {sorted(present)}")
+    return complete
 
 
 def link_exact(source: pathlib.Path, destination: pathlib.Path) -> None:
@@ -149,8 +161,10 @@ def main() -> None:
     shared=args.outdir/"shared-experts"; faithful=args.outdir/"faithful"; compact=args.outdir/"compact"
     for directory in (shared,faithful,compact): directory.mkdir(parents=True,exist_ok=True)
     _, _, save_file = dependencies()
+    pending = {}
     for index, shard in enumerate(source_shards):
-        expert_records, faithful_tensors, compact_tensors = convert_shard(shard,args.n_layers)
+        fragments, faithful_tensors, compact_tensors = convert_shard(shard,args.n_layers)
+        expert_records = merge_expert_records(pending, fragments)
         if expert_records:
             payload=shared/f"experts-{index:05d}.safetensors"
             offsets=nf.write_aligned_safetensors(payload,expert_records)
@@ -161,6 +175,10 @@ def main() -> None:
         if compact_tensors:
             save_file(compact_tensors,compact/f"resident-{index:05d}.safetensors")
         print(f"[{index+1}/{len(source_shards)}] {shard.name}: {len(expert_records)} experts")
+    if pending:
+        detail = {key: sorted(name.split(".")[-2] for name, _ in records if name.endswith(".weight"))
+                  for key, records in pending.items()}
+        raise ValueError(f"incomplete experts after final shard: {detail}")
     for variant,precision in ((faithful,nf.FORMAT_BF16),(compact,nf.FORMAT_INT8_ROW)):
         manifest=nf.make_manifest(args.source_repository,args.source_revision,precision)
         (variant/nf.MANIFEST_NAME).write_text(json.dumps(manifest,indent=2,sort_keys=True)+"\n")
