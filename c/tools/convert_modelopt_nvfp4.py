@@ -9,6 +9,8 @@ offline. Expert shards are written once and hard-linked into both variants.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import collections
 import json
 import os
 import pathlib
@@ -157,17 +159,27 @@ def main() -> None:
     parser.add_argument("--n-layers", type=int, default=78)
     parser.add_argument("--expected-shards", type=int, default=0,
                         help="refuse partial input until exactly this many model shards exist")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="bounded concurrent shard conversions (results are committed in order)")
     args = parser.parse_args()
     source_shards = sorted(args.indir.glob("*.safetensors"))
     if not source_shards: raise SystemExit(f"no Safetensors shards in {args.indir}")
     if args.expected_shards and len(source_shards) != args.expected_shards:
         raise SystemExit(f"expected {args.expected_shards} Safetensors shards, found {len(source_shards)}")
+    if args.workers < 1: raise SystemExit("--workers must be positive")
     shared=args.outdir/"shared-experts"; faithful=args.outdir/"faithful"; compact=args.outdir/"compact"
     for directory in (shared,faithful,compact): directory.mkdir(parents=True,exist_ok=True)
     _, _, save_file = dependencies()
-    pending = {}
-    for index, shard in enumerate(source_shards):
-        fragments, faithful_tensors, compact_tensors = convert_shard(shard,args.n_layers)
+    pending = {}; jobs = collections.deque(); source_iter = iter(enumerate(source_shards))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+      for _ in range(args.workers):
+        item = next(source_iter, None)
+        if item is not None:
+            index, shard = item
+            jobs.append((index, shard, executor.submit(convert_shard, shard, args.n_layers)))
+      while jobs:
+        index, shard, future = jobs.popleft()
+        fragments, faithful_tensors, compact_tensors = future.result()
         expert_records = merge_expert_records(pending, fragments)
         if expert_records:
             payload=shared/f"experts-{index:05d}.safetensors"
@@ -179,6 +191,11 @@ def main() -> None:
         if compact_tensors:
             save_file(compact_tensors,compact/f"resident-{index:05d}.safetensors")
         print(f"[{index+1}/{len(source_shards)}] {shard.name}: {len(expert_records)} experts")
+        item = next(source_iter, None)
+        if item is not None:
+            next_index, next_shard = item
+            jobs.append((next_index, next_shard,
+                         executor.submit(convert_shard, next_shard, args.n_layers)))
     if pending:
         detail = {key: sorted(name.split(".")[-2] for name, _ in records if name.endswith(".weight"))
                   for key, records in pending.items()}
