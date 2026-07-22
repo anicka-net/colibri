@@ -8,7 +8,12 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "tools"))
 import nvfp4_format as nf
-from convert_modelopt_nvfp4 import is_routed_expert, merge_expert_records
+from convert_modelopt_nvfp4 import (
+    classify_layer,
+    is_routed_expert,
+    is_runtime_indexer,
+    merge_expert_records,
+)
 
 
 class Nvfp4FormatTest(unittest.TestCase):
@@ -97,6 +102,15 @@ class Nvfp4FormatTest(unittest.TestCase):
         base = "model.layers.{}.mlp.experts.0.down_proj.weight"
         self.assertIsNotNone(is_routed_expert(base.format(77), 78))
         self.assertIsNone(is_routed_expert(base.format(78), 78))
+
+    def test_indexer_augmentation_excludes_mtp_layer(self):
+        base = "model.layers.{}.self_attn.indexer.wq_b.weight"
+        self.assertEqual(classify_layer(base.format(0)), 0)
+        self.assertEqual(classify_layer(base.format(77)), 77)
+        self.assertEqual(classify_layer(base.format(78)), 78)
+        self.assertEqual(classify_layer("model.embed_tokens.weight"), -1)
+        self.assertTrue(is_runtime_indexer(base.format(77), 78))
+        self.assertFalse(is_runtime_indexer(base.format(78), 78))
 
 
 if __name__ == "__main__":

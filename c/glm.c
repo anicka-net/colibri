@@ -1878,6 +1878,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(e->fmt==COLI_TENSOR_BF16){
+        const uint16_t *q=e->bf16+(int64_t)tok*D;
+        for(int i=0;i<D;i++) x[i]=coli_bf16_f32(q[i]);
+        return;
+    }
     if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
         for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
     if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
@@ -2247,13 +2252,17 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
  * them in one syscall, and reaps CQEs on demand.  The kernel, rather than a set
  * of blocking pthreads, owns the I/O concurrency. */
 #define URING_LOAD_MAX 64
-#define URING_REQ_MAX  512
+#define URING_REQ_MAX  1024
 typedef struct {
     int load, expect;
 } UringRead;
 typedef struct {
     Model *m; ESlot *s; int layer,eid,fatal;
-    st_tensor *tw[3],*tq[3]; int64_t pos[3];
+    st_tensor *tw[3],*tq[3],*tt[3],*ti[3];
+    int64_t pos[3],scale_pos[3],tensor_pos[3],input_pos[3];
+    int64_t src_pos[3],src_scale_pos[3];
+    void *iobuf; size_t iobuf_cap;
+    int native,native_coalesced;
     int pending,done,finalized,error;
 } UringLoad;
 typedef struct {
@@ -2295,14 +2304,90 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
     char nm[3][288],qn[300]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
-    snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
-    if(g_mmap || !st_has(&m->S,qn))
-        return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
+    if(g_mmap) return uring_load_error(l,ENOTSUP,"URING is incompatible with mmap"),li;
 #ifdef COLI_CUDA
     if(!s->g.cuda_eligible) qt_cuda_reset(&s->g);
     if(!s->u.cuda_eligible) qt_cuda_reset(&s->u);
     if(!s->d.cuda_eligible) qt_cuda_reset(&s->d);
 #endif
+    if(m->manifest.present){
+        Cfg *c=&m->c; int I=c->moe_inter,D=c->hidden;
+        int OO[3]={I,I,D},II[3]={D,D,I}; int64_t slab_need=0;
+        char side[360]; l->native=1;
+        for(int k=0;k<3;k++){
+            l->tw[k]=st_find(&m->S,nm[k]);
+            snprintf(side,sizeof(side),"%.287s.nvfp4_scale",nm[k]);l->tq[k]=st_find(&m->S,side);
+            snprintf(side,sizeof(side),"%.287s.nvfp4_tensor_scale",nm[k]);l->tt[k]=st_find(&m->S,side);
+            snprintf(side,sizeof(side),"%.287s.nvfp4_input_scale",nm[k]);l->ti[k]=st_find(&m->S,side);
+            int64_t wb=(int64_t)OO[k]*((II[k]+1)/2);
+            int64_t sb=(int64_t)coli_nvfp4_cutlass_scale_bytes(OO[k],II[k]);
+            if(!l->tw[k]||!l->tq[k]||!l->tt[k]||!l->ti[k]||
+               l->tw[k]->dtype!=3||l->tq[k]->dtype!=3||l->tt[k]->dtype!=2||l->ti[k]->dtype!=2||
+               l->tw[k]->nbytes!=wb||l->tq[k]->nbytes!=sb||
+               l->tt[k]->nbytes!=4||l->ti[k]->nbytes!=4||INT64_MAX-slab_need<wb+sb)
+                return uring_load_error(l,EINVAL,"invalid native NVFP4 io_uring metadata"),li;
+            slab_need+=wb+sb;
+        }
+        st_tensor *part[12];int np=0;
+        for(int k=0;k<3;k++){part[np++]=l->tw[k];part[np++]=l->tq[k];part[np++]=l->tt[k];part[np++]=l->ti[k];}
+        for(int a=0;a<np;a++)for(int z=a+1;z<np;z++)if(part[z]->off<part[a]->off){st_tensor *t=part[a];part[a]=part[z];part[z]=t;}
+        int contiguous=1;for(int a=1;a<np;a++)if(part[a]->fd!=part[0]->fd||
+            part[a-1]->off+part[a-1]->nbytes!=part[a]->off)contiguous=0;
+        int64_t record_off=part[0]->off;
+        int64_t record_span=part[np-1]->off+part[np-1]->nbytes-record_off;
+        if(contiguous){slab_need=record_span;l->native_coalesced=1;}
+        if(!s->slab||slab_need>s->slab_cap){
+            compat_aligned_free(s->slab);s->slab=NULL;s->slab_cap=0;
+            size_t alloc=((size_t)slab_need+4095)&~(size_t)4095;
+            if(posix_memalign((void**)&s->slab,4096,alloc))
+                return uring_load_error(l,ENOMEM,"io_uring native expert slab"),li;
+            s->slab_cap=alloc;numa_slab_bind(s->slab,alloc);
+        }
+        if(!s->fslab||s->fslab_cap<6){
+            free(s->fslab);s->fslab=malloc(6*sizeof(float));s->fslab_cap=s->fslab?6:0;
+            if(!s->fslab) return uring_load_error(l,ENOMEM,"io_uring native scalar slab"),li;
+            numa_slab_bind(s->fslab,6*sizeof(float));
+        }
+        if(contiguous){
+            size_t packed=0;
+            for(int k=0;k<3;k++){
+                l->src_pos[k]=l->tw[k]->off-record_off;
+                l->src_scale_pos[k]=l->tq[k]->off-record_off;
+                packed=(packed+15)&~(size_t)15;l->pos[k]=(int64_t)packed;packed+=(size_t)l->tw[k]->nbytes;
+                packed=(packed+15)&~(size_t)15;l->scale_pos[k]=(int64_t)packed;packed+=(size_t)l->tq[k]->nbytes;
+                l->tensor_pos[k]=l->tt[k]->off-record_off;l->input_pos[k]=l->ti[k]->off-record_off;
+            }
+            if(packed>s->slab_cap)
+                return uring_load_error(l,EOVERFLOW,"io_uring native packed expert slab"),li;
+            int dfd=g_direct?st_direct_fd(&m->S,part[0]->fd):-1;
+            size_t len=dfd>=0?(((size_t)record_span+4095)&~(size_t)4095):(size_t)record_span;
+            if(posix_memalign(&l->iobuf,4096,(len+4095)&~(size_t)4095))
+                return uring_load_error(l,ENOMEM,"io_uring native record staging"),li;
+            l->iobuf_cap=(len+4095)&~(size_t)4095;
+            if(uring_add_read(b,li,dfd>=0?dfd:part[0]->fd,l->iobuf,len,record_off,(size_t)record_span))
+                return uring_load_error(l,errno,"io_uring native coalesced record read"),li;
+            return li;
+        }
+        int64_t o=0;
+        for(int k=0;k<3;k++){
+            l->pos[k]=o;
+            if(uring_add_read(b,li,l->tw[k]->fd,s->slab+o,(size_t)l->tw[k]->nbytes,
+                              l->tw[k]->off,(size_t)l->tw[k]->nbytes))
+                return uring_load_error(l,errno,"io_uring native weight read"),li;
+            o+=l->tw[k]->nbytes;l->scale_pos[k]=o;
+            if(uring_add_read(b,li,l->tq[k]->fd,s->slab+o,(size_t)l->tq[k]->nbytes,
+                              l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+                return uring_load_error(l,errno,"io_uring native block-scale read"),li;
+            o+=l->tq[k]->nbytes;
+            if(uring_add_read(b,li,l->tt[k]->fd,&s->fslab[k*2],4,l->tt[k]->off,4)||
+               uring_add_read(b,li,l->ti[k]->fd,&s->fslab[k*2+1],4,l->ti[k]->off,4))
+                return uring_load_error(l,errno,"io_uring native tensor-scale read"),li;
+        }
+        return li;
+    }
+    snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    if(!st_has(&m->S,qn))
+        return uring_load_error(l,ENOTSUP,"URING requires quantized expert tensors"),li;
     for(int k=0;k<3;k++){
         l->tw[k]=st_find(&m->S,nm[k]);
         size_t n=strnlen(nm[k],sizeof(nm[k]));
@@ -2403,6 +2488,45 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     UringLoad *l=&b->load[li]; ESlot *s=l->s;
     if(l->finalized) return 0;
     if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
+    if(l->native){
+        Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden;
+        QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
+        int64_t total=0;
+        for(int k=0;k<3;k++){
+            if(l->native_coalesced){
+                memcpy(s->slab+l->pos[k],(uint8_t*)l->iobuf+l->src_pos[k],(size_t)l->tw[k]->nbytes);
+                memcpy(s->slab+l->scale_pos[k],(uint8_t*)l->iobuf+l->src_scale_pos[k],(size_t)l->tq[k]->nbytes);
+                memcpy(&s->fslab[k*2],(uint8_t*)l->iobuf+l->tensor_pos[k],4);
+                memcpy(&s->fslab[k*2+1],(uint8_t*)l->iobuf+l->input_pos[k],4);
+            }
+            uint8_t *bs=s->slab+l->scale_pos[k]; int64_t sb=l->tq[k]->nbytes;
+            float ts=s->fslab[k*2],is=s->fslab[k*2+1];
+            if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
+                return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
+            for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z])))
+                return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
+            for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
+                float v=coli_e4m3fn_f32(bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
+                if(!isfinite(v)||v<=0)
+                    return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
+            }
+            qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
+            qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;qt[k]->O=OO[k];qt[k]->I=II[k];
+            qt[k]->gs=COLI_NVFP4_GROUP_SIZE;qt[k]->q4=s->slab+l->pos[k];
+            qt[k]->block_scales=bs;qt[k]->tensor_scale=ts;qt[k]->input_scale=is;
+            qt[k]->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;
+            total+=l->tw[k]->nbytes+sb+8;
+        }
+        free(l->iobuf);l->iobuf=NULL;l->iobuf_cap=0;
+        if(g_drop) for(int k=0;k<3;k++){
+            posix_fadvise(l->tw[k]->fd,l->tw[k]->off,l->tw[k]->nbytes,POSIX_FADV_DONTNEED);
+            posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
+            posix_fadvise(l->tt[k]->fd,l->tt[k]->off,4,POSIX_FADV_DONTNEED);
+            posix_fadvise(l->ti[k]->fd,l->ti[k]->off,4,POSIX_FADV_DONTNEED);
+        }
+        atomic_fetch_add_explicit(&g_prof_io,total,memory_order_relaxed);
+        if(publish_eid)s->eid=l->eid;l->finalized=1;return 0;
+    }
     if(g_drop){
         int ord0=0; for(int k=1;k<3;k++) if(l->tw[k]->off<l->tw[ord0]->off) ord0=k;
         int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
@@ -2502,12 +2626,10 @@ static void *pipe_worker(void *arg){
 static void pipe_init(Model *m){
     if(g_pp.started) return;
 #ifdef __linux__
-    if(g_uring&&m->manifest.present){
-        fprintf(stderr,"[NVFP4] io_uring record loader not engaged; using validated threaded pread fallback\n");
-        g_uring=0;
-    }
     if(g_uring){
         if(uring_batch_init(&g_ub_pipe)){ perror("URING=1 io_uring_setup"); exit(1); }
+        if(m->manifest.present)
+            fprintf(stderr,"[NVFP4] complete-record io_uring loader active\n");
         g_pp.m=m; g_pp.started=1; return;
     }
 #endif
@@ -3045,12 +3167,14 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
      * intero torna al percorso CPU (semantica completa) — MAI attenzione
      * densa sotto selezione. */
     const int *sel_arg=NULL; int sB0_arg=0, topk_arg=0;
+    const char *sel_fb="unknown";
+    #define PREFILL_SEL_FAIL(reason) do{ sel_fb=(reason); goto sel_fail; }while(0)
     int sel_need = m->has_dsa && layer<c->n_layers && st0==0 && !g_dsa_force &&
                    pos_base+S>c->index_topk;
     if(sel_need){
         dsc_enabled();
         int sB0=c->index_topk-pos_base; if(sB0<0) sB0=0;
-        if(!(dsa_chain_on() && S>4)) goto sel_fail;   /* S<=4 e' territorio della catena;
+        if(!(dsa_chain_on() && S>4)) PREFILL_SEL_FAIL("chain"); /* S<=4 e' territorio della catena;
                                                         * 5..15 riempie tile wmma a meta'
                                                         * ma batte di GRAN lunga la CPU
                                                         * O(T)/riga (append agentici!) */
@@ -3059,21 +3183,21 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
             if(!wq->cuda_eligible||!wk->cuda_eligible||!wp->cuda_eligible||
                !qt_cuda_upload(wq)||!qt_cuda_upload(wk)||!qt_cuda_upload(wp)||
                wq->cuda_device!=dev||wk->cuda_device!=dev||wp->cuda_device!=dev)
-                goto sel_fail;
+                PREFILL_SEL_FAIL("ix");
             float *knw=layer<256?pipe_ln_cache(dev,layer,5,m->ix_knw[layer],(size_t)c->index_hd):NULL;
             float *knb=layer<256?pipe_ln_cache(dev,layer,6,m->ix_knb[layer],(size_t)c->index_hd):NULL;
-            if(!knw||!knb) goto sel_fail;
+            if(!knw||!knb) PREFILL_SEL_FAIL("kn");
             float *d_ic=NULL;
             if(g_cuda_pipe){
-                if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) goto sel_fail;
+                if(!ic_dev_sync(m,l,m->kv,layer,pos_base)) PREFILL_SEL_FAIL("icsync");
                 d_ic=m->kv->cuda_Ic[layer];
             }else{
-                if(coli_cuda_kv_dtype()==COLI_KV_FP8_E4M3) goto sel_fail;
+                if(coli_cuda_kv_dtype()==COLI_KV_FP8_E4M3) PREFILL_SEL_FAIL("fp8-no-pipe");
                 size_t icb=(size_t)(pos_base+S)*c->index_hd*kv_esz();
                 d_ic=coli_cuda_pipe_scratch(dev,22,icb);
-                if(!d_ic) goto sel_fail;
+                if(!d_ic) PREFILL_SEL_FAIL("ic-scratch");
                 if(pos_base>0&&!coli_cuda_pipe_upload_kv(dev,d_ic,m->Ic[layer],
-                    (size_t)pos_base*c->index_hd,0)) goto sel_fail;
+                    (size_t)pos_base*c->index_hd,0)) PREFILL_SEL_FAIL("ic-upload");
             }
             ColiCudaDsaChain dsac; memset(&dsac,0,sizeof dsac);
             dsac.ix_wq=wq->cuda; dsac.ix_wk=wk->cuda; dsac.ix_wp=wp->cuda;
@@ -3089,41 +3213,42 @@ static int attn_pipe_prefill(Model *m, Layer *l, int layer, const float *x, int 
                     m->dsa_scap=(int64_t)S*dtopk;
                     m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                     m->dsa_nsel=malloc((size_t)S*sizeof(int));
-                    if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; goto sel_fail; }
+                    if(!m->dsa_sel||!m->dsa_nsel){ m->dsa_scap=0; PREFILL_SEL_FAIL("sel-alloc"); }
                 }
                 dsac.sel=m->dsa_sel; dsac.nsel=m->dsa_nsel; dsac.topk=dtopk;
                 if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
-                    goto sel_fail;
+                    PREFILL_SEL_FAIL("select-device");
                 for(int s2=0;s2<sB0;s2++) m->dsa_nsel[s2]=0;
             }else{
                 static float *pisc=NULL; static size_t pisc_cap=0;
                 size_t need=(size_t)(S-sB0)*(pos_base+S);
                 if(need>pisc_cap){
                     float *p=realloc(pisc,need*sizeof(float));
-                    if(!p) goto sel_fail;
+                    if(!p) PREFILL_SEL_FAIL("score-alloc");
                     pisc=p; pisc_cap=need;
                 }
                 dsac.iscore_host=pisc;
                 if(!coli_cuda_prefill_dsa_select(dev,&dsac,xd,qrd,S,pos_base,sB0,D,ql,R,c->theta))
-                    goto sel_fail;
-                if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) goto sel_fail;
+                    PREFILL_SEL_FAIL("select-host");
+                if(!prefill_dsa_topk(m,pisc,S,sB0,pos_base,layer)) PREFILL_SEL_FAIL("topk");
             }
             if(g_cuda_pipe) m->kv->cuda_ic_valid[layer]=pos_base+S;
             if(g_dsc_on) g_dsc_pfull++;
         }else{
-            if(!m->dsa_nsel) goto sel_fail;
+            if(!m->dsa_nsel) PREFILL_SEL_FAIL("shared-empty");
             for(int s2=sB0;s2<S;s2++)
-                if(m->dsa_nsel[s2]!=c->index_topk) goto sel_fail;
+                if(m->dsa_nsel[s2]!=c->index_topk) PREFILL_SEL_FAIL("shared-shape");
             if(g_dsc_on) g_dsc_pshared++;
         }
         sel_arg=m->dsa_sel; sB0_arg=sB0; topk_arg=c->index_topk;
         if(0){
 sel_fail:
             if(g_dsc_on){ g_dsc_pfb++; if(g_dsc_pfb<=20)
-                fprintf(stderr,"[DSAC] prefill-fb li=%d\n",layer); }
+                fprintf(stderr,"[DSAC] prefill-fb %s li=%d\n",sel_fb,layer); }
             ok=0; goto done;
         }
     }
+    #undef PREFILL_SEL_FAIL
 #ifdef COLI_CUDA
     /* Negativo (2026-07-13): P2P a stella dal device di casa serializza ~95MB/layer
      * sul suo link PCIe — attention 26->41-44s. Resta opt-in per topologie NVLink. */
@@ -3167,7 +3292,7 @@ sel_fail:
             ok=coli_cuda_pipe_gemm(l->o.cuda,out_dev,ctx_full,S)&&coli_cuda_pipe_sync(dev);
         } else ok=0;
         if(!ok)
-            ok=coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+            ok=coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,kvls,kvrs,
                 S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
     } else
 #endif
@@ -3196,9 +3321,9 @@ sel_fail:
                 ok=coli_cuda_prefill_attn_gemm(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,kvls,kvrs,
                     S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale,NULL,0,0);
             if(!ok)
-                ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,
+                ok=out_dev?coli_cuda_attention_project_batch_dev_out(l->kv_b.cuda,l->o.cuda,out_dev,qd,ld_,rd,kvls,kvrs,
                         S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale)
-                          :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,
+                          :coli_cuda_attention_project_batch_dev(l->kv_b.cuda,l->o.cuda,out,qd,ld_,rd,kvls,kvrs,
                         S,H,c->qk_nope,R,c->v_head,kvl,T,c->attn_scale);
         }
     }
@@ -3490,6 +3615,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                         Q+(int64_t)s*H*qh,
                         (float*)((char*)ks->cuda_Lc[layer]+(size_t)st0*kvl*kv_esz()),
                         (float*)((char*)ks->cuda_Rc[layer]+(size_t)st0*c->qk_rope*kv_esz()),
+                        ks->cuda_Lc_scale[layer]?ks->cuda_Lc_scale[layer]+st0:NULL,
+                        ks->cuda_Rc_scale[layer]?ks->cuda_Rc_scale[layer]+st0:NULL,
                         H,c->qk_nope,c->qk_rope,
                         vh,kvl,nt,c->attn_scale);
                 if(!cuda_core)
@@ -4124,8 +4251,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
 #ifdef COLI_CUDA
-            if((!group_enabled||e->g.fmt==COLI_TENSOR_MODELOPT_NVFP4) && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
-               e->d.cuda_eligible && !omp_in_parallel() &&
+            if((!group_enabled||e->g.fmt==COLI_TENSOR_MODELOPT_NVFP4) && g_cuda_enabled &&
+               e->g.cuda && e->u.cuda && e->d.cuda && !omp_in_parallel() &&
                coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                 for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
                     for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }

@@ -56,6 +56,14 @@ static void assert_projection(const QT *q,int O,int I){
 }
 
 int main(void){
+    /* Faithful snapshots keep the token boundary in BF16.  Decode it
+     * explicitly instead of falling through to the legacy packed-INT2 case. */
+    {
+        uint16_t rows[6]={0x3f80,0xc000,0x3f00,0x4040,0x0000,0xbf80};
+        Model em={0};em.c.hidden=3;em.embed.fmt=COLI_TENSOR_BF16;em.embed.bf16=rows;
+        float out[3]={0};embed_row(&em,1,out);
+        assert(out[0]==3.0f&&out[1]==0.0f&&out[2]==-1.0f);
+    }
     char path[]="test_nvfp4_loader_XXXXXX";int fd=mkstemp(path);assert(fd>=0);
     FILE *file=fdopen(fd,"w+b");assert(file);
     Model m={0};m.c.hidden=5;m.c.moe_inter=7;m.ebits=4;m.manifest.present=1;

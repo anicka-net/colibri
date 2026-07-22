@@ -78,13 +78,13 @@ typedef int            (*fn_tensor_device)(const ColiCudaTensor *tensor);
 /* --- #111 GPU resident pipeline additions (matched to backend_cuda.h) --- */
 typedef int (*fn_attention_absorb_batch)(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent,const float *rope,int S, int H,int Q,int R,int V,int K,int T, float attention_scale);
 typedef int (*fn_attention_absorb_batch_dev)(ColiCudaTensor *kv_b_shard,float *ctx_dev, const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
-typedef int (*fn_attention_absorb_kvdev)(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T, float scale);
+typedef int (*fn_attention_absorb_kvdev)(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale,int H,int Q,int R,int V,int K,int T, float scale);
 typedef int (*fn_attention_project_batch)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const float *latent, const float *rope,int S,int H,int Q,int R, int V,int K,int T,float attention_scale);
 typedef int (*fn_attention_project_ragged)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
         float *out,const float *q,const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
-typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
-typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale);
+typedef int (*fn_attention_project_batch_dev)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale, int S,int H,int Q,int R,int V,int K,int T,float scale);
+typedef int (*fn_attention_project_batch_dev_out)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale, int S,int H,int Q,int R,int V,int K,int T,float scale);
 typedef int (*fn_prefill_attn_gemm)(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale,int S,int H,int Q,int R,int V,int K,int T,float scale, const int *sel_host,int sB0,int sel_topk);
 typedef int (*fn_prefill_dsa_select)(int device,ColiCudaDsaChain *dsa, const float *xn_dev,const float *qres_dev, int S,int pos_base,int sB0,int D,int q_lora,int qk_rope,float theta);
 typedef void (*fn_dsac_times)(double *sync_s, double *topk_s);
@@ -508,9 +508,9 @@ int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *kv_b_shard,float *ctx_d
     return g_cuda.attention_absorb_batch_dev(kv_b_shard, ctx_dev, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
 }
 
-int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T, float scale){
+int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *kv_b,float *ctx,const float *q, const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale,int H,int Q,int R,int V,int K,int T, float scale){
     if(!g_cuda.available){ return 0; }
-    return g_cuda.attention_absorb_kvdev(kv_b, ctx, q, latent_dev, rope_dev, H, Q, R, V, K, T, scale);
+    return g_cuda.attention_absorb_kvdev(kv_b, ctx, q, latent_dev, rope_dev, latent_scale, rope_scale, H, Q, R, V, K, T, scale);
 }
 
 int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q,const float *latent, const float *rope,int S,int H,int Q,int R, int V,int K,int T,float attention_scale){
@@ -526,14 +526,14 @@ int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_pr
         S,H,Q,R,V,K,max_t,attention_scale);
 }
 
-int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale){
+int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out,const float *q_dev,const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale, int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!g_cuda.available){ return 0; }
-    return g_cuda.attention_project_batch_dev(kv_b, o_proj, out, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
+    return g_cuda.attention_project_batch_dev(kv_b, o_proj, out, q_dev, latent_dev, rope_dev, latent_scale, rope_scale, S, H, Q, R, V, K, T, scale);
 }
 
-int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev, int S,int H,int Q,int R,int V,int K,int T,float scale){
+int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale, int S,int H,int Q,int R,int V,int K,int T,float scale){
     if(!g_cuda.available){ return 0; }
-    return g_cuda.attention_project_batch_dev_out(kv_b, o_proj, out_dev, q_dev, latent_dev, rope_dev, S, H, Q, R, V, K, T, scale);
+    return g_cuda.attention_project_batch_dev_out(kv_b, o_proj, out_dev, q_dev, latent_dev, rope_dev, latent_scale, rope_scale, S, H, Q, R, V, K, T, scale);
 }
 
 int coli_cuda_prefill_attn_gemm(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj, float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,const float *latent_scale,const float *rope_scale,int S,int H,int Q,int R,int V,int K,int T,float scale, const int *sel_host,int sB0,int sel_topk){

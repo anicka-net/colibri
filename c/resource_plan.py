@@ -149,10 +149,10 @@ def discover_gpus():
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return []
+        result = None
     devices = []
     import csv
-    for fields in csv.reader(result.stdout.splitlines()):
+    for fields in csv.reader(result.stdout.splitlines() if result else []):
         fields = [f.strip() for f in fields]
         if len(fields) != 4:
             continue
@@ -163,6 +163,29 @@ def discover_gpus():
         devices.append({"index": index, "name": fields[1],
                         "total_bytes": total * 1024 * 1024,
                         "free_bytes": free * 1024 * 1024})
+    if devices:
+        return devices
+    # Unified-memory GPUs such as GB10 expose memory.total/free as N/A through
+    # nvidia-smi even though CUDA can use system LPDDR.  Keep the device visible
+    # to the planner, but assign it no separate VRAM tier: RAM accounting remains
+    # authoritative and environment_for_plan selects CUDA with CUDA_EXPERT_GB=0.
+    try:
+        basic = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader,nounits"],
+            text=True, capture_output=True, check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    for fields in csv.reader(basic.stdout.splitlines()):
+        fields = [f.strip() for f in fields]
+        if len(fields) != 2:
+            continue
+        try:
+            index = int(fields[0])
+        except ValueError:
+            continue
+        devices.append({"index": index, "name": fields[1],
+                        "total_bytes": 0, "free_bytes": 0,
+                        "unified_memory": True})
     return devices
 
 

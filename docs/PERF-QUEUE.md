@@ -15,6 +15,68 @@ Measurement discipline: `TEMP=0`; expect ±3-5% run-to-run drift anyway (the
 expert pin-placement stats file updates every run). `COLI_CUDA_PROFILE=1`
 splits group time into H2D/kernel/D2H; `PROF=1` gives phase shares.
 
+## Native NVFP4 on GB10 (2026-07-22)
+
+Branch `feature/native-nvfp4` now has end-to-end ModelOpt NVFP4 snapshots and
+native CUTLASS dispatch on Pondermatic (one NVIDIA GB10, CUDA 13.0, CUTLASS
+4.5.1, feature target `sm_121a`).  The faithful and compact trees share the
+407.69 GB immutable expert payload by hard link.  Faithful resident tensors are
+BF16; compact resident matrices are row-INT8, while vectors/routers/norms remain
+FP32.  The exact source revision is
+`506e95b94eab6688ec3409312e1a383dcf2a49d5`.
+
+Correctness and engagement gates passed:
+
+- CUTLASS scale-layout round trips, the scalar NVFP4 oracle, generic CUDA,
+  native single GEMM, grouped expert GEMM, and all production GLM expert shapes.
+- Faithful one-token full-model smoke: 1,800 native projection calls, zero
+  generic/unavailable/failure calls, 34.7 GB resident CUDA and 47.3 GB RSS with
+  an eight-slot/layer (12.7 GB) expert LRU.
+- Faithful FP8-KV smoke: 8,286 native NVFP4 calls, 936 quantized KV rows, 858
+  FP8 reader rows, and zero FP8 fallbacks.  Compact full-model smoke likewise
+  used 1,800 native calls with zero fallback and reduced the resident CUDA set
+  to 17.35 GB (29.9 GB RSS).
+- The converted source contains 21 runtime DSA indexer layers (105 tensors).
+  The converter now preserves them in normal conversion and can safely augment
+  an existing expert payload; faithful stores their matrices as BF16 and compact
+  as row-INT8.  The CUDA DSA prefill/decode validators accept both explicit
+  formats, and FP8 selected-attention has a generic BF16/INT8 correctness path.
+- A 4,101-token faithful prefill completed in 765.35 s with all 78 DSA layers
+  engaged (21 FULL, 57 SHARED, zero prefill fallback).  It quantized 639,912
+  FP8 KV rows and read 479,622 FP8 rows with zero invalid-value fallback; peak
+  RSS was 49.63 GB.  The generic BF16 selected-attention path is therefore a
+  correctness fallback, not a competitive prefill kernel: the earlier
+  2,201-token gate took 398.28 s, so full 32k model validation is deferred until
+  the resident BF16 projections have a native grouped attention path.
+- A frozen 2,201-token pipe-level-2 decode gate then engaged the resident DSA
+  chain on every layer (21 FULL, 57 SHARED) with zero chain fallback.  Prefill
+  was 393.78 s and decode was 6.79 s for two generated tokens at a 4.3% expert
+  hit rate; the run remained I/O-bound.  FP8 counters were 343,356 quantized
+  rows, 171,756 reader rows, and zero fallback.  The required BF16 resident
+  projections use the generic CUDA matmul inside the chain; row-INT4 retains
+  its measured GEMV path.
+
+Build note: CUDA 13 `-arch=native` selects plain `sm_121` on GB10, which compiles
+but cannot execute CUTLASS's architecture-conditional block-scaled MMA.  Native
+NVFP4 release builds must use `CUDA_ARCH=sm_121a NVFP4_NATIVE=1`; the plain target
+correctly failed the CUDA harness with a visible device assertion.  The planner
+also now recognizes unified-memory NVIDIA devices whose `nvidia-smi` VRAM fields
+are `N/A`, assigning no fictitious separate VRAM tier.
+
+The short cold-cache measurements are I/O results, not kernel benchmarks: at a
+27% expert hit rate, 97% of wall time was felt expert I/O while native expert
+compute was about 0.16 s.  Native engagement is therefore proven, but decode
+threshold tuning must use a frozen, warmed `.coli_usage` state.  Keep FP8 KV
+opt-in outside the validated Spark profile until the quality and 32k gates are
+complete.
+
+Rejected dispatch/build thresholds are intentionally visible.  Plain `sm_121`
+cannot launch the CUTLASS architecture-conditional MMA and is rejected in favor
+of `sm_121a`.  For prefill, native NVFP4 is engaged while resident BF16 selected
+attention remains on the generic kernel; for decode, S=1 stays on the measured
+generic/chain path rather than forcing a CUTLASS grouped launch whose setup cost
+has not yet won at one row.
+
 ## Open items, largest first
 
 ### Decode selected-attention tensor-core gather (landed, 2026-07-20)
@@ -880,3 +942,38 @@ I=2048/O=6144 (0.052 vs 0.123 ms). At S=64 the speedups are 62.01x and
 case through the generic W4A32 decoder. Repeat the build gate in the pinned
 CUDA 13.1 deployment container; CUDA 13.0 is an additional compatibility
 result, not a replacement for that pin.
+
+#### NVFP4 expert-record alignment follow-up (2026-07-22)
+
+The converted payload aligns each expert record to 4 KiB, but does not align
+every component independently: the two FP32 scalar scales make some following
+packed weights and block-scale arrays land at 8 mod 16. CUTLASS TMA requires
+16-byte input alignment. The compatibility loader therefore performs one
+coalesced direct io_uring read into an aligned staging record, then repacks the
+six persistent weight/scale arrays at 16-byte boundaries. This preserves large
+NVMe requests and correctness but adds a host memcpy and extra transient page
+traffic on every cache miss.
+
+Rebuild candidate: pad every packed weight and block-scale component to 16
+bytes while retaining a 4-KiB-aligned, direct-I/O-sized record. That permits
+io_uring to read directly into the immutable host-backed expert slab, removing
+the repack copy and its UVM/page-placement pressure. Measure staging-copy CPU,
+UVM worker CPU, achieved NVMe bandwidth, and end-to-end miss latency before
+deciding whether to regenerate the 427-GB shared payload.
+
+The first staged cap-16 measurement also held `UVM GPU1 BH` at 0% while the
+main process used roughly 1.25 CPU cores and the SSD delivered about 1.0--1.1
+GB/s. Besides the repack memcpy, native load finalization currently rescans
+every physical and logical FP8 block scale on every cache reload. Since expert
+records are immutable, cache a successful validation per tensor/record after
+the first load; retain full validation for the first publication and all
+metadata checks. Measure this separately from the aligned-format rebuild.
+
+Compatibility-path gate: faithful FP32-KV smoke, cap 16, `URING=1`,
+`DIRECT=1`, and host-backed CUDA experts completed in 452 s at 100% accuracy
+and `-0.28516 nat/token`, exactly matching the earlier faithful result. Swap did
+not grow and `UVM GPU1 BH` remained at 0% CPU; peak steady RSS was about 64 GB.
+Observed NVMe throughput rose from roughly 1.0 to 1.8 GB/s as queue depth grew
+from about 25 to 47. This is correctness evidence, not a performance win: the
+earlier pthread smoke took 181 s. Do not claim native-record io_uring faster
+until aligned direct placement and validation caching recover that regression.
