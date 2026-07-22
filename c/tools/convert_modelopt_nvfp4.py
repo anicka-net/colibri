@@ -29,6 +29,11 @@ EXPERT_RE = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|
 META_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json")
 
 
+def is_routed_expert(name: str, n_layers: int):
+    match = EXPERT_RE.match(name)
+    return match if match and int(match.group(1)) < n_layers else None
+
+
 def dependencies():
     try:
         import torch
@@ -98,7 +103,7 @@ def convert_shard(path: pathlib.Path, n_layers: int):
     with safe_open(path, framework="pt", device="cpu") as source:
         keys = set(source.keys())
         for name in source.keys():
-            match = EXPERT_RE.match(name)
+            match = is_routed_expert(name, n_layers)
             if match:
                 key = (int(match.group(1)), int(match.group(2)))
                 records.setdefault(key, []).extend(native_projection(source, name, keys))

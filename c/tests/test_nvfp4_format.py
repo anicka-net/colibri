@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / "tools"))
 import nvfp4_format as nf
-from convert_modelopt_nvfp4 import merge_expert_records
+from convert_modelopt_nvfp4 import is_routed_expert, merge_expert_records
 
 
 class Nvfp4FormatTest(unittest.TestCase):
@@ -92,6 +92,11 @@ class Nvfp4FormatTest(unittest.TestCase):
         done = merge_expert_records(pending, {key: record("up_proj") + record("down_proj")})
         self.assertEqual(len(done), 1)
         self.assertNotIn(key, pending)
+
+    def test_mtp_layer_is_not_a_routed_expert(self):
+        base = "model.layers.{}.mlp.experts.0.down_proj.weight"
+        self.assertIsNotNone(is_routed_expert(base.format(77), 78))
+        self.assertIsNone(is_routed_expert(base.format(78), 78))
 
 
 if __name__ == "__main__":
