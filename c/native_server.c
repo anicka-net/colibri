@@ -233,10 +233,10 @@ static _Thread_local char response_origin[512];
 static _Thread_local char response_path[1024];
 static _Thread_local char response_request_id[96];
 
-static void model_metadata(const char *path, unsigned long long *size,
-                           time_t *modified) {
+static void model_metadata_walk(const char *path, unsigned long long *size,
+                                time_t *modified, int follow) {
   struct stat st;
-  if (lstat(path, &st))
+  if ((follow ? stat(path, &st) : lstat(path, &st)))
     return;
   if (S_ISREG(st.st_mode)) {
     if (st.st_size > 0 && *size <= ULLONG_MAX - (unsigned long long)st.st_size)
@@ -258,9 +258,13 @@ static void model_metadata(const char *path, unsigned long long *size,
     char child[PATH_MAX];
     if (snprintf(child, sizeof(child), "%s/%s", path, entry->d_name) <
         (int)sizeof(child))
-      model_metadata(child, size, modified);
+      model_metadata_walk(child, size, modified, 0);
   }
   closedir(dir);
+}
+static void model_metadata(const char *path, unsigned long long *size,
+                           time_t *modified) {
+  model_metadata_walk(path, size, modified, 1);
 }
 
 static int http_debug_enabled(void) {
@@ -1495,12 +1499,18 @@ typedef int (*semantic_emit_fn)(void *opaque, semantic_kind kind,
                                 const tool_call *call);
 typedef struct {
   int thinking, failed, tool_count;
+  long long tool_id_time;
+  unsigned long tool_id_thread;
   jval *tools;
   buf pending, raw_debug;
   semantic_emit_fn emit;
   void *opaque;
 } semantic_stream;
 
+static void semantic_tool_id(semantic_stream *s, tool_call *call, int index) {
+  snprintf(call->id, sizeof(call->id), "call_%lld_%lu_%d", s->tool_id_time,
+           s->tool_id_thread, index);
+}
 static void semantic_consume(semantic_stream *s, size_t n) {
   if (n >= s->pending.n) {
     b_free(&s->pending);
@@ -1610,6 +1620,7 @@ static int semantic_feed(semantic_stream *s, const char *data, size_t n) {
         return 1;
     } else {
       for (int i = 0; i < count; i++) {
+        semantic_tool_id(s, &calls[i], s->tool_count);
         if (s->emit(s->opaque, SEM_TOOL, NULL, 0, &calls[i]))
           s->failed = 1;
         else
@@ -1642,6 +1653,7 @@ static int semantic_finish(semantic_stream *s) {
     b_free(&ignored);
     if (count) {
       for (int i = 0; i < count; i++) {
+        semantic_tool_id(s, &calls[i], s->tool_count);
         if (s->emit(s->opaque, SEM_TOOL, NULL, 0, &calls[i]))
           s->failed = 1;
         else
@@ -1989,6 +2001,8 @@ static void completion(server *s, int fd, http_req *hr, jval *body, int chat) {
                               .id = rid,
                               .model = s->c.model_id};
   stream_ctx.semantic.thinking = thinking;
+  stream_ctx.semantic.tool_id_time = (long long)time(NULL);
+  stream_ctx.semantic.tool_id_thread = (unsigned long)pthread_self();
   stream_ctx.semantic.tools =
       tools && tools->t == J_ARR && tools->len ? tools : NULL;
   stream_ctx.semantic.emit = openai_semantic_emit;
@@ -2298,6 +2312,8 @@ static void anthropic(server *s, int fd, jval *body) {
            (unsigned long)pthread_self());
   anthropic_stream live = {.fd = fd};
   live.semantic.thinking = thinking;
+  live.semantic.tool_id_time = (long long)time(NULL);
+  live.semantic.tool_id_thread = (unsigned long)pthread_self();
   live.semantic.tools = has_tools ? tools : NULL;
   live.semantic.emit = anthropic_semantic_emit;
   live.semantic.opaque = &live;
@@ -2595,6 +2611,8 @@ static void responses(server *s, int fd, jval *body) {
            (unsigned long)pthread_self());
   responses_stream live = {.fd = fd};
   live.semantic.thinking = thinking;
+  live.semantic.tool_id_time = (long long)time(NULL);
+  live.semantic.tool_id_thread = (unsigned long)pthread_self();
   live.semantic.tools = tools && tools->t == J_ARR && tools->len ? tools : NULL;
   live.semantic.emit = responses_semantic_emit;
   live.semantic.opaque = &live;
@@ -2642,6 +2660,9 @@ static void responses(server *s, int fd, jval *body) {
                    ? parse_tool_calls(r.data.p ? r.data.p : "", tools, &visible,
                                       calls, 16)
                    : 0;
+  if (stream)
+    for (int i = 0; i < call_n; i++)
+      semantic_tool_id(&live.semantic, &calls[i], i);
   if (!tools || tools->t != J_ARR || !tools->len)
     b_add(&visible, r.data.p ? r.data.p : "");
   buf reasoning = {0}, content = {0};
@@ -2906,6 +2927,8 @@ static void ollama_generate(server *s, int fd, jval *body, int chat) {
   int stream = jbool(body, "stream", 1);
   ollama_stream live = {.fd = fd, .chat = chat, .model = s->c.model_id};
   live.semantic.thinking = jbool(body, "think", 0);
+  live.semantic.tool_id_time = (long long)time(NULL);
+  live.semantic.tool_id_thread = (unsigned long)pthread_self();
   live.semantic.tools =
       chat && tools && tools->t == J_ARR && tools->len ? tools : NULL;
   live.semantic.emit = ollama_semantic_emit;

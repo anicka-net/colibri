@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import math
 import socket
 import tempfile
@@ -188,6 +189,21 @@ class ProtocolTest(unittest.TestCase):
         finally:
             server.scheduler.close()
             server.server_close()
+
+    def test_regular_file_model_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = os.path.join(directory, "model.bin")
+            with open(model, "wb") as handle:
+                handle.write(b"x" * 5000)
+            os.utime(model, (1700000000, 1700000000))
+            server = APIServer(("127.0.0.1", 0), FakeEngine(), "test-model",
+                               model_path=model)
+            try:
+                self.assertEqual(server.model_size, 5000)
+                self.assertEqual(server.model_modified, 1700000000)
+            finally:
+                server.scheduler.close()
+                server.server_close()
 
 
 class SchedulerTest(unittest.TestCase):

@@ -999,17 +999,27 @@ class APIServer(ThreadingHTTPServer):
         self.model_size = 0
         self.model_modified = 0
         if model_path:
-            for root, dirs, files in os.walk(model_path):
-                dirs[:] = [name for name in dirs if not name.startswith(".coli")]
-                for name in files:
-                    if name.startswith(".coli"):
-                        continue
-                    try:
-                        stat = os.stat(os.path.join(root, name))
-                    except OSError:
-                        continue
-                    self.model_size += stat.st_size
-                    self.model_modified = max(self.model_modified, int(stat.st_mtime))
+            if os.path.isfile(model_path):
+                try:
+                    model_stat = os.stat(model_path)
+                except OSError:
+                    pass
+                else:
+                    self.model_size = model_stat.st_size
+                    self.model_modified = int(model_stat.st_mtime)
+            else:
+                for root, dirs, files in os.walk(model_path):
+                    dirs[:] = [name for name in dirs if not name.startswith(".coli")]
+                    for name in files:
+                        if name.startswith(".coli"):
+                            continue
+                        try:
+                            file_stat = os.stat(os.path.join(root, name))
+                        except OSError:
+                            continue
+                        self.model_size += file_stat.st_size
+                        self.model_modified = max(
+                            self.model_modified, int(file_stat.st_mtime))
         self.model_modified = min(self.model_modified, self.created)
         self.watchdog_lock = threading.Lock()
         self.watchdog_active = 0
