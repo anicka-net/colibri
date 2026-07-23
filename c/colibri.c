@@ -4370,6 +4370,29 @@ static void kv_bind(Model *m, KVState *k){
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
+    /* Chunked prefill (COLI_PREFILL_CHUNK=N): run a long prompt through the
+     * layers in N-token slices. KV rows are position-addressed, so a slice at
+     * pos_base+done is exactly the serve path's incremental suffix prefill —
+     * every S-scaled activation buffer here and inside attention/moe shrinks
+     * from prompt-sized to chunk-sized, and a serve scheduler gains a natural
+     * yield point between slices. Leading slices only write KV; logits come
+     * from the final slice's fall-through. Skipped under an active MTP draft:
+     * mtp_absorb consumes cross-position pairs a chunk boundary would split.
+     * Verified: 1,683-token prompt at N=256 produces byte-identical greedy
+     * output to the single-shot path. */
+    static int chunk=-1;
+    if(chunk<0) chunk=getenv("COLI_PREFILL_CHUNK")?atoi(getenv("COLI_PREFILL_CHUNK")):0;
+    if(chunk>0 && S>chunk && !(m->has_mtp && g_draft>0)){
+        int done=0;
+        while(S-done>chunk){
+            float *cx=falloc((int64_t)chunk*D);
+            for(int s=0;s<chunk;s++) embed_row(m, ids[done+s], cx+(int64_t)s*D);
+            layers_forward(m,cx,chunk,pos_base+done);
+            free(cx);
+            done+=chunk;
+        }
+        ids+=done; S-=done; pos_base+=done;
+    }
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
