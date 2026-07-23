@@ -5757,7 +5757,9 @@ static void run_score(Model *m, const char *snap, const char *path){
     if(pfx_on) maxT+=2;   /* le richieste senza prefisso crescono di 2 token */
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
-    int *ids=malloc(maxT*sizeof(int));
+    int *ids=malloc(maxT*sizeof(int)), *cached_ids=malloc(maxT*sizeof(int));
+    float *cached_lo=falloc(c->vocab);
+    int cached_ctxlen=-1;
     rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
     while(getline(&ln,&cp,f)>0){
         char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
@@ -5767,20 +5769,51 @@ static void run_score(Model *m, const char *snap, const char *path){
             memmove(ids+2,ids,(size_t)T*sizeof(int));
             ids[0]=pfx[0]; ids[1]=pfx[1]; ctxlen+=2; T+=2;
         }
-        for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-        layers_forward(m,x,T,0);
         double lp=0; int greedy=1;
-        for(int pos=ctxlen-1; pos<T-1; pos++){
-            rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
-            matmul_qt(lo,row,&m->lm_head,1);
-            int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
+        int same_ctx=contlen>0 && cached_ctxlen==ctxlen &&
+                     !memcmp(cached_ids,ids,(size_t)ctxlen*sizeof(int));
+        if(same_ctx){
+            /* Multiple-choice requests are adjacent and share the complete
+             * causal prefix.  Host KV is canonical, so retain rows [0,ctxlen)
+             * and rewind only the device-shadow watermark before evaluating
+             * the next continuation.  This avoids recomputing the same long
+             * context once per answer choice without changing any logits. */
+            kv_shadow_rewind(m,m->kv,ctxlen);
+            int am;
+            lp=logprob_target(cached_lo,c->vocab,ids[ctxlen],&am);
+            if(!am) greedy=0;
+            int tail=contlen-1;
+            if(tail>0){
+                for(int s=0;s<tail;s++)
+                    embed_row(m,ids[ctxlen+s],x+(int64_t)s*D);
+                layers_forward(m,x,tail,ctxlen);
+                for(int s=0;s<tail;s++){
+                    rmsnorm(row,x+(int64_t)s*D,m->final_norm,D,c->eps);
+                    matmul_qt(lo,row,&m->lm_head,1);
+                    lp+=logprob_target(lo,c->vocab,ids[ctxlen+s+1],&am);
+                    if(!am)greedy=0;
+                }
+            }
+        }else{
+            kv_shadow_rewind(m,m->kv,0);
+            for(int s=0;s<T;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+            layers_forward(m,x,T,0);
+            for(int pos=ctxlen-1; pos<T-1; pos++){
+                rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
+                matmul_qt(lo,row,&m->lm_head,1);
+                int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
+                if(pos==ctxlen-1)memcpy(cached_lo,lo,(size_t)c->vocab*sizeof(float));
+            }
+            memcpy(cached_ids,ids,(size_t)ctxlen*sizeof(int));
+            cached_ctxlen=ctxlen;
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
             nreq, now_s()-t0, rss_gb(), expert_hit_pct(m));
     }
     if(g_prof) profile_print(m,now_s()-t0);
-    free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
+    free(ln); free(ids); free(cached_ids); free(cached_lo);
+    free(x); free(lo); free(row); fclose(f);
 }
 
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
