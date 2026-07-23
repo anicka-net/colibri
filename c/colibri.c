@@ -5717,6 +5717,8 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
 }
 
 /* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */
+static void profile_print(Model *m, double elapsed);
+
 /* modalita' SCORING per i benchmark (stile lm-eval, log-likelihood):
  * input: file con righe "<ctxlen> <contlen> <id0> .. <id_{T-1}>"  (T=ctxlen+contlen)
  * output: riga "<logprob_continuazione> <contlen> <greedy 0/1>" per richiesta.
@@ -5772,6 +5774,7 @@ static void run_score(Model *m, const char *snap, const char *path){
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
             nreq, now_s()-t0, rss_gb(), expert_hit_pct(m));
     }
+    if(g_prof) profile_print(m,now_s()-t0);
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
 }
 
