@@ -8069,6 +8069,19 @@ static double cuda_expert_ram_bytes(Model *m){
 #endif
 }
 
+static double cuda_dense_ram_bytes(void){
+#ifdef COLI_CUDA
+    if(!g_cuda_enabled||!g_cuda_dense)return 0;
+    double total=0;
+    for(int i=0;i<g_cuda_ndev;i++)
+        total+=coli_vram_ram_charge((double)g_cuda_dense_projected[i],
+            coli_cuda_device_is_integrated(g_cuda_devices[i]));
+    return total;
+#else
+    return 0;
+#endif
+}
+
 /* PIPE2 keeps a second Ic copy on the layer's CUDA device for FULL DSA layers.
  * On coherent unified-memory hosts it consumes the same physical RAM as host Ic. */
 static double cuda_ic_shadow_bytes(Model *m, int max_ctx){
@@ -8143,6 +8156,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx) + cuda_ic_shadow_bytes(m,max_ctx);
     double cuda_expert_b = cuda_expert_ram_bytes(m);
+    double cuda_dense_b = cuda_dense_ram_bytes();
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
@@ -8153,7 +8167,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * and slowed decode (1.03->0.83 tok/s). The reserve is a legitimate safety margin
      * for OS + CUDA + file metadata, not just buffered pread throughput. Keep it. */
     double pc_b  = 2.5e9;
-    double slack = 1.2e9 + pc_b + ws_b + kv_b + cuda_expert_b + kvb_b;
+    double slack = 1.2e9 + pc_b + ws_b + kv_b + cuda_expert_b + cuda_dense_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
     int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
     int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
@@ -8181,10 +8195,10 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
         }
     }
     if(capmax < m->ecap){
-        fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, CUDA experts %.1f, kvb %.1f), "
+        fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, CUDA dense %.1f, CUDA experts %.1f, kvb %.1f), "
             "experts %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
             ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
-            kv_slot_count(),max_ctx,kv_b/1e9,cuda_expert_b/1e9,kvb_b/1e9,
+            kv_slot_count(),max_ctx,kv_b/1e9,cuda_dense_b/1e9,cuda_expert_b/1e9,kvb_b/1e9,
             eb/1e6, nsp, m->ecap, capmax,
             (m->resident_bytes + (double)capmax*nsp*eb + slack)/1e9);
         m->ecap=capmax;
@@ -8586,7 +8600,14 @@ int main(int argc, char **argv){
         g_cuda_enabled=coli_cuda_init(g_cuda_devices,g_cuda_ndev);
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] requested backend is unavailable\n"); return 2; }
     }
-    g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    ColiSnapshotManifest startup_manifest; char startup_manifest_error[256];
+    int startup_manifest_rc=coli_manifest_load(snap,&startup_manifest,
+        startup_manifest_error,sizeof(startup_manifest_error));
+    g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):
+        (startup_manifest_rc>0&&startup_manifest.resident_format==COLI_TENSOR_BF16);
+    if(g_cuda_enabled&&g_cuda_dense&&!getenv("CUDA_DENSE")&&startup_manifest_rc>0)
+        fprintf(stderr,"[CUDA] faithful BF16 snapshot: resident CUDA path enabled "
+            "(CUDA_DENSE=0 restores the scalar CPU fallback)\n");
     g_cuda_host_experts=getenv("COLI_CUDA_HOST_EXPERTS")?atoi(getenv("COLI_CUDA_HOST_EXPERTS")):0;
     g_cuda_pipe=getenv("COLI_CUDA_PIPE")?atoi(getenv("COLI_CUDA_PIPE")):0;
     g_cuda_prefill=getenv("COLI_CUDA_PREFILL")?atoi(getenv("COLI_CUDA_PREFILL")):0;
