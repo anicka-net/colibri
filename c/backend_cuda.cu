@@ -483,7 +483,13 @@ __global__ static void grouped_hidden_w4_dual(float *gate,float *up,const float 
         int i=b*2;ga+=xs[i]*g0;ua+=xs[i]*u0;if(i+1<D){ga+=xs[i+1]*g1;ua+=xs[i+1]*u1;}}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
-    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;gate[z]=gp[0]*d.gs[o];up[z]=upv[0]*d.us[o];}
+    /* Fused epilogue: silu(gate)*up lands here instead of a third kernel —
+     * the exact silu_mul expression on the exact same inputs, so bit-identical,
+     * and the up[] round-trip through global memory disappears. up stays a
+     * param so the launch sites keep their signature. */
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=gp[0]*d.gs[o],u=upv[0]*d.us[o];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
 }
 
 __global__ static void grouped_down_w4(float *y,const float *x,const GroupDesc *desc,int D,int I){
@@ -517,7 +523,11 @@ __global__ static void grouped_hidden_g4_dual(float *gate,float *up,const float 
         if(i+1<D){ga+=xs[i+1]*g1*gv;ua+=xs[i+1]*u1*uv;}}
     __shared__ float gp[256],upv[256];gp[threadIdx.x]=ga;upv[threadIdx.x]=ua;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n){gp[threadIdx.x]+=gp[threadIdx.x+n];upv[threadIdx.x]+=upv[threadIdx.x+n];}__syncthreads();}
-    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;gate[z]=gp[0];up[z]=upv[0];}
+    /* same epilogue fusion as the w4 dual above (per-group scales already
+     * applied inside the accumulation, so silu runs on the raw sums) */
+    if(!threadIdx.x){size_t z=(size_t)(d.offset+s)*I+o;
+        float g=gp[0],u=upv[0];
+        gate[z]=(g/(1.0f+expf(-g)))*u;(void)up;}
 }
 __global__ static void grouped_down_g4(float *y,const float *x,const GroupDesc *desc,int D,int I){
     int o=blockIdx.x,s=blockIdx.y,c=blockIdx.z;GroupDesc d=desc[c];if(s>=d.rows)return;
@@ -1485,18 +1495,17 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
         if(dual)grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        else{
+        else{   /* non-dual path has no fused epilogue: silu stays a kernel here */
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->x,dev,I,D,0);
             grouped_hidden_w4<<<hg,256,0,ctx->stream>>>(ctx->up,ctx->x,dev,I,D,1);
+            silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         }
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_q4&&any_g4){
         /* grouped-int4 (fmt=4) present: per-group scales (#334). fmt=2 members
-         * ride along as the ng=1 special case. */
+         * ride along as the ng=1 special case. silu fused in the dual epilogue. */
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         grouped_hidden_g4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        silu_mul<<<(unsigned)(((size_t)total*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)total*I);
         grouped_down_g4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else{
         /* generic path decodes fmt 0/1/2/3 only — a fmt=4 group that slipped the
@@ -2952,8 +2961,7 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
     bcast_row<<<64,256,0,ctx->stream>>>(ctx->x,ctx->x,count,D);   /* row 0 -> rows 1..count-1 (in-place safe: row 0 rewritten with itself) */
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     dim3 hg((unsigned)I,1,(unsigned)count),og((unsigned)D,1,(unsigned)count);
-    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-    silu_mul<<<(unsigned)(((size_t)count*I+255)/256),256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)count*I);
+    grouped_hidden_w4_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);  /* silu fused in epilogue */
     grouped_down_w4<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     weighted_sum_rows<<<48,256,0,ctx->stream>>>(partial_local,ctx->y,w_dev,count,D);
     if(!cuda_ok(cudaMemcpyPeerAsync(partial_slot_dev,home_device,partial_local,device,
