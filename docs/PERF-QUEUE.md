@@ -88,6 +88,19 @@ NVFP4 host wrapping is now independent of that gate; under the same explicit
 minutes and advanced steadily through all 78 layers.  The broader frozen
 quality rungs remain the release gate.
 
+Post-quality resident-format work should start by tuning the two implemented
+profiles rather than adding another conversion variable: faithful
+NVFP4/BF16 and compact NVFP4/row-INT8 still have substantial attention,
+resident-projection, dispatch, UVM, and expert-I/O headroom.  Once their
+accuracy baselines are frozen, evaluate a third compact resident profile using
+properly scaled E4M3 weights (prefer block scaling over an unscaled BF16-to-FP8
+cast).  FP8 has the same one-byte weight storage and may unlock faster native
+GB10 tensor-core projections, while row-INT8 is the current conservative
+quality/compatibility choice and can have finer effective precision after row
+scaling.  Compare BF16, row-INT8, and block-scaled E4M3 with the identical
+NVFP4 routed-expert payload and frozen `.coli_usage`; do not make FP8-resident
+support part of the current merge gate.
+
 Rejected dispatch/build thresholds are intentionally visible.  Plain `sm_121`
 cannot launch the CUTLASS architecture-conditional MMA and is rejected in favor
 of `sm_121a`.  For prefill, native NVFP4 is engaged while resident BF16 selected
