@@ -6558,9 +6558,15 @@ int main(int argc, char **argv){
          * acceptance can still reach 30-50% even with the cold-expert mismatch.
          * See #292 for the diagnostic sweep that identified this. */
         int cuda_mtp = getenv("COLI_CUDA_MTP") ? atoi(getenv("COLI_CUDA_MTP")) : 0;
-        g_draft = (m.has_mtp && (!g_cuda_enabled || cuda_mtp)) ? 3 : 0;
+        /* Auto depth = 1, not 3. A GLM-5.2 744B sweep (DRAFT=0/1/2/3, streaming and
+         * fully-resident) showed single-token speculation is the only depth that pays:
+         * acceptance ~85% at depth 1 vs ~44-62% at 2-3, and every extra draft token
+         * both costs verify compute and (when streaming) faults experts that evict the
+         * LRU working set. Depth 1 was the fastest MTP setting in every measured
+         * configuration; 2-3 never beat it anywhere. DRAFT=n still forces any depth. */
+        g_draft = (m.has_mtp && (!g_cuda_enabled || cuda_mtp)) ? 1 : 0;
 #else
-        g_draft = m.has_mtp ? 3 : 0;
+        g_draft = m.has_mtp ? 1 : 0;
 #endif
     }
     if(getenv("DSA_TOPK")) m.c.index_topk=atoi(getenv("DSA_TOPK"));   /* override per test */
