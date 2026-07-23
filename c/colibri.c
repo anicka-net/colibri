@@ -461,6 +461,25 @@ static float *falloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld is out of range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
+/* Come falloc, per i buffer non-float del percorso caldo. moe() e' la funzione piu'
+ * chiamata del motore e girare al soffitto di RAM e' la premessa del progetto: e'
+ * esattamente la condizione in cui malloc torna NULL. Un deref di NULL li' e' un
+ * segfault a meta' generazione senza diagnostica, indistinguibile da un bug vero
+ * quando l'utente lo riporta. exit(1) con messaggio e' la stessa convenzione di
+ * falloc e dello scratch xexp. */
+static void *xalloc(size_t n, const char *what){
+    if(n==0) n=1;
+    void *p=malloc(n);
+    if(!p){ fprintf(stderr,"OOM: %s (%zu byte)\n",what,n); exit(1); }
+    return p;
+}
+static void *xzalloc(size_t n, const char *what){
+    if(n==0) n=1;
+    void *p=calloc(n,1);
+    if(!p){ fprintf(stderr,"OOM: %s (%zu byte)\n",what,n); exit(1); }
+    return p;
+}
+
 
 
 /* Fused gate+up for grouped int4 (fmt=4): computes both yg[S,O] and yu[S,O] from
@@ -2750,8 +2769,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     /* ---- FASE A: routing di tutte le S posizioni ---- */
     double route_t0=g_prof?now_s():0;
-    int *idxs=malloc((size_t)S*K*sizeof(int)); float *ws=malloc((size_t)S*K*sizeof(float));
-    int *keff=malloc(S*sizeof(int));
+    int *idxs=xalloc((size_t)S*K*sizeof(int),"moe idxs"); float *ws=xalloc((size_t)S*K*sizeof(float),"moe ws");
+    int *keff=xalloc((size_t)S*sizeof(int),"moe keff");
     /* router in UN matmul batch: stessa matematica, via le S chiamate S=1 */
     float *logits_all=falloc((int64_t)S*E);
     int pre_routed=0; (void)pre_routed;
@@ -2937,7 +2956,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
-    int *uniq=malloc((size_t)E*sizeof(int)); int nu=0;
+    int *uniq=xalloc((size_t)E*sizeof(int),"moe uniq"); int nu=0;
     unsigned char seen[E]; memset(seen,0,(size_t)E);
     for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){
         int e=idxs[(int64_t)s*K+kk];
@@ -2962,7 +2981,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int j=0;j<nu;j++) if(uniq[j]==e){ wsum[j]+=ws[(int64_t)s*K+kk]; break; }
         }
         /* residency pre-scan: which experts are already in pin or ecache (hits)? */
-        unsigned char *is_hit=calloc(nu,1); int nhits=0;
+        unsigned char *is_hit=xzalloc((size_t)nu,"moe is_hit"); int nhits=0;
         for(int j=0;j<nu;j++){ int eid=uniq[j];
             int found=0;
             ESlot *P=m->pin[layer];
@@ -2975,7 +2994,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         int miss_budget = g_expert_budget - nhits; if(miss_budget<0) miss_budget=0;
         /* mark which unique experts to keep (1) or drop (0): keep all hits, fill rest
          * with top-weight misses up to miss_budget */
-        unsigned char *keep=calloc(nu,1); int nkeep=0;
+        unsigned char *keep=xzalloc((size_t)nu,"moe keep"); int nkeep=0;
         for(int j=0;j<nu;j++) if(is_hit[j]){ keep[j]=1; nkeep++; }
         for(int rank=0;rank<miss_budget;rank++){
             int best=-1; float bv=-1e30f;
@@ -3013,7 +3032,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
                        * experts of the layer share it (the placement rule in quant.h) */
-    int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+    int *rows=xalloc((size_t)S*sizeof(int),"moe rows"); float *rw=xalloc((size_t)S*sizeof(float),"moe rw");
 #ifdef COLI_CUDA
     /* PIPE Inc.1b: il batch-union del prefill passa dai gruppi GPU — prima di
      * questo, 9343 expert in VRAM restavano INUTILIZZATI durante il prefill
@@ -3021,8 +3040,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int group_enabled = S<=64 || (g_cuda_pipe && S<=4096);
     float *group_x=group_enabled?falloc((int64_t)S*K*D):NULL;
     float *group_y=group_enabled?falloc((int64_t)S*K*D):NULL;
-    int *group_row=group_enabled?malloc((size_t)64*S*sizeof(int)):NULL;
-    float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
+    int *group_row=group_enabled?xalloc((size_t)64*S*sizeof(int),"moe group_row"):NULL;
+    float *group_weight=group_enabled?xalloc((size_t)64*S*sizeof(float),"moe group_weight"):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
     for(int base=0;base<nu;base+=64){
@@ -3083,7 +3102,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_metal_enabled){
             for(int q=0;q<nmiss;q++) is_miss[missk[q]]=1;
             mxg=falloc((int64_t)(nb+1)*S*D);
-            mrows=malloc((size_t)(nb+1)*S*sizeof(int)); mrw=malloc((size_t)(nb+1)*S*sizeof(float));
+            mrows=xalloc((size_t)(nb+1)*S*sizeof(int),"moe mrows"); mrw=xalloc((size_t)(nb+1)*S*sizeof(float),"moe mrw");
             MB_BUILD(0, base==0 && !g_pre_sh);
             if(nbb>0){
                 double t0=now_s();
