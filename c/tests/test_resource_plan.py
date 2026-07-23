@@ -311,6 +311,16 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertNotIn("COLI_GPU", disabled)
         self.assertNotIn("CUDA_EXPERT_GB", disabled)
 
+    def test_unified_gpu_enables_cuda_without_vram_tier(self):
+        plan = build_plan(self.model, available_memory=16 * GB, available_disk=1,
+                          gpus=[{"index": 0, "name": "NVIDIA GB10",
+                                 "total_bytes": 0, "free_bytes": 0,
+                                 "unified_memory": True}])
+        env = environment_for_plan(plan)
+        self.assertEqual(env["COLI_CUDA"], "1")
+        self.assertEqual(env["COLI_GPU"], "0")
+        self.assertEqual(env["CUDA_EXPERT_GB"], "0.000")
+
     def test_rejects_unknown_policy_and_marks_experimental_policy(self):
         with self.assertRaisesRegex(ValueError, "unknown policy"):
             build_plan(self.model, available_memory=16 * GB, available_disk=1,

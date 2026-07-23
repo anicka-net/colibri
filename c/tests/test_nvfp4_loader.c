@@ -70,6 +70,15 @@ int main(void){
         float out[3]={0};embed_row(&em,1,out);
         assert(out[0]==3.0f&&out[1]==0.0f&&out[2]==-1.0f);
     }
+    {
+        uint16_t rows[6]={0x3f80,0x4000,0x4040,0x4080,0x40a0,0x40c0};
+        QT w={0};w.fmt=COLI_TENSOR_BF16;w.O=2;w.I=3;w.bf16=rows;
+        float acc[3]={0},x[3]={1,2,3},out[2]={0};
+        qt_addrow(&w,1,2,acc);
+        assert(acc[0]==8.0f&&acc[1]==10.0f&&acc[2]==12.0f);
+        qt_matvec_rows(&w,0,2,x,out);
+        assert(out[0]==14.0f&&out[1]==32.0f);
+    }
     char path[]="test_nvfp4_loader_XXXXXX";int fd=mkstemp(path);assert(fd>=0);
     FILE *file=fdopen(fd,"w+b");assert(file);
     Model m={0};m.c.hidden=5;m.c.moe_inter=7;m.c.n_layers=2;m.c.n_experts=4;

@@ -115,6 +115,20 @@ tensor-core **0.378–0.386 s/request** versus scalar **0.444–0.451 s/request*
 expert-tier hits. A padded S=1 tensor-core output projection measured slower
 (~176 ms phase), so only the absorption decomposition uses WMMA.
 
+The first default-on version still launched scalar absorption after a
+successful TC gather and then cleared that launch's error.  The corrected path
+uses the gathered context directly, retains the cached GEMV, and checks scalar
+fallback launches normally.  Treat the pre-fix H100 number above as
+provisional until it is repeated on the corrected control flow.
+
+Corrected GB10 measurement used a frozen usage file and a 2,701-token prompt.
+TC-off/TC-on generated identical first-32-token continuations; over 128 greedy
+tokens the trajectories diverged after token 35.  TC gather engaged 9,906 rows
+with zero fallback, cut attention 48.8 -> 37.4 s and decode p50 846.1 -> 791.5
+ms, but wall time improved only 376.0 -> 371.5 s (**1.2%**).  That misses the
+5% production gate, so the GB10 service keeps
+`COLI_DSA_DECODE_TCGATHER=0`.
+
 Implementation gotcha: timestamp-preserving deployment could leave a newer
 remote `backend_cuda.o` and silently reuse stale code. CUDA validation builds
 must use `make -B` (or remove the object) after source synchronization.
@@ -153,6 +167,81 @@ Longer-term, genuinely concurrent rows still need a resident ragged chain:
    The resident-ragged path lands only if it beats isolated scheduling without
    changing DSA selections or cross-session state.
 
+### Dual-Spark RDMA transport (measured 2026-07-21)
+
+Both direct CX7 cables recovered after the physical power cycle and negotiate
+200 Gb/s.  One stream sustains 105.3/105.0 Gb/s RDMA write on the two ports;
+the addressed port sustains 80.6 Gb/s RDMA read.  Concurrent writes deliver
+92.55 + 91.59 = **184.14 Gb/s (23.02 GB/s)**; concurrent reads deliver
+74.72 + 74.72 = **149.44 Gb/s (18.68 GB/s)**.  Both aggregates reproduce in
+either host direction.  Two-byte RDMA write latency is 1.47 us typical,
+1.55 us p99, 1.90 us p99.9.  The current netdev MTU exposes RDMA MTU 1024, so
+jumbo-frame configuration may raise the ceiling further.
+
+Recipe: `rocep1s0f1` uses RoCEv2 GID 3 and the 169.254/16 link-local addresses.
+`roceP2p1s0f1` has no IP address and uses RoCEv1 GID 0; perftest's TCP control
+channel can use the management address while RDMA data stays on that device.
+The direct transport is fast enough to justify a remote expert-cache/compute
+prototype; the remaining question is scheduling and transfer granularity.
+
+### Remote complete-layer tier (measured 2026-07-21) — DECODE WIN, LONG E2E MISSES
+
+The smallest exact integration assigns six complete sparse layers (4–9) to
+deepthought. Those layers had the weakest historical coverage in
+pondermatic's 30 GB hot tier (5.6–11.7%). A 1,536-expert compact pack is
+29.05 GB. Pondermatic sends one normalized activation row plus the eight
+expert ids per layer; deepthought returns eight individual expert outputs,
+and pondermatic applies the existing router weights in the existing union
+order. The worker uses registered host buffers and the existing grouped CUDA
+ABI; no GPUDirect or general scheduler.
+
+The first forced-replay benchmark appeared to clear the gate, but the
+subsequent unforced control exposed a pre-existing local correctness bug.
+CUDA expert wrappers in shared `ws[]` slots were invalidated only when the
+expert id changed. The same id in a different layer could therefore retain
+weight and scale pointers into the previous layer's slab, making ordinary
+local output cache-history-dependent. Remote execution changed that history
+and exposed the fault.
+
+The fix resets every non-device CUDA wrapper on reload in both the pread and
+io_uring loaders. REPIN keeps true VRAM allocations and refreshes them with
+the existing in-place update API. An aggressive `REPIN=1` smoke completed 51
+VRAM swaps without failure and reproduced the normal 16-token trajectory.
+
+Four independent unforced 128-token runs used the same 43-token prompt,
+frozen `.coli_usage`, PIPE2, and TC gather off:
+
+| Order | Local wall | Remote wall | Gain | Local p50 | Remote p50 |
+|---|---:|---:|---:|---:|---:|
+| off1 → on1 | 121.12 s | 115.58 s | **4.6%** | 684.2 ms | 616.8 ms |
+| off2 → on2 | 123.32 s | 114.20 s | **7.4%** | 679.6 ms | 617.1 ms |
+
+All four greedy trajectories were token-identical. Mean wall gain was
+**6.0%**. Each remote run served 762 layer calls / 6,096 expert rows at about
+726 us end to end per call, with zero fallback.
+
+The production-shaped 2,701-token prompt changes the verdict. Two
+order-reversed forced-replay pairs measured:
+
+| Order | Local wall | Remote wall | Gain | Local p50 | Remote p50 |
+|---|---:|---:|---:|---:|---:|
+| off1 → on1 | 382.19 s | 374.89 s | **1.9%** | 884.7 ms | 811.8 ms |
+| on2 → off2 | 383.42 s | 372.32 s | **2.9%** | 882.3 ms | 802.2 ms |
+
+Remote decode p50 improved by 8–9%, but the local 2,701-token prefill
+dominates total wall time because the fixed worker protocol handles only
+`S<=4`. Mean end-to-end gain was **2.4%**, below the 5% production gate.
+Production therefore remains on the local known-good build. The remote tier
+is a validated decode optimization, but deployment requires either remote
+prefill support or a workload gate that is explicitly decode-heavy.
+
+Control: doubling pondermatic's local expert tier from 30 to 60 GB improved
+p50 876.7→770.4 ms and cut read wait 113.7→95.5 s, but orchestration rose
+6.2→54.2 s and total decode regressed 360.2→374.0 s. The win depends on
+independent remote capacity, not merely loading more experts into the first
+Spark. Missing or stalled workers disable the remote path within the bounded
+timeout and fall back locally; a no-worker smoke replayed 2/2 exact tokens.
+
 ### 1. DSA sparse attention + IndexShare (long context) — STRICT WIN, growing with T (+20% @6.7k, +63% @13.4k); open: IndexShare, decode-attention attribution (inc.6 ruled out selection cost)
 The snapshot has **no indexer weights** (`out-idx-*` never extracted), so every
 layer runs full attention.  Native GLM-5.2 attends over the indexer's top-2048
@@ -178,10 +267,10 @@ pays attention twice.
   index_topk_freq refresh — and lifting the pipe2 gate past index_topk.
   (Original plan, for reference: `--indexer` re-downloads shards
   to keep a few GB (resumable per shard).  Run it on the multi-GB/s host, not
-  the 1 Gbps ones; the few-GB output then crosses the ~100 Mbps host-to-host
-  link in minutes (never move the raw shards between machines).  The fast host
-  has limited disk — fine for extraction (one ~5 GB shard in flight, deleted
-  after conversion; output a few GB); anything bulk belongs on the RAID host.
+  the 1 Gbps ones.  The management LAN remains slow, while the direct CX7 path
+  now sustains 23.0 GB/s aggregate.  The fast host has limited disk — fine for
+  extraction (one ~5 GB shard in flight, deleted after conversion; output a
+  few GB); anything bulk belongs on the RAID host.
 - Integration: the CPU DSA paths exist, but the fused pipe2 chain has no index
   support and the pipe gate disables itself past `index_topk` when `has_dsa`.
 - IndexShare for drafts comes nearly free once the above lands.
@@ -702,6 +791,13 @@ prefill), 64 greedy output tokens: **p50 485.5 -> 221.5 ms/forward**, or about
 DSA fallbacks; the old outer projection/RoPE bucket fell from 171.4 s/668 tok
 to exactly 0.  The remaining attention cost is resident DSA, especially
 selected absorb+o_proj (7.08 s/64 tok, ~111 ms/token).
+
+The matched GB10 result also clears the deployment gate.  With a frozen usage
+file, a 2,701-token prompt, and a fixed 128-token continuation, candidate
+PIPE0 matched the preceding build (453.5 vs 451.5/451.7 s decode), while PIPE2
+repeated at 364.0 and 360.2 s: about **20% faster decode** and **19% faster
+wall-clock**.  All controlled runs executed the same 128-token continuation;
+PIPE2 recorded 384/384 dense engagements and zero fallback.
 
 #### Increment 8 — device-side top-k for prefill selection (landed, default ON)
 `COLI_DSA_DEVTOPK=1` (default; `=0` restores the host top-k) moves the

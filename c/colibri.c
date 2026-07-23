@@ -73,6 +73,9 @@ static inline int omp_get_thread_num(void){ return 0; }
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
+#ifdef COLI_REMOTE
+#include "remote_expert.h"
+#endif
 #ifdef COLI_METAL
 #include "backend_metal.h"
 #include <omp.h>
@@ -405,6 +408,9 @@ static void cuda_stats_print(void){
     {uint64_t q=0,r=0,f=0;coli_cuda_kv_fp8_stats(&q,&r,&f);
       if(q||r||f)fprintf(stderr,"[CUDA] FP8 KV: quantized rows %llu | reader rows %llu | fallbacks %llu\n",
         (unsigned long long)q,(unsigned long long)r,(unsigned long long)f);}
+#ifdef COLI_REMOTE
+    coli_remote_expert_stats(stderr);
+#endif
 }
 static int parse_cuda_devices(const char *list, int *out){
     if(!list||!*list) return 0;
@@ -863,8 +869,8 @@ static int g_xcrc=0;          /* COLI_DBG_XCRC=1: hash FNV del residuo per layer
 static void xcrc_emit(int layer,const float *src,int S,int D){
     uint64_t h=1469598103934665603ULL;
     const unsigned char *b=(const unsigned char*)src;
-    for(size_t z=0;z<(size_t)S*D*4;z+=64){ h^=b[z]; h*=1099511628211ULL; }
-    double t2=0; for(int s=S-4;s<S;s++){ double n2=0;
+    for(size_t z=0;z<(size_t)S*D*4;z++){ h^=b[z]; h*=1099511628211ULL; }
+    double t2=0; for(int s=S>4?S-4:0;s<S;s++){ double n2=0;
         for(int j=0;j<D;j+=8){ float v=src[(int64_t)s*D+j]; n2+=(double)v*v; }
         t2+=n2; }
     fprintf(stderr,"[XCRC] L%02d %016llx tail4 %.6e\n",layer,(unsigned long long)h,t2);
@@ -1961,12 +1967,17 @@ typedef struct {
 } UringBatch;
 static UringBatch g_ub_pipe, g_ub_pilot;
 
+static void uring_load_cleanup(UringLoad *l){
+    free(l->iobuf); l->iobuf=NULL; l->iobuf_cap=0;
+}
 static int uring_batch_init(UringBatch *b){
     if(b->started) return 0;
     if(coli_uring_init(&b->ring,URING_REQ_MAX)) return -1;
     b->started=1; return 0;
 }
 static void uring_batch_reset(UringBatch *b){
+    for(int i=0;i<b->nload;i++) if(b->load[i].done)
+        uring_load_cleanup(&b->load[i]);
     b->nload=0; b->nreq=0;
 }
 static int uring_load_error(UringLoad *l,int err,const char *what){
@@ -2196,7 +2207,10 @@ static int uring_wait_load(UringBatch *b,int li){
 static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     UringLoad *l=&b->load[li]; ESlot *s=l->s;
     if(l->finalized) return 0;
-    if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
+    if(uring_wait_load(b,li)<0){
+        if(l->done) uring_load_cleanup(l);
+        errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1;
+    }
     if(l->native){
         Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden;
         QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
@@ -2216,10 +2230,14 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             }
             uint8_t *bs=s->slab+l->scale_pos[k]; int64_t sb=l->tq[k]->nbytes;
             float ts=s->fslab[k*2],is=s->fslab[k*2+1];
-            if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
+            if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0){
+                uring_load_cleanup(l);
                 return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
-            if(!scales_valid&&!native_nvfp4_scales_valid(bs,sb,OO[k],II[k]))
+            }
+            if(!scales_valid&&!native_nvfp4_scales_valid(bs,sb,OO[k],II[k])){
+                uring_load_cleanup(l);
                 return uring_load_error(l,EINVAL,"invalid native NVFP4 block scale");
+            }
             qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
             qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;qt[k]->O=OO[k];qt[k]->I=II[k];
             qt[k]->gs=COLI_NVFP4_GROUP_SIZE;qt[k]->q4=s->slab+l->pos[k];
@@ -2229,7 +2247,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         }
         if(!scales_valid&&l->m->native_valid)
             atomic_store_explicit(&l->m->native_valid[valid_idx],1,memory_order_release);
-        free(l->iobuf);l->iobuf=NULL;l->iobuf_cap=0;
+        uring_load_cleanup(l);
         if(g_drop) for(int k=0;k<3;k++){
             posix_fadvise(l->tw[k]->fd,l->tw[k]->off,l->tw[k]->nbytes,POSIX_FADV_DONTNEED);
             posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
@@ -3947,7 +3965,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     float *group_weight=group_enabled?malloc((size_t)64*S*sizeof(float)):NULL;
 #endif
     int shared_on_gpu=0; (void)shared_on_gpu;   /* set by the Metal path when Phase E was fused */
-    for(int base=0;base<nu;base+=64){
+    int routed_remote=0;
+#if defined(COLI_REMOTE) && defined(COLI_CUDA)
+    if(g_cuda_pipe>=2 && coli_remote_expert_enabled(layer,S)){
+        double tr=now_s();
+        routed_remote=coli_remote_expert_run(layer,x,S,uniq,nu,idxs,ws,keff,K,D,out);
+        if(routed_remote){ double dt=now_s()-tr; m->t_emm+=dt; if(g_prof)m->t_egpu+=dt; }
+    }
+#endif
+    if(!routed_remote) for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
@@ -5142,7 +5168,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                     int pok=pipe_layer_cuda(m,l,i,x_dev,S,pos_base,nrm,tmp);
                     if(!l->sparse){ if(pok)g_pipe_dense_ok++; else g_pipe_dense_fb++; }
                     if(pok){
-                        if(g_xcrc && S>=8){   /* probe anche sotto PIPE2 (il tail del loop e' saltato) */
+                        if(g_xcrc){           /* probe anche sotto PIPE2 (il tail del loop e' saltato) */
                             static float *cb=NULL; static size_t cc=0;
                             if(cc<xb){ free(cb); cb=malloc(xb); cc=xb; }
                             if(cb && coli_cuda_pipe_download(dev,x_dev,cb,xb)) xcrc_emit(i,cb,S,D);
@@ -5193,7 +5219,7 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
          * PIPE2 emette prima del suo continue).  Il download nel ramo PIPE2
          * forza il drain dello stream: se il jitter SPARISCE col probe attivo,
          * la race sta nell'overlap asincrono al confine di layer. */
-        if(g_xcrc && S>=8
+        if(g_xcrc
 #ifdef COLI_CUDA
            && x_dev_on<0
 #endif
@@ -5618,6 +5644,10 @@ static int grammar_draft(GrDraft *g, int *draft, int cap){
  * killing the engine; :more can continue the interrupted answer. Armed only
  * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
 static volatile sig_atomic_t g_intr=0;
+/* Benchmark-only replay control: run the normal forward/routing path while
+ * keeping both sides of a performance A/B on the same continuation. */
+static const int *g_force_ref=NULL;
+static int g_force_ref_n=0;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
 static void intr_install(void){
@@ -5647,7 +5677,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     enum { GUARD_PAUSE_TOKENS = 256 };
     uint64_t gd_prop0=m->mtp_prop, gd_acc0=m->mtp_acc; int gd_pause=0;
     while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
-        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
+        int next=(g_force_ref && emitted<g_force_ref_n)
+            ? g_force_ref[emitted] : pick_tok(logit,V,carry_ban);
+        carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
@@ -8924,8 +8956,13 @@ int main(int argc, char **argv){
         return 0;
     }
     int *out=malloc((np+n_new)*sizeof(int));
+    if(getenv("FORCE_REF") && atoi(getenv("FORCE_REF"))){
+        if(g_temp>0){ fprintf(stderr,"FORCE_REF requires TEMP=0\n"); return 2; }
+        g_force_ref=full+np; g_force_ref_n=n_new;
+    }
     ProfBase pb; prof_base(&m,&pb);
     double t=now_s(); generate(&m,prompt,np,n_new,out); double dt=now_s()-t;
+    g_force_ref=NULL; g_force_ref_n=0;
     int match=0;
     printf("\nReference (oracle): "); for(int i=np;i<nfull;i++) printf("%d ", full[i]);
     printf("\nGLM C engine      : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }

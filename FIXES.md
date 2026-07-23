@@ -537,3 +537,109 @@ Production recovery after the isolated GB10 probes:
    charging, pilot/repin exclusion, transport-header removal plus authored
    system preservation, malformed/OOM token checkpoints, and the full suite.
    Their outputs appear in items 1-5 and Full validation.
+
+## Round 6 - TC gather, streaming IDs, and Ollama metadata
+
+### 1. TC gather result overwritten by scalar absorption
+
+**FIXED** - Successful decode TC gather now bypasses scalar absorption and
+projects the gathered context with the cached GEMV.  The scalar fallback checks
+its own launch status; the H100 WMMA stage-boundary clear remains only on the
+successful TC branch.
+
+The corrected GB10 path generated the same first 32 tokens with TC disabled and
+enabled, while exercising every eligible TC row:
+
+```text
+fdd8ca4062502590f49ab0095b41735e143ef98f095ffb8987d9264b16e1d8bc  /tmp/tc-off.tokens
+fdd8ca4062502590f49ab0095b41735e143ef98f095ffb8987d9264b16e1d8bc  /tmp/tc-on.tokens
+[PROF] DSA decode TC gather: 0 row | 0 fallback
+[PROF] resident dense layers: 96 engaged | 0 fallback
+[PROF] DSA decode TC gather: 2418 row | 0 fallback
+[PROF] resident dense layers: 96 engaged | 0 fallback
+```
+
+The 128-token performance control engaged 9,906 TC rows with no fallback and
+reduced attention and decode p50, but total wall time remained below the
+production gate:
+
+```text
+tc-off: attention 48.806s | p50 846.1 ms | wall_seconds=376.03
+tc-on:  attention 37.372s | p50 791.5 ms | wall_seconds=371.50
+[PROF] DSA decode TC gather: 9906 row | 0 fallback
+[PROF] resident dense layers: 384 engaged | 0 fallback
+```
+
+The broader CUDA test reached the new cached-GEMV and dense-resident checks,
+then hit the repository's known later GB10 baseline failure:
+
+```text
+[CUDA] device 0: NVIDIA GB10, 130.7 GB VRAM, sm_121
+cached q4 GEMV parity: ok
+device group ordering: ok
+resident dense MLP composition: ok
+make: *** [Makefile:274: cuda-test] Error 1
+```
+
+### 2. Duplicate IDs across streamed tool calls
+
+**FIXED** - Each semantic stream now owns one request-stable ID seed and assigns
+the running tool index before emission.  Responses API deltas and the final
+`response.completed` object use the same IDs.
+
+### 3. Native metadata for a symlinked model root
+
+**FIXED** - The native metadata walk follows the top-level model path, then
+retains `lstat()` for recursive entries so nested symlinks cannot create loops.
+The native server fixture now starts from a symlink and still reports the
+expected 123-byte model and timestamp.
+
+### 4. Python metadata for a regular-file model
+
+**FIXED** - The Python server handles a regular-file `model_path` directly,
+including its size and modification time, while directory models keep the
+existing filtered walk.
+
+The three reviewed server failure paths pass together:
+
+```text
+test_anthropic_responses_and_ollama (tests.test_native_server.NativeServerTest.test_anthropic_responses_and_ollama) ... ok
+test_multiple_streamed_tool_calls_have_unique_stable_ids (tests.test_native_server.NativeServerTest.test_multiple_streamed_tool_calls_have_unique_stable_ids) ... ok
+test_regular_file_model_metadata (tests.test_openai_server.ProtocolTest.test_regular_file_model_metadata) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.169s
+
+OK
+```
+
+### Full validation
+
+```text
+.[api] tool-calls: 1 total, 1 strict, 0 de-mangled [CLEAN]
+.................
+----------------------------------------------------------------------
+Ran 124 tests in 8.932s
+
+OK
+```
+
+Production recovery after the isolated GB10 benchmarks:
+
+```text
+active
+VmRSS:	   25424 kB
+VmSwap:	       0 kB
+{"status":"ok","scheduler":{"active":0,"queued":0,"capacity":1,"max_queue":8,"queue_timeout_seconds":300.0,"admitted":0,"completed":0,"rejected":0,"timed_out":0,"cancelled":0},"kv_slots":1,"watchdog_active":0,"tiers":{"vram":1586,"ram":0,"disk":17870,"vram_gb":30.0,"ram_gb":0.0},"hwinfo":{"cores":20,"ram_total_gb":127.6,"ram_avail_gb":80.7,"gpus":1,"vram_total_gb":130.7,"cpu":"","gpu":"CUDA device x1"}}
+```
+
+### Self-check
+
+1. No review item in this round remains unverified.  The pre-fix H100
+   performance result was not repeated and is marked provisional in the
+   performance ledger.
+2. Every claim above corresponds to the final diff or a pasted output block.
+3. The reviews had no separate smoke-test list.  This round exercised the
+   full-model TC branch and control, multiple streamed calls across three API
+   shapes, native symlink metadata, Python regular-file metadata, the portable
+   full suite, and production recovery; their outputs appear above.

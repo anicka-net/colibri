@@ -51,6 +51,8 @@ class NativeServerTest(unittest.TestCase):
         future = int(time.time()) + 86400
         os.utime(cls.model_dir / "weights.bin", (future, future))
         (cls.model_dir / ".coli_usage").write_bytes(b"runtime state")
+        cls.model_link = Path(cls.runtime_tmp.name) / "model-link"
+        cls.model_link.symlink_to(cls.model_dir, target_is_directory=True)
         web = Path(cls.web_tmp.name)
         (web / "index.html").write_text("native dashboard", encoding="utf-8")
         outside = web.parent / (web.name + "-private")
@@ -61,7 +63,7 @@ class NativeServerTest(unittest.TestCase):
         env["XDG_RUNTIME_DIR"] = cls.runtime_tmp.name
         cls.server_env = env
         cls.process = subprocess.Popen([
-            str(ROOT / "coli-native"), "serve", "--model", str(cls.model_dir),
+            str(ROOT / "coli-native"), "serve", "--model", str(cls.model_link),
             "--host", "127.0.0.1", "--port", str(cls.port),
             "--model-id", "glm-test", "--model-alias", "glm-public",
             "--hidden-model-alias", "glm-hidden", "--api-key", "secret",
@@ -579,6 +581,63 @@ class NativeServerTest(unittest.TestCase):
         calls = result["choices"][0]["message"]["tool_calls"]
         self.assertEqual([json.loads(call["function"]["arguments"])
                           for call in calls], [{"q": "bird"}, {"q": "tern"}])
+
+    def test_multiple_streamed_tool_calls_have_unique_stable_ids(self):
+        parameters = {"type": "object", "properties": {
+            "q": {"type": "string"}}}
+        openai_tool = {"type": "function", "function": {
+            "name": "lookup", "parameters": parameters}}
+        anthropic_tool = {"name": "lookup", "input_schema": parameters}
+
+        with self.request("/v1/messages", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "multiple tools"}], "max_tokens": 16,
+            "thinking": {"type": "disabled"}, "tools": [anthropic_tool],
+            "stream": True,
+        }) as response:
+            events = [json.loads(line[6:]) for line in response
+                      if line.startswith(b"data: ")]
+        anthropic_ids = [
+            event["content_block"]["id"] for event in events
+            if event.get("type") == "content_block_start"
+            and event["content_block"]["type"] == "tool_use"
+        ]
+        self.assertEqual(len(anthropic_ids), 2)
+        self.assertEqual(len(set(anthropic_ids)), 2)
+
+        with self.request("/v1/chat/completions", {
+            "model": "glm-test", "messages": [{"role": "user",
+                "content": "multiple tools"}], "max_tokens": 16,
+            "tools": [openai_tool], "stream": True,
+            "reasoning_effort": "none",
+        }) as response:
+            events = [json.loads(line[6:]) for line in response
+                      if line.startswith(b"data: ") and b"[DONE]" not in line]
+        deltas = [
+            call for event in events for choice in event["choices"]
+            for call in choice["delta"].get("tool_calls", [])
+        ]
+        self.assertEqual([call["index"] for call in deltas], [0, 1])
+        self.assertEqual(len({call["id"] for call in deltas}), 2)
+
+        with self.request("/v1/responses", {
+            "model": "glm-test", "input": "multiple tools",
+            "max_output_tokens": 16, "tools": [openai_tool],
+            "stream": True,
+        }) as response:
+            events = [json.loads(line[6:]) for line in response
+                      if line.startswith(b"data: ") and b"[DONE]" not in line]
+        delta_ids = [
+            event["item_id"] for event in events
+            if event["type"] == "response.function_call_arguments.delta"
+        ]
+        completed = next(event["response"] for event in events
+                         if event["type"] == "response.completed")
+        completed_ids = [item["id"] for item in completed["output"]]
+        self.assertEqual(len(set(delta_ids)), 2)
+        self.assertEqual(delta_ids, completed_ids)
+        self.assertEqual(len({item["call_id"]
+                              for item in completed["output"]}), 2)
 
     def test_anthropic_stream_retains_split_utf8_tail(self):
         with self.request("/v1/messages", {

@@ -204,6 +204,7 @@ else
 PYTHON    ?= python3
 endif
 CUDA_OBJ  =
+REMOTE_OBJ =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_group_plan$(EXE) tests/test_serve_limit$(EXE) tests/test_expert_vram_plan$(EXE) tests/test_nvfp4$(EXE) tests/test_nvfp4_loader$(EXE) tests/test_snapshot_manifest$(EXE) tests/test_kv_dtype$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_kv_cache$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_olmoe_ppl$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -246,6 +247,21 @@ GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
 endif
 
+# REMOTE=1 adds the Linux-only, opt-in RDMA client. The default engine keeps
+# its dependency-free CPU path and unchanged link surface.
+REMOTE ?= 0
+ifeq ($(REMOTE),1)
+ifeq (,$(LINUX))
+$(error REMOTE=1 is supported only on Linux)
+endif
+ifneq ($(CUDA),1)
+$(error REMOTE=1 requires CUDA=1)
+endif
+CFLAGS    += -DCOLI_REMOTE
+LDFLAGS   += -libverbs
+REMOTE_OBJ = remote_expert.o
+endif
+
 # METAL=1 adds an opt-in Apple-GPU backend (macOS only). The shader is compiled at
 # runtime, so no Xcode / offline metal compiler is required. Default build unchanged.
 METAL     ?= 0
@@ -282,7 +298,7 @@ coli-native$(EXE): coli_native.c native_server.c native_server.h native_plan.c n
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|NVFP4_NATIVE=$(NVFP4_NATIVE)|CUTLASS_DIR=$(CUTLASS_DIR)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|REMOTE=$(REMOTE)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|NVFP4_NATIVE=$(NVFP4_NATIVE)|CUTLASS_DIR=$(CUTLASS_DIR)|METAL=$(METAL)|HIP=$(HIP)|HIP_ARCH=$(HIP_ARCH)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -295,8 +311,11 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) .build-config
-	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) -o colibri$(EXE) $(LDFLAGS)
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h $(CUDA_OBJ) $(METAL_OBJ) $(REMOTE_OBJ) .build-config
+	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(REMOTE_OBJ) -o colibri$(EXE) $(LDFLAGS)
+
+remote_expert.o: remote_expert.c remote_expert.h remote_expert_protocol.h .build-config
+	$(CC) $(CFLAGS) -c remote_expert.c -o $@
 
 # Windows runtime loader object: resolves coli_cuda_* from coli_cuda.dll.
 backend_loader.o: backend_loader.c backend_cuda.h compat.h .build-config
@@ -360,6 +379,10 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
+
+remote-expert-worker: backend_cuda.cu backend_cuda.h remote_expert_worker.cu remote_expert_protocol.h
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) backend_cuda.cu remote_expert_worker.cu -o remote-expert-worker$(EXE) -libverbs
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)

@@ -77,6 +77,42 @@ on multi-GPU hosts the per-layer P2P hops cancel the gain, so the decode gate is
 device-count aware. `COLI_CUDA_TC_W4A16=1` enables Tensor-Core int4×fp16 mixed
 dispatch for batched rows (pays at ≥16 rows).
 
+## Optional remote expert layers (Linux/RDMA)
+
+`REMOTE=1` adds an opt-in libibverbs client without changing the default build.
+The initial implementation moves complete routed-expert layers, which keeps
+accumulation exact and avoids loading those experts from local disk:
+
+```bash
+# On the model host: create one compact pack containing complete layers.
+python tools/pack_remote_layers.py /nvme/glm52_i4 /nvme/layers4-9.colirxp \
+  --layers 4,5,6,7,8,9
+
+# On the worker host.
+make remote-expert-worker CUDA_HOME=/usr/local/cuda CUDA_ARCH=native
+./remote-expert-worker /nvme/layers4-9.colirxp rocep1s0f1 3
+
+# On the model host.
+make glm CUDA=1 REMOTE=1 CUDA_HOME=/usr/local/cuda CUDA_ARCH=native
+COLI_CUDA=1 COLI_CUDA_PIPE=2 \
+COLI_REMOTE_EXPERT=worker-hostname \
+COLI_REMOTE_DEVICE=rocep1s0f1 COLI_REMOTE_GID=3 \
+COLI_REMOTE_LAYERS=4,5,6,7,8,9 \
+SNAP=/nvme/glm52_i4 ./glm 17 4 4
+```
+
+Remote execution is decode-only (`S<=4`) and requires every expert in each
+configured layer to be present in the worker pack. Requests use registered
+host buffers; the default timeout is 5 seconds
+(`COLI_REMOTE_TIMEOUT_MS`). Connection, protocol, or completion failures log
+the reason, disable the remote path, and continue through the existing local
+expert tiers. The worker accepts one engine connection and exits after that
+engine shuts down.
+
+The first dual-GB10 result for layers 4–9 improved matched 128-token wall time
+by 6.1–7.7% with exact replay and zero fallback; see
+[PERF-QUEUE.md](PERF-QUEUE.md#remote-complete-layer-tier-measured-2026-07-21--clears-gate).
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.

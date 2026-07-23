@@ -21,6 +21,7 @@ FILES = [
     "nvfp4_cuda_bench", "nvfp4_cuda_bench.exe",
     "nvfp4_layout_test", "nvfp4_layout_test.exe",
     "backend_cuda_bench", "backend_cuda_bench.exe",
+    "remote-expert-worker", "remote-expert-worker.exe", "remote_expert.o",
     "backend_metal.o", "backend_metal_test",
     "coli_cuda.dll", "coli_cuda.lib", "coli_cuda.exp",
 ]
