@@ -235,6 +235,11 @@ typedef struct {
      * after it dropped out of the working set. Same shape/allocation as elast; NULL for dense
      * layers. */
     uint32_t **elast_dc, **elast_pre, eaccess_clock_dc;
+    /* Native expert records are immutable.  Cache successful block-scale
+     * validation by (layer,eid), but continue checking metadata and the two
+     * scalar scales on every load.  Racy duplicate first validations are
+     * harmless; the byte is published only after all three projections pass. */
+    _Atomic uint8_t *native_valid;
     /* DSA lightning indexer (attivo solo se i pesi out-idx-* sono presenti) */
     int has_dsa;
     QT *ix_wq, *ix_wk, *ix_wp;                   /* per layer FULL: wq_b, wk, weights_proj */
@@ -1223,6 +1228,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
     m->elast=calloc(NR,sizeof(uint32_t*));
     m->elast_dc=calloc(NR,sizeof(uint32_t*)); m->elast_pre=calloc(NR,sizeof(uint32_t*));
+    if(m->manifest.present){
+        size_t nvalid=(size_t)NR*(size_t)c->n_experts;
+        m->native_valid=calloc(nvalid,sizeof(*m->native_valid));
+        if(!m->native_valid){ fprintf(stderr,"OOM native expert validation cache\n"); exit(1); }
+    }
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
@@ -1587,6 +1597,8 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
 #endif
     }
     uint8_t *native_weight[3]={0},*native_scales[3]={0};
+    size_t valid_idx=(size_t)layer*(size_t)c->n_experts+(size_t)eid;
+    int scales_valid=m->native_valid&&atomic_load_explicit(&m->native_valid[valid_idx],memory_order_acquire);
     int64_t pos=0,total=0;
     for(int k=0;k<3;k++){
         int64_t wb=tw[k]->nbytes,sb=ts[k]->nbytes;
@@ -1603,15 +1615,19 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
             fprintf(stderr,"invalid native NVFP4 tensor/input scale: layer %d expert %d projection %d\n",layer,eid,k);
             if(fatal)exit(1);return -1;
         }
-        /* Validate every FP8 scale byte now, never lazily reinterpret malformed data. */
-        for(int64_t z=0;z<sb;z++){float v=coli_e4m3fn_f32(native_scales[k][z]);
-            /* CUTLASS padding bytes are zero; logical scale positions must be positive. */
-            if(isnan(v)){fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
-        for(int o=0;o<OO[k];o++)for(int g=0;g<(II[k]+15)/16;g++){
-            float v=coli_e4m3fn_f32(native_scales[k][coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
-            if(!isfinite(v)||v<=0){fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
+        if(!scales_valid){
+            /* Validate every FP8 scale byte before the record's first publication. */
+            for(int64_t z=0;z<sb;z++){float v=coli_e4m3fn_f32(native_scales[k][z]);
+                /* CUTLASS padding bytes are zero; logical scale positions must be positive. */
+                if(isnan(v)){fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
+            for(int o=0;o<OO[k];o++)for(int g=0;g<(II[k]+15)/16;g++){
+                float v=coli_e4m3fn_f32(native_scales[k][coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
+                if(!isfinite(v)||v<=0){fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
+        }
         total+=wb+sb+8;
     }
+    if(!scales_valid&&m->native_valid)
+        atomic_store_explicit(&m->native_valid[valid_idx],1,memory_order_release);
     /* Publish all three projections only after the complete immutable record
      * has been read and validated. A short read must never leave a mixed old/
      * new expert visible through the slot's QT fields. */
@@ -2142,6 +2158,9 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden;
         QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
         int64_t total=0;
+        size_t valid_idx=(size_t)l->layer*(size_t)c->n_experts+(size_t)l->eid;
+        int scales_valid=l->m->native_valid&&
+            atomic_load_explicit(&l->m->native_valid[valid_idx],memory_order_acquire);
         for(int k=0;k<3;k++){
             if(l->native_coalesced){
                 uint8_t *record=l->native_direct?s->slab:(uint8_t*)l->iobuf;
@@ -2156,12 +2175,14 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             float ts=s->fslab[k*2],is=s->fslab[k*2+1];
             if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
                 return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
-            for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z])))
-                return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
-            for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
-                float v=coli_e4m3fn_f32(bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
-                if(!isfinite(v)||v<=0)
-                    return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
+            if(!scales_valid){
+                for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z])))
+                    return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
+                for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
+                    float v=coli_e4m3fn_f32(bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
+                    if(!isfinite(v)||v<=0)
+                        return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
+                }
             }
             qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
             qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;qt[k]->O=OO[k];qt[k]->I=II[k];
@@ -2170,6 +2191,8 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             qt[k]->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;
             total+=l->tw[k]->nbytes+sb+8;
         }
+        if(!scales_valid&&l->m->native_valid)
+            atomic_store_explicit(&l->m->native_valid[valid_idx],1,memory_order_release);
         free(l->iobuf);l->iobuf=NULL;l->iobuf_cap=0;
         if(g_drop) for(int k=0;k<3;k++){
             posix_fadvise(l->tw[k]->fd,l->tw[k]->off,l->tw[k]->nbytes,POSIX_FADV_DONTNEED);

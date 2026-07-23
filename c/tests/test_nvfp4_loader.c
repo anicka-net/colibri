@@ -67,7 +67,10 @@ int main(void){
     }
     char path[]="test_nvfp4_loader_XXXXXX";int fd=mkstemp(path);assert(fd>=0);
     FILE *file=fdopen(fd,"w+b");assert(file);
-    Model m={0};m.c.hidden=5;m.c.moe_inter=7;m.ebits=4;m.manifest.present=1;
+    Model m={0};m.c.hidden=5;m.c.moe_inter=7;m.c.n_layers=2;m.c.n_experts=4;
+    m.ebits=4;m.manifest.present=1;
+    m.native_valid=calloc((size_t)(m.c.n_layers+1)*m.c.n_experts,sizeof(*m.native_valid));
+    assert(m.native_valid);
     m.S.n=m.S.cap=12;m.S.t=calloc(12,sizeof(st_tensor));assert(m.S.t);
     int n=0;char base[288];const char *p[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++){
@@ -77,6 +80,7 @@ int main(void){
     assert(n==12);fflush(file);
     ESlot slot={.eid=-1};
     assert(expert_load_impl(&m,2,3,&slot,0,1)==0&&slot.eid==3);
+    assert(atomic_load(&m.native_valid[2*m.c.n_experts+3])==1);
     assert_projection(&slot.g,7,5);assert_projection(&slot.u,7,5);assert_projection(&slot.d,5,7);
     int64_t logical=qt_bytes(&slot.g)+qt_bytes(&slot.u)+qt_bytes(&slot.d);
     assert(logical>0&&slot.slab_cap>=4096&&slot.fslab_cap==6);
@@ -99,7 +103,7 @@ int main(void){
     assert(expert_load_impl(&m,2,3,&slot,0,1)==-1&&slot.eid==-1);
     assert(!slot.g.q4&&!slot.u.q4&&!slot.d.q4);
     expert_lru_release(&slot);
-    for(int i=0;i<m.S.n;i++)free(m.S.t[i].name);free(m.S.t);
+    for(int i=0;i<m.S.n;i++)free(m.S.t[i].name);free(m.S.t);free(m.native_valid);
     fclose(file);unlink(path);
     puts("native NVFP4 expert load/evict/reload: ok");
     return 0;
