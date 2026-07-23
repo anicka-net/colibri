@@ -3485,25 +3485,32 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             } else for(int di=0;di<g_cuda_ndev;di++)
                 if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
         }
-        if(!async_done)
-        /* resident path (#431 PR-C0): issue the group on its device with the input
-         * P2P'd from the home device and the weighted partial pushed back there —
-         * no host bytes, no per-device sync; take() runs after moe() returns.
-         * Issue is serial (it only queues async work); failure falls back to the
-         * synchronous host-round-trip call below, per device. */
-        if(g_pres_home>=0 && S==1){
-            for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
-                float wbuf[64];
-                for(int q=0;q<dev_nc[di];q++) wbuf[q]=group_weight[(int64_t)dev_which[di][q]*S];
-                if(coli_cuda_expert_group_resident_issue(dev_g[di],dev_u[di],dev_d[di],wbuf,dev_nc[di],
-                        g_pres_home,g_pres_xsrc,g_pres_slots+(int64_t)g_pres_nused*D)){
-                    g_pres_used[g_pres_nused++]=g_cuda_devices[di];
-                    dev_ok[di]=2;                       /* handled on device: skip host collection */
+        if(!async_done){
+            /* resident path (#431 PR-C0): issue the group on its device with the input
+             * P2P'd from the home device and the weighted partial pushed back there —
+             * no host bytes, no per-device sync; take() runs after moe() returns.
+             * Issue is serial (it only queues async work); failure falls back to the
+             * synchronous host-round-trip call below, per device. */
+            if(g_pres_home>=0 && S==1){
+                for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
+                    float wbuf[64];
+                    for(int q=0;q<dev_nc[di];q++) wbuf[q]=group_weight[(int64_t)dev_which[di][q]*S];
+                    if(coli_cuda_expert_group_resident_issue(dev_g[di],dev_u[di],dev_d[di],wbuf,dev_nc[di],
+                            g_pres_home,g_pres_xsrc,g_pres_slots+(int64_t)g_pres_nused*D)){
+                        g_pres_used[g_pres_nused++]=g_cuda_devices[di];
+                        dev_ok[di]=2;                       /* handled on device: skip host collection */
+                    }
                 }
             }
         }
+        /* dev_ok==0 is the real "needs the synchronous host round-trip" condition:
+         * never attempted, or a per-device async take() that failed. The old guard
+         * was !=2, which let dev_ok==1 through — a device whose ASYNC group had
+         * SUCCEEDED was recomputed here and overwrote group_y with identical values.
+         * Output stayed correct, so it went unnoticed; the symptom was simply that
+         * COLI_GROUP_ASYNC never showed a speedup while doubling GPU expert work. */
         #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
-        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]&&dev_ok[di]!=2){
+        for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]&&dev_ok[di]==0){
             double td=g_prof?now_s():0;
             dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
                 group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
