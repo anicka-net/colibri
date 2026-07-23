@@ -989,3 +989,25 @@ Observed NVMe throughput rose from roughly 1.0 to 1.8 GB/s as queue depth grew
 from about 25 to 47. This is correctness evidence, not a performance win: the
 earlier pthread smoke took 181 s. Do not claim native-record io_uring faster
 until aligned direct placement and validation caching recover that regression.
+
+Aligned-v2 GB10 follow-up (2026-07-23, CUDA 13.1.1, `sm_121a`): the rewritten
+payload passed a faithful FP32-KV smoke at cap 16 with `DIRECT=1`, `URING=1`,
+host-backed CUDA experts, native NVFP4 at S>=1, and no CUDA expert tier:
+9/9 requests, 100% smoke accuracy, and `-0.28373 nat/token`. Peak RSS remained
+about 63.3 GiB. The initial aligned run spent one CPU core converting and
+rescanning every FP8 scale on every reload and took 1602 s. Caching successful
+validation per immutable `(layer,expert)` record, recognizing E4M3FN validity
+from its exact byte encoding, and validating full production scale tiles in
+one linear pass reduced the same smoke to 1017 s (-36.5%). Metadata and scalar
+scales are still checked on every load; odd/padded shapes retain full physical
+and logical scale validation on first publication. This recovers substantial
+CPU headroom but is still slower than the 452 s compatibility-path run and the
+historical 181 s pthread run, so aligned io_uring throughput remains an open
+performance gate rather than a claimed win.
+
+Final GB10 correctness gates at commit `07d4fdc`: full CUDA backend harness,
+generic fallback (`COLI_NVFP4_NATIVE=0`), CUTLASS SFA/SFB layout parity,
+production-shape native/grouped oracle, and FP8-KV device-shadow readers
+including 32k all passed in the pinned CUDA 13.1.1 container. The native
+service profile remains unpromoted pending the broader frozen quality suite
+and a satisfactory disk-streaming performance result.
