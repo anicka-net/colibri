@@ -104,14 +104,27 @@ support part of the current merge gate.
 For GB10 and coherent-memory Grace systems, the target steady-state execution
 model is GPU-only for tensor computation.  Unified/coherent addressing means
 routed experts need not fall back to CPU matmul merely because their weights
-are outside a separate VRAM tier: CUDA should consume the host/LPDDR/Grace
-memory directly, as the faithful NVFP4 run already does (`routed CPU 0`).
-CPU work remains appropriate for routing/control, io_uring submission and
-completion, metadata validation, and other orchestration.  Any CPU attention,
-projection, expert matmul, KV transform, or logits path on these machines
-should be counted and treated as a missing/failed device path.  Apply the same
-design to GH200 using formats Hopper supports; GH200's lack of native NVFP4
-does not justify CPU tensor execution.
+are outside a GPU-local tier.  CPU work remains appropriate for
+routing/control, io_uring submission and completion, metadata validation, and
+other orchestration.  Any CPU attention, projection, expert matmul, KV
+transform, or logits path on these machines should be counted and treated as a
+missing/failed device path.
+
+Do not, however, collapse GB10 and GH200 into the same memory-tier policy.
+GB10 has LPDDR unified memory and no separate high-bandwidth GPU-local VRAM, so
+CUDA consumption from LPDDR is the terminal execution tier, as the faithful
+NVFP4 run already demonstrates (`routed CPU 0`).  GH200 has both
+Grace-accessible coherent LPDDR and 96 GB of substantially faster HBM.  Its
+cold path should launch the expert on the GPU directly from coherent LPDDR
+while asynchronously promoting that same expert into HBM; later hits execute
+from HBM.  This resembles Tekton's RAM-to-VRAM promotion in placement and
+reuse, but not in cold execution: Tekton may profitably calculate a small cold
+expert on its EPYC CPU while H2D is in flight, whereas GH200 should calculate
+it on the GPU from LPDDR while the LPDDR-to-HBM promotion is in flight.  Keep
+the source allocation alive until both execution and copy complete, coalesce
+duplicate promotions, and expose direct-LPDDR, HBM-hit, promotion, and
+promotion-fallback counters.  Apply this design using formats Hopper supports;
+GH200's lack of native NVFP4 does not justify CPU tensor execution.
 
 Rejected dispatch/build thresholds are intentionally visible.  Plain `sm_121`
 cannot launch the CUTLASS architecture-conditional MMA and is rejected in favor
