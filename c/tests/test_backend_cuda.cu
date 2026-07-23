@@ -128,6 +128,18 @@ int main(int argc, char **argv) {
     ColiCudaTensor *t4 = nullptr;
     if (!coli_cuda_matmul(&t4, got, x, q4, s4, 2, 1, 4, 2, d1, 0) || !close_enough(got, want4, 2)) return 1;
 
+    /* Grouped INT4 keeps offset-binary nibbles and has O*ceil(I/gs) scales.
+     * Guard the generic upload/matmul/accounting path independently of the
+     * routed-expert grouped kernels. */
+    const uint8_t q4g[4] = {0x80,0x7f,0xa9,0xcb};
+    const float s4g[4] = {1.0f,0.5f,0.25f,2.0f};
+    const float want4g[2] = {4.5f,-14.75f};
+    ColiCudaTensor *t4g = nullptr;
+    if (!coli_cuda_matmul(&t4g,got,x,q4g,s4g,COLI_TENSOR_INT4_GROUP,
+                          1,4,2,d1,2) ||
+        !close_enough(got,want4g,2) ||
+        coli_cuda_tensor_bytes(t4g)!=sizeof(q4g)+sizeof(s4g)) return 1;
+
     const uint8_t q2[2] = {0xe4, 0x1b};
     const float s2[2] = {0.5f, 2.0f};
     const float want2[2] = {-2.0f, 12.0f};
@@ -426,21 +438,23 @@ int main(int argc, char **argv) {
     }
 
     coli_cuda_stats(-1, &count, &bytes);
-    if (count != 7 || bytes != 166) {
+    if (count != 8 || bytes != 186) {
         std::fprintf(stderr, "unexpected CUDA stats: %zu tensors, %zu bytes\n", count, bytes);
         return 1;
     }
     if (coli_cuda_tensor_device(t8) != d0 || coli_cuda_tensor_device(tf) != d0 ||
-        coli_cuda_tensor_device(t4) != d1 || coli_cuda_tensor_device(t2) != d1) return 1;
+        coli_cuda_tensor_device(t4) != d1 || coli_cuda_tensor_device(t4g) != d1 ||
+        coli_cuda_tensor_device(t2) != d1) return 1;
     coli_cuda_stats(d0, &count, &bytes);
     if (ndev > 1) {
         if (count != 5 || bytes != 144) return 1;
         coli_cuda_stats(d1, &count, &bytes);
-        if (count != 2 || bytes != 22) return 1;
-    } else if (count != 7 || bytes != 166) return 1;
+        if (count != 3 || bytes != 42) return 1;
+    } else if (count != 8 || bytes != 186) return 1;
 
     coli_cuda_tensor_free(t8);
     coli_cuda_tensor_free(t4);
+    coli_cuda_tensor_free(t4g);
     coli_cuda_tensor_free(t2);
     coli_cuda_tensor_free(tf);
     coli_cuda_tensor_free(tg);

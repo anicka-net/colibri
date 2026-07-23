@@ -121,7 +121,8 @@ static int select_ctx(DeviceContext *ctx) {
 __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == COLI_TENSOR_F32) return (size_t)I * sizeof(float);
     if (fmt == COLI_TENSOR_INT8_ROW) return (size_t)I;
-    if (fmt == COLI_TENSOR_INT4_ROW) return (size_t)(I + 1) / 2;
+    if (fmt == COLI_TENSOR_INT4_ROW || fmt == COLI_TENSOR_INT4_GROUP)
+        return (size_t)(I + 1) / 2;
     if (fmt == COLI_TENSOR_INT2_ROW) return (size_t)(I + 3) / 4;
     if (fmt == COLI_TENSOR_BF16) return (size_t)I * sizeof(uint16_t);
     return 0;
@@ -140,6 +141,11 @@ __device__ static float weight_at(const void *weights, int fmt, size_t row, int 
         uint8_t v = q[i >> 1];
         int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n&8?n-16:n);
     }
+    if (fmt == COLI_TENSOR_INT4_GROUP) {
+        uint8_t v = q[i >> 1];
+        int n=(i&1)?(v>>4):(v&15); return static_cast<float>(n-8);
+    }
+    if (fmt != COLI_TENSOR_INT2_ROW) return 0.0f;
     uint8_t v = q[i >> 2];
     return static_cast<float>(((v >> ((i & 3) * 2)) & 3) - 2);
 }
@@ -911,7 +917,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
     int scaled = fmt == COLI_TENSOR_INT8_ROW || fmt == COLI_TENSOR_INT4_ROW ||
-                 fmt == COLI_TENSOR_INT2_ROW;
+                 fmt == COLI_TENSOR_INT2_ROW || fmt == COLI_TENSOR_INT4_GROUP;
     if (!rb || (scaled && !scales)) return 0;
     if (*tensor) {
         ColiCudaTensor *t = *tensor;
@@ -931,15 +937,16 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     if(fmt==COLI_TENSOR_INT4_ROW){offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
     if (scaled) {
-        if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
-            !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
+        size_t scale_bytes=t->scale_count*sizeof(float);
+        if (!cuda_ok(cudaMalloc(&t->scales, scale_bytes), "scale allocation") ||
+            !cuda_ok(cudaMemcpy(t->scales, scales, scale_bytes, cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
         }
     }
     t->tracked = 1;
     ctx->tensor_count++;
-    ctx->tensor_bytes += t->weight_bytes + (scaled ? (size_t)O * sizeof(float) : 0);
+    ctx->tensor_bytes += t->weight_bytes + (scaled ? t->scale_count*sizeof(float) : 0);
     *tensor = t;
     return 1;
 }
@@ -958,7 +965,8 @@ extern "C" int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor,
     DeviceContext *ctx=find_ctx(device);
     if(!tensor||*tensor||!weights||I<1||O<1||!select_ctx(ctx))return 0;
     size_t rb=row_bytes(fmt,I);
-    int scaled=fmt==COLI_TENSOR_INT8_ROW||fmt==COLI_TENSOR_INT4_ROW||fmt==COLI_TENSOR_INT2_ROW;
+    int scaled=fmt==COLI_TENSOR_INT8_ROW||fmt==COLI_TENSOR_INT4_ROW||
+               fmt==COLI_TENSOR_INT2_ROW||fmt==COLI_TENSOR_INT4_GROUP;
     if(!rb||(scaled&&!scales))return 0;
     int pageable=0,host_pt=0;
     if(cudaDeviceGetAttribute(&pageable,cudaDevAttrPageableMemoryAccess,device)!=cudaSuccess||
@@ -1020,7 +1028,7 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
     int scaled=tensor && (tensor->fmt==COLI_TENSOR_INT8_ROW||tensor->fmt==COLI_TENSOR_INT4_ROW||
-                          tensor->fmt==COLI_TENSOR_INT2_ROW);
+                          tensor->fmt==COLI_TENSOR_INT2_ROW||tensor->fmt==COLI_TENSOR_INT4_GROUP);
     if (!tensor || tensor->host_backed || !weights || (scaled && !scales)) return 0;
     DeviceContext *ctx=find_ctx(tensor->device);
     if (!select_ctx(ctx)) return 0;
@@ -1032,7 +1040,7 @@ extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
         if(!cuda_ok(cudaGetLastError(),"int4 weight refresh")) return 0;
     }
     return !scaled || cuda_ok(cudaMemcpy(tensor->scales,scales,
-        (size_t)tensor->O*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
+        tensor->scale_count*sizeof(float),cudaMemcpyHostToDevice),"scale refresh");
 }
 
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
@@ -1818,9 +1826,9 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
         int scaled=tensor->fmt==COLI_TENSOR_INT8_ROW||tensor->fmt==COLI_TENSOR_INT4_ROW||
-                   tensor->fmt==COLI_TENSOR_INT2_ROW;
+                   tensor->fmt==COLI_TENSOR_INT2_ROW||tensor->fmt==COLI_TENSOR_INT4_GROUP;
         size_t bytes = tensor->weight_bytes + tensor->block_scale_bytes +
-            (scaled?(size_t)tensor->O*sizeof(float):0);
+            (scaled?tensor->scale_count*sizeof(float):0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -1833,9 +1841,9 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if(!tensor)return 0;
     int scaled=tensor->fmt==COLI_TENSOR_INT8_ROW||tensor->fmt==COLI_TENSOR_INT4_ROW||
-               tensor->fmt==COLI_TENSOR_INT2_ROW;
+               tensor->fmt==COLI_TENSOR_INT2_ROW||tensor->fmt==COLI_TENSOR_INT4_GROUP;
     return tensor->weight_bytes+tensor->block_scale_bytes+
-        (scaled?(size_t)tensor->O*sizeof(float):0);
+        (scaled?tensor->scale_count*sizeof(float):0);
 }
 
 extern "C" int coli_cuda_tensor_update_nvfp4(ColiCudaTensor *tensor,const uint8_t *weights,

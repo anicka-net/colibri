@@ -110,28 +110,38 @@ typedef struct {
 #endif
     int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
 } QT;
-static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
+static int64_t qt_weight_bytes(const QT *t){
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==COLI_TENSOR_F32) return n*4;
     if(t->fmt==COLI_TENSOR_BF16) return n*2;
-    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4){
-        int64_t sb=t->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4
+    if(t->fmt==COLI_TENSOR_INT8_ROW) return n;
+    if(t->fmt==COLI_TENSOR_INT4_ROW||t->fmt==COLI_TENSOR_INT4_GROUP||
+       t->fmt==COLI_TENSOR_MODELOPT_NVFP4) return (int64_t)t->O*((t->I+1)/2);
+    if(t->fmt==COLI_TENSOR_INT2_ROW) return (int64_t)t->O*((t->I+3)/4);
+    if(t->fmt==COLI_TENSOR_INT3_GROUP){
+        int64_t ng=((int64_t)t->I+63)/64;
+        return (int64_t)t->O*ng*24; }
+    if(t->fmt==COLI_TENSOR_E8)
+        return (int64_t)t->O*(((int64_t)t->I+255)/256)*98;
+    return 0;
+}
+static int64_t qt_scale_bytes(const QT *t){
+    if(t->fmt==COLI_TENSOR_MODELOPT_NVFP4)
+        return t->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4
             ?(int64_t)coli_nvfp4_cutlass_scale_bytes(t->O,t->I)
             :(int64_t)t->O*((t->I+15)/16);
-        return (int64_t)t->O*((t->I+1)/2)+sb+8;
-    }
-    if(t->fmt==COLI_TENSOR_INT8_ROW) return n + (int64_t)t->O*4;
-    if(t->fmt==COLI_TENSOR_INT2_ROW) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
-    if(t->fmt==COLI_TENSOR_INT4_GROUP){ /* int4 grouped: packed nibbles + O*ceil(I/gs) scales */
-        int ng=(t->I+t->gs-1)/t->gs;
-        return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*ng*4; }
-    if(t->fmt==COLI_TENSOR_INT3_GROUP){ /* int3-g64: 24B/group weights + one f32 scale per group (I3_* in quant.h,
-                    * included below — keep the arithmetic literal here) */
-        int64_t ng=((int64_t)t->I+63)/64;
-        return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
-    if(t->fmt==COLI_TENSOR_E8)  /* E8/IQ3: 98B per 256 weights, scales in-block, .qs is a 4-byte tag */
-        return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
-    return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
+    if(t->fmt==COLI_TENSOR_INT8_ROW||t->fmt==COLI_TENSOR_INT4_ROW||
+       t->fmt==COLI_TENSOR_INT2_ROW) return (int64_t)t->O*4;
+    if(t->fmt==COLI_TENSOR_INT4_GROUP)
+        return (int64_t)t->O*((t->I+t->gs-1)/t->gs)*4;
+    if(t->fmt==COLI_TENSOR_INT3_GROUP)
+        return (int64_t)t->O*(((int64_t)t->I+63)/64)*4;
+    if(t->fmt==COLI_TENSOR_E8) return 4; /* .qs format tag */
+    return 0;
+}
+static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
+    int64_t wb=qt_weight_bytes(t),sb=qt_scale_bytes(t);
+    return wb+sb+(t->fmt==COLI_TENSOR_MODELOPT_NVFP4?8:0);
 }
 
 typedef struct {
@@ -614,10 +624,11 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
     }
-    if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
-    else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
+    if(w->fmt==COLI_TENSOR_INT8_ROW) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
+    else if(w->fmt==COLI_TENSOR_INT2_ROW) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else if(w->fmt==COLI_TENSOR_INT3_GROUP) matmul_i3(y,x,w->q4,w->s,S,w->I,w->O);
-    else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
+    else if(w->fmt==COLI_TENSOR_INT4_ROW) matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
+    else { fprintf(stderr,"matmul_qt: unsupported tensor format %d\n",w->fmt); exit(1); }
 }
 
 static int g_nopack=0;   /* NOPACK=1 -> tiene i valori <=4bit in contenitore int8 (per validare il packing) */
@@ -1189,13 +1200,18 @@ static void qt_cuda_colocate(QT *dst,const QT *src){
 }
 static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
     if(!g_cuda_enabled||!g_cuda_dense||g_cuda_ndev<2||l->kv_b.fmt==0)return;
-    int rb=l->kv_b.fmt==1?l->kv_b.I:
-           (l->kv_b.fmt==2||l->kv_b.fmt==4)?(l->kv_b.I+1)/2:(l->kv_b.I+3)/4;
-    const uint8_t *weights=l->kv_b.fmt==1?(const uint8_t*)l->kv_b.q8:l->kv_b.q4;
+    if(l->kv_b.fmt!=COLI_TENSOR_INT8_ROW&&l->kv_b.fmt!=COLI_TENSOR_INT4_ROW&&
+       l->kv_b.fmt!=COLI_TENSOR_INT4_GROUP&&l->kv_b.fmt!=COLI_TENSOR_INT2_ROW&&
+       l->kv_b.fmt!=COLI_TENSOR_BF16)return;
+    int rb=(int)(qt_weight_bytes(&l->kv_b)/l->kv_b.O);
+    const uint8_t *weights=l->kv_b.fmt==COLI_TENSOR_INT8_ROW?(const uint8_t*)l->kv_b.q8:
+                           l->kv_b.fmt==COLI_TENSOR_BF16?(const uint8_t*)l->kv_b.bf16:l->kv_b.q4;
+    int scales_per_row=l->kv_b.gs>0?(l->kv_b.I+l->kv_b.gs-1)/l->kv_b.gs:
+                       (l->kv_b.s?1:0);
     for(int d=0,h0=0;d<g_cuda_ndev;d++){
         int hn=H/g_cuda_ndev+(d<H%g_cuda_ndev),rows=hn*(Q+V);
         const void *part=weights+(int64_t)h0*(Q+V)*rb;
-        const float *scale=l->kv_b.s+(int64_t)h0*(Q+V)*(l->kv_b.gs>0?(l->kv_b.I+l->kv_b.gs-1)/l->kv_b.gs:1);
+        const float *scale=scales_per_row?l->kv_b.s+(int64_t)h0*(Q+V)*scales_per_row:NULL;
         if(!coli_cuda_tensor_upload_g(&l->kv_b_shard[d],part,scale,l->kv_b.fmt,l->kv_b.I,rows,g_cuda_devices[d],l->kv_b.gs))return;
         l->shard_h0[d]=h0;l->shard_hn[d]=hn;l->n_kv_b_shard++;h0+=hn;
     }
@@ -1418,6 +1434,13 @@ static void embed_row(Model *m, int tok, float *x){
         for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
             if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
         return; }
+    if(e->fmt==COLI_TENSOR_INT4_GROUP){
+        const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2);
+        int ng=(D+e->gs-1)/e->gs; const float *sr=e->s+(int64_t)tok*ng;
+        for(int i=0;i<D;i++){ uint8_t byte=q[i>>1]; int nib=(i&1)?byte>>4:byte&15;
+            x[i]=(float)(nib-8)*sr[i/e->gs]; }
+        return;
+    }
     if(e->fmt==COLI_TENSOR_INT3_GROUP){ const uint8_t *q=e->q4+(int64_t)tok*i3_rowbytes(D);   /* int3-g64 */
         const float *sr=e->s+(int64_t)tok*i3_groups(D); int64_t ng=i3_groups(D);
         for(int64_t g=0; g<ng; g++){ const uint8_t *lo=q+g*I3_GBYTES, *hi=lo+16;
@@ -1425,8 +1448,13 @@ static void embed_row(Model *m, int tok, float *x){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 x[base+k]=(float)((int)u-4)*sr[g]; } }
         return; }
-    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
-    for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
+    if(e->fmt==COLI_TENSOR_INT2_ROW){
+        const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];
+        for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
+        return;
+    }
+    fprintf(stderr,"embed_row: tensor format %d has no row decoder\n",e->fmt);
+    exit(1);
 }
 
 /* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
@@ -2415,12 +2443,15 @@ static int64_t expert_lru_release(ESlot *s){
         QT *q[3]={&s->g,&s->u,&s->d};
         for(int k=0;k<3;k++){
             void *data=q[k]->fmt==0?(void*)q[k]->qf:
-                       q[k]->fmt==1?(void*)q[k]->q8:(void*)q[k]->q4;
+                       q[k]->fmt==COLI_TENSOR_INT8_ROW?(void*)q[k]->q8:
+                       q[k]->fmt==COLI_TENSOR_BF16?(void*)q[k]->bf16:(void*)q[k]->q4;
+            void *scales=q[k]->fmt==COLI_TENSOR_MODELOPT_NVFP4
+                        ?(void*)q[k]->block_scales:(void*)q[k]->s;
 #ifdef COLI_METAL
             if(g_metal_enabled && q[k]->fmt!=0 && data) coli_metal_unregister(data);
-            if(g_metal_enabled && q[k]->s) coli_metal_unregister(q[k]->s);
+            if(g_metal_enabled && scales) coli_metal_unregister(scales);
 #endif
-            free(data); free(q[k]->s);
+            free(data); free(scales);
         }
     }
     compat_aligned_free(s->slab); free(s->fslab);
@@ -2522,6 +2553,11 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 acc[base+k]+=cg*(float)((int)u-4); } }
         return; }
+    if(t->fmt!=COLI_TENSOR_INT8_ROW&&t->fmt!=COLI_TENSOR_INT4_ROW&&
+       t->fmt!=COLI_TENSOR_INT2_ROW){
+        fprintf(stderr,"qt_addrow: tensor format %d has no row decoder\n",t->fmt);
+        exit(1);
+    }
     float c=coef*t->s[row];
     if(t->fmt==1){ const int8_t *w=t->q8+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=c*(float)w[i]; return; }
     if(t->fmt==2){ const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
@@ -2558,13 +2594,6 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
 #endif
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
-        else if(t->fmt==4){ /* per-gruppo, come matmul_i4_grouped / per-group, as matmul_i4_grouped */
-            const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
-            int gs=t->gs, ng=(I+gs-1)/gs; const float *scl=t->s+(int64_t)row*ng;
-            for(int g=0; g*gs<I; g++){ int base=g*gs, end=base+gs>I?I:base+gs; float acc=0;
-                for(int i=base;i<end;i++){ uint8_t b=w[i>>1];
-                    acc+=(float)((i&1)?((int)(b>>4)-8):((int)(b&0xF)-8))*x[i]; }
-                a+=(double)acc*scl[g]; } }
         else if(t->fmt==COLI_TENSOR_INT3_GROUP){ const uint8_t *w=t->q4+(int64_t)row*i3_rowbytes(I);
             const float *sr=t->s+(int64_t)row*i3_groups(I); int64_t ng=i3_groups(I);
             for(int64_t g=0; g<ng; g++){ const uint8_t *lo=w+g*I3_GBYTES, *hi=lo+16;
@@ -2572,8 +2601,9 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
                 for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                     acc+=(float)((int)u-4)*x[base+k]; }
                 a+=(double)(acc*sr[g]); } }
-        else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
+        else if(t->fmt==COLI_TENSOR_INT2_ROW){ const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
+        else { fprintf(stderr,"qt_matvec_rows: tensor format %d has no row decoder\n",t->fmt); exit(1); }
         y[j]=(float)a;
     }
 }
@@ -7698,25 +7728,26 @@ static int mem_wire(void *addr, size_t len){
 static void qt_unwire_mmap(QT *t){
     if(!g_mmap || !mem_should_wire()) return;
     if(!t->q8 && !t->q4) return;
-    int64_t scale_b=(int64_t)t->O*4;
-    int64_t weight_b=qt_bytes(t)-scale_b;
+    int64_t weight_b=qt_weight_bytes(t),scale_b=qt_scale_bytes(t);
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     if(weight_b>0 && !munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
-    if(t->s && scale_b>0 && !munlock(t->s,(size_t)scale_b)) g_mmap_wired-=scale_b;
+    void *sp=t->fmt==COLI_TENSOR_MODELOPT_NVFP4?(void*)t->block_scales:(void*)t->s;
+    if(sp && scale_b>0 && !munlock(sp,(size_t)scale_b)) g_mmap_wired-=scale_b;
 #elif defined(_WIN32)
     if(weight_b>0 && !compat_munlock(wp,(size_t)weight_b)) g_mmap_wired-=weight_b;
-    if(t->s && scale_b>0 && !compat_munlock(t->s,(size_t)scale_b)) g_mmap_wired-=scale_b;
+    void *sp=t->fmt==COLI_TENSOR_MODELOPT_NVFP4?(void*)t->block_scales:(void*)t->s;
+    if(sp && scale_b>0 && !compat_munlock(sp,(size_t)scale_b)) g_mmap_wired-=scale_b;
 #endif
 }
 static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
     if(!t->q8 && !t->q4) return;
     if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
-    int64_t scale_b=(int64_t)t->O*4;
-    int64_t weight_b=qt_bytes(t)-scale_b;
+    int64_t weight_b=qt_weight_bytes(t),scale_b=qt_scale_bytes(t);
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
+    void *sp=t->fmt==COLI_TENSOR_MODELOPT_NVFP4?(void*)t->block_scales:(void*)t->s;
     if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
-    if(t->s && scale_b>0){ if(mem_wire(t->s,(size_t)scale_b)==0) *wired+=scale_b; else (*failed)++; }
+    if(sp && scale_b>0){ if(mem_wire(sp,(size_t)scale_b)==0) *wired+=scale_b; else (*failed)++; }
 }
 static void pin_wire(Model *m){
     if(!mem_should_wire()) return;

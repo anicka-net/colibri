@@ -44,11 +44,16 @@ static void write_projection(Model *m,FILE *file,int *index,const char *base,
 }
 
 static void assert_projection(const QT *q,int O,int I){
+    int64_t wb=(int64_t)O*((I+1)/2);
+    int64_t sb=(int64_t)coli_nvfp4_cutlass_scale_bytes(O,I);
     assert(q->fmt==COLI_TENSOR_MODELOPT_NVFP4);
     assert(q->O==O&&q->I==I&&q->gs==16);
     assert(q->q4&&q->block_scales&&!q->s);
     assert(q->tensor_scale==0.5f&&q->input_scale==1.25f);
     assert(q->scale_layout==COLI_SCALE_CUTLASS_SM1XX_128X4);
+    assert(qt_weight_bytes(q)==wb);
+    assert(qt_scale_bytes(q)==sb);
+    assert(qt_bytes(q)==wb+sb+2*(int64_t)sizeof(float));
     float x[16]={0},y[16]={0};for(int i=0;i<I;i++)x[i]=(float)(i+1)/8.0f;
     assert(coli_matmul_nvfp4_w4a32_ref(y,x,q->q4,q->block_scales,q->tensor_scale,
                                        q->scale_layout,1,I,O));
