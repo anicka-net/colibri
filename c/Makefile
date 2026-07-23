@@ -327,7 +327,7 @@ metal-test: tests/test_backend_metal.mm backend_metal.mm backend_metal.h
 
 cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA_TEST backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
 cuda-nvfp4-layout-test: tests/test_nvfp4_cutlass_layout.cu backend_cuda_nvfp4_cutlass.cuh nvfp4.h
@@ -354,7 +354,7 @@ hip-test:
 # CI: compile the backend and its test binary WITHOUT executing them (for
 # runners with the toolchain but no GPU). Pass CUDA_ARCH/HIP=1+HIP_ARCH.
 gpu-compile: backend_cuda.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) -DCOLI_CUDA_TEST backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
