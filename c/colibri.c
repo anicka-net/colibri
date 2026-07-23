@@ -5485,6 +5485,51 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
+    /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
+     * at memcpy cost: if another slot's history shares a longer prefix with
+     * this prompt (shared system prompt, agent loop), copy its KV rows instead
+     * of recomputing them. MLA rows are position-addressed and self-contained
+     * (the same per-position serialization .coli_kv relies on), so a raw row
+     * copy is exact — the adopted prefill is skipped, not approximated.
+     * Copying beats aliasing here: step_decode_batch rejects two rows sharing
+     * one KVState, and a copy keeps every slot's lifetime independent.
+     * Measured (6x5090, 675-token shared prefix): slot TTFT 50.1s -> 1.7s,
+     * generated tokens identical to the full-prefill run. */
+    static int kvshare=-1;
+    if(kvshare<0) kvshare=getenv("COLI_KV_SHARE")?atoi(getenv("COLI_KV_SHARE")):0;
+    if(kvshare && nctx>1 && prefix>=sc->len){
+        int best=-1, blen=sc->len;
+        for(int i=0;i<nctx;i++){
+            if(i==sub.slot) continue;
+            ServeCtx *dc2=&ctx[i];
+            int lim=dc2->len<nt?dc2->len:nt, p=0;
+            while(p<lim && dc2->hist[p]==tmp[p]) p++;
+            if(p>blen){ blen=p; best=i; }
+        }
+        if(best>=0){
+            ServeCtx *dn=&ctx[best]; Cfg *cc=&m->c; int NR=cc->n_layers+1;
+            int from=sc->len, n=blen-from;
+            for(int l=0;l<NR;l++){
+                if(sc->kv.Lc[l]&&dn->kv.Lc[l])
+                    memcpy(coli_kv_row(sc->kv.Lc[l],from,cc->kv_lora),
+                           coli_kv_row(dn->kv.Lc[l],from,cc->kv_lora),
+                           (size_t)n*cc->kv_lora*sizeof(float));
+                if(sc->kv.Rc[l]&&dn->kv.Rc[l])
+                    memcpy(coli_kv_row(sc->kv.Rc[l],from,cc->qk_rope),
+                           coli_kv_row(dn->kv.Rc[l],from,cc->qk_rope),
+                           (size_t)n*cc->qk_rope*sizeof(float));
+                if(sc->kv.Ic&&dn->kv.Ic&&sc->kv.Ic[l]&&dn->kv.Ic[l])
+                    memcpy(coli_kv_row(sc->kv.Ic[l],from,cc->index_hd),
+                           coli_kv_row(dn->kv.Ic[l],from,cc->index_hd),
+                           (size_t)n*cc->index_hd*sizeof(float));
+            }
+            memcpy(sc->hist+from,tmp+from,(size_t)n*sizeof(int));
+            sc->len=blen;
+            if(m->has_mtp) m->kv_start[cc->n_layers]=-1;   /* MTP rows are per-slot decode state */
+            fprintf(stderr,"[API] KV cross-slot adopt: slot %d took rows [%d,%d) from slot %d\n",
+                    sub.slot,from,blen,best);
+        }
+    }
     int add=nt-sc->len;
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
