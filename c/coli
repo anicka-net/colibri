@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-colibrì — tiny engine, immense model.
+colibri — tiny engine, immense model.
 Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
   coli chat                 interactive chat (loads the model once)
@@ -15,6 +15,9 @@ Run GLM-5.2 (744B) locally on CPU with roughly 15-26 GB of RAM.
 
 Configuration through environment variables or flags (also valid after the subcommand):
   COLI_MODEL=<dir>   model directory (default /home/vincenzo/glm52_i4)
+  COLI_MODEL_MIRROR=<dir>  second copy of the model on another drive: expert reads
+                     are split across both SSDs (COLI_DISK_WEIGHTS=9,3 sets the
+                     primary,mirror bandwidth ratio; default: measured at startup)
   --ram N            RAM budget in GB (automatically sizes the expert cache)
   --repin N          adapt RAM/VRAM experts every N tokens
   --topp P           adaptive expert top-p             --topk N   fixed top-k
@@ -40,6 +43,8 @@ if sys.platform == "win32":
         except (AttributeError, OSError): pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from version import __version__ as _version
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, openai_server.py) and
@@ -52,16 +57,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # guess is right (e.g. a custom packaging layout).
 _EXE = ".exe" if sys.platform == "win32" else ""
 _LIBEXEC = os.path.join(os.path.dirname(HERE), "libexec", "colibri")
+_here_colibri = os.path.join(HERE, "colibri" + _EXE)
 _here_glm = os.path.join(HERE, "glm" + _EXE)
 
 if os.environ.get("COLI_ENGINE"):
     GLM = os.environ["COLI_ENGINE"]
     TOOLS = os.path.join(os.path.dirname(GLM), "tools")
+elif os.path.exists(_here_colibri):
+    GLM = _here_colibri
+    TOOLS = os.path.join(HERE, "tools")
 elif os.path.exists(_here_glm):
     GLM = _here_glm
     TOOLS = os.path.join(HERE, "tools")
 else:
-    GLM = os.path.join(_LIBEXEC, "glm" + _EXE)
+    GLM = os.path.join(_LIBEXEC, "colibri" + _EXE)
     TOOLS = os.path.join(_LIBEXEC, "tools")
     sys.path.insert(0, _LIBEXEC)   # so `import resource_plan`, `doctor`, `openai_server` still resolve
 
@@ -81,7 +90,7 @@ class C:
 TTY = sys.stdout.isatty() or os.environ.get("COLI_COLOR")=="1"
 if not TTY: C.off()
 
-# ---------- colibrì 8-bit (pixel art, 2 pixel verticali per carattere) ----------
+# ---------- colibri 8-bit (pixel art, 2 pixel verticali per carattere) ----------
 SPRITE = [
     "....MMM.........",
     "...MMMMM..w.....",
@@ -115,7 +124,7 @@ def sprite_lines():
 def banner(sub=""):
     sp=sprite_lines()
     txt=[
-        f"{C.teal}{C.b}colibrì{C.r} {C.dim}v1.0{C.r}",
+        f"{C.teal}{C.b}colibri{C.r} {C.dim}v{_version}{C.r}",
         f"{C.dim}tiny engine, immense model{C.r}",
         f"{C.gray}GLM-5.2 · 744B MoE · int4 · streaming CPU{C.r}",
         f"{C.dgray}{sub}{C.r}" if sub else "",
@@ -141,12 +150,24 @@ def need_model(model):
         sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
 
 def cuda_binary():
-    if not os.path.exists(GLM) or sys.platform != "linux": return False
-    try:
-        linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
-        return any("libcudart" in line and "not found" not in line
-                   for line in linked.stdout.splitlines())
-    except (OSError,subprocess.SubprocessError): return False
+    if not os.path.exists(GLM): return False
+    if sys.platform == "linux":
+        try:
+            linked=subprocess.run(["ldd",GLM],capture_output=True,text=True,timeout=3)
+            return any("libcudart" in line and "not found" not in line
+                       for line in linked.stdout.splitlines())
+        except (OSError,subprocess.SubprocessError): return False
+    if sys.platform == "win32":
+        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
+        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
+        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
+        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        try:
+            with open(GLM,"rb") as f: built=b"[CUDA] mode: routed experts" in f.read()
+        except OSError: return False
+        return built and os.path.exists(os.path.join(os.path.dirname(GLM),"coli_cuda.dll"))
+    return False
 
 def resource_request(a, env):
     ctx=a.ctx or int(env.get("CTX",4096))
@@ -194,7 +215,8 @@ def env_for(a):
     if a.ngen: e["NGEN"]=str(a.ngen)
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
-    if a.temp is not None: e["TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+    if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
+                                                        # COLI_TEMP, non TEMP: ROCm e Windows leggono $TEMP come dir temporanea (#509)
     if a.repin: e["REPIN"]=str(a.repin)
     if a.ctx: e["CTX"]=str(a.ctx)
     if a.auto_tier:
@@ -219,6 +241,55 @@ def env_for(a):
         gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
+        # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
+        # run CPU-only, even on a CUDA build with a GPU present — cuda_binary()
+        # returned False on Windows (see above), and nothing set COLI_CUDA without
+        # an explicit flag. Now that detection works, auto-enable the GPU when one
+        # is detected so `coli chat` Just Works. Scoped to Windows: Linux already
+        # has working detection + the explicit-flag UX, and changing bare-chat
+        # semantics there is out of scope. Falls back to CPU with a warning if
+        # nvidia-smi is missing (discover_gpus can't size VRAM without it).
+        # An explicit COLI_CUDA=0 in the environment must win over the implicit
+        # auto-enable: before this check, a Windows user setting COLI_CUDA=0 for
+        # a CPU baseline silently got a ~12.6 GB VRAM expert tier anyway (the
+        # engine's "CPU" rows were GPU-assisted). --gpu none remains the
+        # canonical hard off-switch (works on every platform, also clears the
+        # CUDA_* sizing vars).
+        if (sys.platform == "win32" and a.gpu is None and not a.vram
+                and e.get("COLI_CUDA") != "0"):
+            if cuda_binary():
+                from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
+                gpus = discover_gpus()
+                if gpus:
+                    e["COLI_CUDA"]="1"
+                    e.setdefault("COLI_GPUS", ",".join(str(g["index"]) for g in gpus))
+                    # Reuse the planner so the expert-tier VRAM budget is the real
+                    # free VRAM minus the 2 GB reserve — not a guess. Same machinery
+                    # as --auto-tier, just without requiring the user to pass it.
+                    ram,ctx,devices,vram_req = resource_request(a, e)
+                    try:
+                        plan=build_plan(a.model,ram,ctx,devices,vram_req,policy=a.policy)
+                        e.update(environment_for_plan(plan,e,cuda_enabled=True))
+                        vt=plan["tiers"]["vram"]
+                        names=",".join(g["name"].strip() for g in gpus)
+                        print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
+                              f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)
+                    except (OSError,ValueError,json.JSONDecodeError) as error:
+                        # Plan failed (e.g. model dir unreadable): don't block the
+                        # run, just leave the unsized COLI_CUDA=1 and let the engine
+                        # pick its own budget. Engine handles a missing budget.
+                        print(f"  {C.yel}[GPU] auto-enable: could not size VRAM ({error}); "
+                              f"using engine default{C.r}", file=sys.stderr)
+                else:
+                    print(f"  {C.yel}[GPU] coli_cuda.dll present but nvidia-smi not found on PATH "
+                          f"(cannot size VRAM); running CPU-only. Add nvidia-smi to PATH or pass "
+                          f"--vram N to enable CUDA.{C.r}", file=sys.stderr)
+            # else: CPU build (no coli_cuda.dll) — stay silent, CPU is correct.
+        elif e.get("COLI_CUDA") == "0":
+            # honoured off-switch: also drop stale device/sizing vars so the
+            # engine can't be re-enabled by leftovers (same as --gpu none).
+            e.pop("COLI_GPU",None); e.pop("COLI_GPUS",None)
+            e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
         # --gpu/--vram SENZA --auto-tier: prima venivano ignorati in silenzio e il run
         # partiva CPU-only senza alcun avviso — benchmark "GPU" pubblicati per errore (#121).
         if a.gpu is not None:
@@ -227,13 +298,13 @@ def env_for(a):
                 e["COLI_CUDA"]="0"; e.pop("CUDA_EXPERT_GB",None); e.pop("CUDA_DENSE",None)
             else:
                 if not cuda_binary():
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
                 e["COLI_CUDA"]="1"
                 if a.gpu!="auto": e["COLI_GPUS"]=a.gpu
                 e.setdefault("CUDA_DENSE","1")
         if a.vram and a.gpu!="none":
             if not cuda_binary():
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make glm CUDA=1 (this binary is CPU-only)")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} make colibri CUDA=1 (this binary is CPU-only)")
             e["COLI_CUDA"]="1"; e["CUDA_EXPERT_GB"]=str(a.vram)
     return e
 
@@ -407,8 +478,8 @@ def cmd_build(a):
     banner("build")
     if not os.path.exists(os.path.join(HERE, "Makefile")):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
-                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c glm.")
-    sys.exit(subprocess.call(["make","-C",HERE,"glm"]))
+                  f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
+    sys.exit(subprocess.call(["make","-C",HERE,"colibri"]))
 
 def cmd_info(a):
     banner("info")
@@ -480,8 +551,11 @@ def cmd_run(a):
     need_model(a.model)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run")
-    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink)
-    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>"
+    # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
+    # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
+    # <think> open so the engine emits its reasoning block; the default stays nothink.
+    tk="<think>" if os.environ.get("THINK","0")=="1" else "<think></think>"
+    e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
     sys.exit(subprocess.call([GLM, str(a.cap)], env=e))
 
 def server_probe(base, api_key=None, timeout=1.5):
@@ -534,7 +608,7 @@ def chat_attached(a, base, model_id):
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
-        print(f"\n  {C.teal}◆ colibrì{C.r}")
+        print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False
         try:
@@ -698,7 +772,7 @@ def cmd_chat(a):
                 p.stdin.write(b"\x02MORE\n"); p.stdin.flush()
             else:
                 p.stdin.write((msg.replace("\n"," ")+"\n").encode()); p.stdin.flush()
-            print(f"\n  {C.teal}◆ colibrì{C.r}")
+            print(f"\n  {C.teal}◆ colibri{C.r}")
             dec=codecs.getincrementaldecoder("utf-8")("replace")
             state={"first":True}
             def prefill_tick(path=errlog.name):
@@ -768,14 +842,9 @@ def cmd_serve(a):
     except OSError: pass
     from openai_server import serve
     try:
-        engine_env=env_for(a); engine_env["COLI_MODE"]="serve"
         serve(a.model, a.host, a.port, a.model_id, a.api_key,
-              a.cap,a.ngen,GLM,engine_env,a.cors_origin,
-              a.max_queue,a.queue_timeout,a.kv_slots,
-              expert_bits=a.expert_bits,dense_bits=a.dense_bits,
-              model_aliases=a.model_alias,hidden_model_aliases=a.hidden_model_alias,
-              context_length=a.context_length or a.ctx or None,
-              default_thinking=a.default_thinking)
+              a.cap,a.ngen,GLM,env_for(a),a.cors_origin,
+              a.max_queue,a.queue_timeout,a.kv_slots)
     finally:
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
@@ -803,13 +872,9 @@ def cmd_stop(a):
             if is_serve_argv(argv) and pid!=os.getpid():
                 if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
             comm=open(f"/proc/{pd}/comm").read().strip()
-            if comm in ("glm","exe","olmoe"):
-                env=dict(item.split(b"=",1) for item in
-                         open(f"/proc/{pd}/environ","rb").read().split(b"\0") if b"=" in item)
-                if (env.get(b"SERVE")==b"1" and env.get(b"COLI_MODE")==b"serve" and
-                        os.fsdecode(env.get(b"SNAP",b""))==a.model and
-                        not any(p==pid for p,_ in targets)):
-                    targets.append((pid,f"engine `{comm}` (serve, matching model)"))
+            if comm in ("colibri","glm","exe","olmoe"):
+                env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
+                if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
@@ -825,6 +890,7 @@ def cmd_stop(a):
     try: os.unlink(pf)
     except OSError: pass
     print(f"  {C.grn}✓ stopped{C.r} — RAM released")
+
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
     need_model(a.model)
@@ -910,7 +976,8 @@ def main():
     common.add_argument("--cap", type=int, default=8); common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
-    ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibrì — run GLM-5.2 locally")
+    ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
+    ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
@@ -928,38 +995,22 @@ def main():
     pc.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     ps=sub.add_parser("serve", parents=[common])
     ps.add_argument("--host",default="127.0.0.1"); ps.add_argument("--port",type=int,default=8000)
-    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2"))
-    ps.add_argument("--model-alias",action="append",default=[])
-    ps.add_argument("--hidden-model-alias",action="append",default=[])
-    ps.add_argument("--default-thinking",action="store_true",
-                    default=os.environ.get("COLI_THINK","0")=="1")
-    ps.add_argument("--context-length",type=int,
-                    default=int(os.environ.get("COLI_CONTEXT_LENGTH","0")) or None)
+    ps.add_argument("--model-id",default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))
     ps.add_argument("--api-key",default=os.environ.get("COLI_API_KEY"))
     ps.add_argument("--cors-origin",action="append",default=None)
     ps.add_argument("--max-queue",type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))
     ps.add_argument("--queue-timeout",type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))
     ps.add_argument("--kv-slots",type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))
-    ps.add_argument("--expert-bits",type=int,default=int(os.environ.get("COLI_EXPERT_BITS","8")))
-    ps.add_argument("--dense-bits",type=int,default=int(os.environ["COLI_DENSE_BITS"]) if os.environ.get("COLI_DENSE_BITS") else None)
     pst=sub.add_parser("stop", parents=[common], help="shut down a running coli serve and its engine")
     pst.add_argument("--port",type=int,default=8000); pst.add_argument("--dry-run",action="store_true")
     pw=sub.add_parser("web", parents=[common], help="serve + open the dashboard in a browser")
     for arg,kw in (("--host",dict(default="127.0.0.1")),("--port",dict(type=int,default=8000)),
-                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2"))),
-                   ("--model-alias",dict(action="append",default=[])),
-                   ("--hidden-model-alias",dict(action="append",default=[])),
-                   ("--default-thinking",dict(action="store_true",
-                                              default=os.environ.get("COLI_THINK","0")=="1")),
-                   ("--context-length",dict(type=int,
-                                            default=int(os.environ.get("COLI_CONTEXT_LENGTH","0")) or None)),
+                   ("--model-id",dict(default=os.environ.get("COLI_MODEL_ID","glm-5.2-colibri"))),
                    ("--api-key",dict(default=os.environ.get("COLI_API_KEY"))),
                    ("--cors-origin",dict(action="append",default=None)),
                    ("--max-queue",dict(type=int,default=int(os.environ.get("COLI_MAX_QUEUE","8")))),
                    ("--queue-timeout",dict(type=float,default=float(os.environ.get("COLI_QUEUE_TIMEOUT","300")))),
-                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1")))),
-                   ("--expert-bits",dict(type=int,default=int(os.environ.get("COLI_EXPERT_BITS","8")))),
-                   ("--dense-bits",dict(type=int,default=int(os.environ["COLI_DENSE_BITS"]) if os.environ.get("COLI_DENSE_BITS") else None))):
+                   ("--kv-slots",dict(type=int,default=int(os.environ.get("COLI_KV_SLOTS","1"))))):
         pw.add_argument(arg,**kw)
     pw.add_argument("--no-browser",action="store_true",help="don't auto-open the browser")
     pb=sub.add_parser("bench", parents=[common]); pb.add_argument("tasks", nargs="*")

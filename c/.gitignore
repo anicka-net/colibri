@@ -5,3 +5,5 @@ olmoe_i4/
 .build-config
 coli-native
 tests/fake_mux_engine
+tests/test_st_mirror
+tests/test_st_pread

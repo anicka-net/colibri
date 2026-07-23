@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static void add_tensor(shards *s,int *index,const char *name,int fd,int64_t off,
@@ -60,7 +60,8 @@ int main(void){
      * explicitly instead of falling through to the legacy packed-INT2 case. */
     {
         uint16_t rows[6]={0x3f80,0xc000,0x3f00,0x4040,0x0000,0xbf80};
-        Model em={0};em.c.hidden=3;em.embed.fmt=COLI_TENSOR_BF16;em.embed.bf16=rows;
+        Model em={0};em.c.hidden=3;em.embed.O=2;
+        em.embed.fmt=COLI_TENSOR_BF16;em.embed.bf16=rows;
         float out[3]={0};embed_row(&em,1,out);
         assert(out[0]==3.0f&&out[1]==0.0f&&out[2]==-1.0f);
     }
@@ -75,7 +76,7 @@ int main(void){
     }
     assert(n==12);fflush(file);
     ESlot slot={.eid=-1};
-    assert(expert_load_impl(&m,2,3,&slot,0)==0&&slot.eid==3);
+    assert(expert_load_impl(&m,2,3,&slot,0,1)==0&&slot.eid==3);
     assert_projection(&slot.g,7,5);assert_projection(&slot.u,7,5);assert_projection(&slot.d,5,7);
     int64_t logical=qt_bytes(&slot.g)+qt_bytes(&slot.u)+qt_bytes(&slot.d);
     assert(logical>0&&slot.slab_cap>=4096&&slot.fslab_cap==6);
@@ -84,18 +85,18 @@ int main(void){
     /* Native records use the same validated pread path in direct/mmap modes;
      * neither flag may reinterpret a native tensor as a legacy mapped record. */
     g_direct=1;g_mmap=1;
-    assert(expert_load_impl(&m,2,3,&slot,0)==0);
+    assert(expert_load_impl(&m,2,3,&slot,0,1)==0);
     assert_projection(&slot.g,7,5);expert_lru_release(&slot);g_direct=g_mmap=0;
 
     /* Metadata corruption is rejected before allocation. */
     m.S.t[1].dtype=2;
-    assert(expert_load_impl(&m,2,3,&slot,0)==-1&&!slot.slab);
+    assert(expert_load_impl(&m,2,3,&slot,0,1)==-1&&!slot.slab);
     m.S.t[1].dtype=3;
 
     /* A shard shortened underneath live descriptors must report failure and
      * never publish the expert id or a partially initialized QT. */
     assert(ftruncate(fd,m.S.t[11].off+2)==0);
-    assert(expert_load_impl(&m,2,3,&slot,0)==-1&&slot.eid==-1);
+    assert(expert_load_impl(&m,2,3,&slot,0,1)==-1&&slot.eid==-1);
     assert(!slot.g.q4&&!slot.u.q4&&!slot.d.q4);
     expert_lru_release(&slot);
     for(int i=0;i<m.S.n;i++)free(m.S.t[i].name);free(m.S.t);

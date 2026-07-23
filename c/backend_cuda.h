@@ -39,6 +39,9 @@ COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *expert
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
 /* Upload without executing, so capacity failures happen during model startup. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
+        const void *weights, const float *scales,
+        int fmt, int I, int O, int device, int gs);
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
@@ -60,13 +63,14 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_host_nvfp4(ColiCudaTensor **tensor
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.
  * fmt is a ColiTensorFormat from tensor_format.h.
- * The first successful call uploads W and its row scales; later calls reuse it.
+ * gs is the group size for fmt=4 (0 for all other formats).
+ * The first successful call uploads W and its scales; later calls reuse it.
  * Returns 1 on success and 0 when CUDA is not initialized or the format is invalid.
  */
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul(ColiCudaTensor **tensor,
                      float *y, const float *x,
                      const void *weights, const float *scales,
-                     int fmt, int S, int I, int O, int device);
+                     int fmt, int S, int I, int O, int device, int gs);
 COLI_CUDA_DLLEXPORT int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
                      float *y, const float *x, const uint8_t *weights,
                      const uint8_t *block_scales, float tensor_scale,
@@ -97,6 +101,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate, ColiCud
 
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
+/* Async issue/take split of the group call below (Inc.4): issue launches on the
+ * device stream and returns; take syncs and returns the pinned result rows (valid
+ * until the next issue on that device). Small totals only (<=8 rows); one
+ * outstanding issue per device. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+                               ColiCudaTensor *const *ups,
+                               ColiCudaTensor *const *downs,
+                               const int *rows, int count, const float *x);
+COLI_CUDA_DLLEXPORT const float *coli_cuda_expert_group_take(int device);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                            ColiCudaTensor *const *ups,
                            ColiCudaTensor *const *downs,
@@ -127,7 +141,8 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch(ColiCudaTensor *kv_b,C
                                       int V,int K,int T,float attention_scale);
 
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_ragged(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
-        float *out,const float *q,const float *const *latent,const float *const *rope,
+        float *out,const float *q,const void *const *keys,
+        const float *const *latent,const float *const *rope,
         const int *lengths,int S,int H,int Q,int R,int V,int K,int max_t,float attention_scale);
 
 COLI_CUDA_DLLEXPORT void coli_cuda_tensor_free(ColiCudaTensor *tensor);
@@ -233,6 +248,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rmsnorm_s(int device,float *y_dev,const f
                              int xstride,int ystride);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_rope_base(int device,float *v_dev,int pos_base,int rows,
                              int stride,int offset,int R,int heads,float theta);
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gates,
+        ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
+        const float *weights, int count,
+        int home_device, const float *x_src_dev, float *partial_slot_dev);
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_group_resident_take(int home_device,const int *devices,
+        int n_issued,float *slots_dev,float *acc_dev,int D);
+COLI_CUDA_DLLEXPORT int coli_cuda_pipe_router(int device,const float *x_dev,
+        const void *rw_dev,const void *rb_dev,int D,int E,int Ksel,
+        float topp,int norm_topk,float routed_scale,
+        int *idx_host,float *w_host,int *keff_host);
 COLI_CUDA_DLLEXPORT int coli_cuda_pipe_copy2d(int device,float *dst,int dpitch,const float *src,
                           int spitch,int width,int height);
 COLI_CUDA_DLLEXPORT int coli_cuda_attention_project_batch_dev(ColiCudaTensor *kv_b,ColiCudaTensor *o_proj,
