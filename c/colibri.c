@@ -2715,6 +2715,22 @@ static int expert_is_resident(Model *m, int layer, int eid){
     return 0;
 }
 
+/* I loop di selezione top-K partono da best=-1 e lo usano come indice appena il
+ * giro finisce. Se OGNI punteggio candidato e' non finito nessun confronto riesce
+ * (NaN>bv e' falso) e best resta -1: logit[-1] e' una lettura fuori range, e
+ * idx[]=-1 si propaga a eusage/eheat/elast (tre scritture heap a indice -1) e al
+ * VLA seen[] (underflow di stack). Non e' teorico: c/tests/test_logit_nan.c
+ * documenta NaN/Inf nei logit da un tile expert corrotto o da un overflow fp al
+ * confine di eviction, e ha indurito solo il lato sampling — il router e' a monte.
+ * Qui degradiamo a una scelta deterministica e avvisiamo una volta sola. */
+static int router_best_or_fallback(int best, int kk, int E, int layer){
+    if(best>=0) return best;
+    static int warned;
+    if(!warned){ warned=1;
+        fprintf(stderr,"[router] logits non finiti al layer %d: selezione degradata\n",layer); }
+    return kk<E ? kk : 0;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -2761,6 +2777,23 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         memcpy(idxs,g_pre_idx,(size_t)S*K*sizeof(int));
         memcpy(ws,g_pre_w,(size_t)S*K*sizeof(float));
         memcpy(keff,g_pre_keff,(size_t)S*sizeof(int));
+        /* Stessa classe di difetto dal lato GPU: un risultato di routing malformato
+         * (keff oltre K, id expert fuori range) indicizzerebbe gli stessi array
+         * eusage/eheat/elast e il VLA seen[] di FASE B. Meglio sanificare qui una
+         * volta che fidarsi del device. */
+        for(int s=0;s<S;s++){
+            if(keff[s]<0) keff[s]=0;
+            if(keff[s]>K) keff[s]=K;
+            for(int kk=0;kk<keff[s];kk++){
+                int e=idxs[(int64_t)s*K+kk];
+                if(e<0||e>=E){
+                    static int warned_pre;
+                    if(!warned_pre){ warned_pre=1;
+                        fprintf(stderr,"[router] indice expert %d fuori range al layer %d: azzerato\n",e,layer); }
+                    idxs[(int64_t)s*K+kk]=0;
+                }
+            }
+        }
         for(int s=0;s<S;s++){
             m->ereq+=keff[s];
             for(int kk=0;kk<keff[s];kk++){
@@ -2802,6 +2835,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int kk=0;kk<Mmax;kk++){ int best=-1; float bv=-1e30f;
                     for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
                         if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                    best=router_best_or_fallback(best,kk,E,layer);
                     rank_buf[kk]=best; rank_w[kk]=logit[best];
                 }
                 float tot=1e-20f; for(int kk=0;kk<Mmax;kk++) tot+=rank_w[kk]>0?rank_w[kk]:0;
@@ -2813,6 +2847,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int kk=0;kk<Mwin;kk++){ int best=-1; float bv=-1e30f;
                     for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(rank_buf[j]==e){tk=1;break;}
                         if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                    best=router_best_or_fallback(best,kk,E,layer);
                     rank_buf[kk]=best; rank_w[kk]=logit[best];
                 }
             }
@@ -2881,6 +2916,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
                 for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
                     if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                best=router_best_or_fallback(best,kk,E,layer);
                 idx[kk]=best; w[kk]=logit[best];
             }
             if(g_route_agree){
