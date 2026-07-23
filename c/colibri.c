@@ -1617,12 +1617,14 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
         }
         if(!scales_valid){
             /* Validate every FP8 scale byte before the record's first publication. */
-            for(int64_t z=0;z<sb;z++){float v=coli_e4m3fn_f32(native_scales[k][z]);
+            for(int64_t z=0;z<sb;z++){
                 /* CUTLASS padding bytes are zero; logical scale positions must be positive. */
-                if(isnan(v)){fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
+                if(!coli_e4m3fn_raw_is_finite(native_scales[k][z])){
+                    fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
             for(int o=0;o<OO[k];o++)for(int g=0;g<(II[k]+15)/16;g++){
-                float v=coli_e4m3fn_f32(native_scales[k][coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
-                if(!isfinite(v)||v<=0){fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
+                uint8_t v=native_scales[k][coli_nvfp4_cutlass_scale_offset(o,g,II[k])];
+                if(!coli_e4m3fn_raw_is_positive(v)){
+                    fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
         }
         total+=wb+sb+8;
     }
@@ -2176,11 +2178,11 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
                 return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
             if(!scales_valid){
-                for(int64_t z=0;z<sb;z++) if(isnan(coli_e4m3fn_f32(bs[z])))
+                for(int64_t z=0;z<sb;z++) if(!coli_e4m3fn_raw_is_finite(bs[z]))
                     return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
                 for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
-                    float v=coli_e4m3fn_f32(bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])]);
-                    if(!isfinite(v)||v<=0)
+                    uint8_t v=bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])];
+                    if(!coli_e4m3fn_raw_is_positive(v))
                         return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
                 }
             }

@@ -17,6 +17,14 @@ int main(void) {
     if (!near(coli_e4m3fn_f32(0x01), ldexpf(1.0f,-9)) ||
         !near(coli_e4m3fn_f32(0x7e), 448.0f) ||
         !isnan(coli_e4m3fn_f32(0x7f))) return 2;
+    if (!coli_e4m3fn_raw_is_finite(0x00) ||
+        !coli_e4m3fn_raw_is_finite(0x7e) ||
+        coli_e4m3fn_raw_is_finite(0x7f) ||
+        coli_e4m3fn_raw_is_finite(0xff) ||
+        coli_e4m3fn_raw_is_positive(0x00) ||
+        !coli_e4m3fn_raw_is_positive(0x01) ||
+        !coli_e4m3fn_raw_is_positive(0x7e) ||
+        coli_e4m3fn_raw_is_positive(0x81)) return 15;
 
     uint16_t bf16[] = {0x3f80, 0x4000, 0x4040, 0x4080};
     float bx[] = {2, -1}, by[2];

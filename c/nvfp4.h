@@ -25,6 +25,17 @@ static inline float coli_e4m3fn_f32(uint8_t value) {
     return sign * magnitude;
 }
 
+/* Bit-level predicates avoid an ldexpf conversion in loader validation.
+ * E4M3FN has exactly two NaN encodings (0x7f/0xff); native block scales
+ * must additionally be positive and nonzero at every logical position. */
+static inline int coli_e4m3fn_raw_is_finite(uint8_t value) {
+    return (value & 0x7f) != 0x7f;
+}
+
+static inline int coli_e4m3fn_raw_is_positive(uint8_t value) {
+    return value > 0 && value <= 0x7e;
+}
+
 static inline uint8_t coli_f32_e4m3fn_positive(float value) {
     if(!isfinite(value)||value<=0.f)return 0;
     if(value>=448.f)return 0x7e;
