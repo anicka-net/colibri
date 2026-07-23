@@ -179,7 +179,13 @@ def main():
     threading.Thread(target=_drain_stderr, daemon=True).start()
     for line in proc.stdout:
         line = line.strip()
-        if not line or line[0] not in "-0123456789": continue
+        if not line: continue
+        if line[0] not in "-0123456789":
+            # SCORE profiling is emitted on stdout by the engine. Preserve it
+            # in benchmark logs instead of silently discarding the phase
+            # breakdown while still parsing numeric score records below.
+            print(f"  [engine] {line}", file=sys.stderr)
+            continue
         parts = line.split()
         if n_done >= len(reqs): break
         try: logprob = float(parts[0])
