@@ -1550,6 +1550,24 @@ static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag
     }
     return 0;
 }
+
+static int native_nvfp4_scales_valid(const uint8_t *scales,int64_t n,int O,int I){
+    /* Production GLM projections exactly fill CUTLASS 128x64 scale tiles, so
+     * every physical byte is a logical scale. Validate that common case in
+     * one linear pass; odd synthetic/future shapes retain padding-aware checks. */
+    if(!(O&127)&&!(I&63)){
+        for(int64_t z=0;z<n;z++)
+            if(!coli_e4m3fn_raw_is_positive(scales[z]))return 0;
+        return 1;
+    }
+    for(int64_t z=0;z<n;z++)
+        if(!coli_e4m3fn_raw_is_finite(scales[z]))return 0;
+    for(int o=0;o<O;o++)for(int g=0;g<(I+15)/16;g++)
+        if(!coli_e4m3fn_raw_is_positive(
+            scales[coli_nvfp4_cutlass_scale_offset(o,g,I)]))return 0;
+    return 1;
+}
+
 static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288],int fatal){
     Cfg *c=&m->c; int I=c->moe_inter,D=c->hidden;
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
@@ -1616,15 +1634,10 @@ static int expert_load_native(Model *m,int layer,int eid,ESlot *s,char nm[3][288
             if(fatal)exit(1);return -1;
         }
         if(!scales_valid){
-            /* Validate every FP8 scale byte before the record's first publication. */
-            for(int64_t z=0;z<sb;z++){
-                /* CUTLASS padding bytes are zero; logical scale positions must be positive. */
-                if(!coli_e4m3fn_raw_is_finite(native_scales[k][z])){
-                    fprintf(stderr,"NaN native NVFP4 scale\n");if(fatal)exit(1);return -1;}}
-            for(int o=0;o<OO[k];o++)for(int g=0;g<(II[k]+15)/16;g++){
-                uint8_t v=native_scales[k][coli_nvfp4_cutlass_scale_offset(o,g,II[k])];
-                if(!coli_e4m3fn_raw_is_positive(v)){
-                    fprintf(stderr,"nonpositive native NVFP4 logical scale\n");if(fatal)exit(1);return -1;}}
+            if(!native_nvfp4_scales_valid(native_scales[k],sb,OO[k],II[k])){
+                fprintf(stderr,"invalid native NVFP4 block scale\n");
+                if(fatal)exit(1);return -1;
+            }
         }
         total+=wb+sb+8;
     }
@@ -2177,15 +2190,8 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
             float ts=s->fslab[k*2],is=s->fslab[k*2+1];
             if(!isfinite(ts)||ts<=0||ts>=1||!isfinite(is)||is<=0)
                 return uring_load_error(l,EINVAL,"invalid native NVFP4 tensor/input scale");
-            if(!scales_valid){
-                for(int64_t z=0;z<sb;z++) if(!coli_e4m3fn_raw_is_finite(bs[z]))
-                    return uring_load_error(l,EINVAL,"NaN native NVFP4 block scale");
-                for(int o=0;o<OO[k];o++) for(int g=0;g<(II[k]+15)/16;g++){
-                    uint8_t v=bs[coli_nvfp4_cutlass_scale_offset(o,g,II[k])];
-                    if(!coli_e4m3fn_raw_is_positive(v))
-                        return uring_load_error(l,EINVAL,"nonpositive native NVFP4 logical scale");
-                }
-            }
+            if(!scales_valid&&!native_nvfp4_scales_valid(bs,sb,OO[k],II[k]))
+                return uring_load_error(l,EINVAL,"invalid native NVFP4 block scale");
             qt[k]->qf=NULL;qt[k]->q8=NULL;qt[k]->bf16=NULL;qt[k]->s=NULL;
             qt[k]->fmt=COLI_TENSOR_MODELOPT_NVFP4;qt[k]->O=OO[k];qt[k]->I=II[k];
             qt[k]->gs=COLI_NVFP4_GROUP_SIZE;qt[k]->q4=s->slab+l->pos[k];
