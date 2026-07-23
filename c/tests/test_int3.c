@@ -51,6 +51,25 @@ int main(void){
     static uint8_t q3[(int64_t)O*(MAXI/64+1)*24];
     static float   sc[(int64_t)O*(MAXI/64+1)];
 
+    /* Resident BF16 tensors also use these row helpers in MLA absorption.
+     * Falling through to the packed-int2 case dereferences q4/s (both NULL)
+     * as soon as a reused SCORE prefix evaluates a short continuation. */
+    {
+        enum { BI=4, BO=3 };
+        float wf[BO*BI]={1.f,-2.f,.5f,4.f, -1.f,3.f,2.f,-.5f, 2.f,1.f,-3.f,.25f};
+        uint16_t wb[BO*BI];
+        for(int i=0;i<BO*BI;i++){ uint32_t u; memcpy(&u,&wf[i],4); wb[i]=(uint16_t)(u>>16); }
+        QT t={0}; t.fmt=COLI_TENSOR_BF16; t.O=BO; t.I=BI; t.bf16=wb;
+        float acc[BI]={0}, xv[BI]={.25f,-1.f,2.f,.5f}, yr[2];
+        qt_addrow(&t,1,.5f,acc);
+        for(int i=0;i<BI;i++) CHECK(acc[i]==.5f*wf[BI+i]);
+        qt_matvec_rows(&t,1,2,xv,yr);
+        for(int j=0;j<2;j++){ float ref=0;
+            for(int i=0;i<BI;i++)ref+=wf[(j+1)*BI+i]*xv[i];
+            CHECK(yr[j]==ref);
+        }
+    }
+
     for(unsigned c=0;c<sizeof Is/sizeof *Is;c++){
         int I=Is[c];
         for(int64_t i=0;i<(int64_t)O*I;i++) w[i]=rndf()*0.05f;
