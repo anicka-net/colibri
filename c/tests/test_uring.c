@@ -66,6 +66,54 @@ static int test_expert_layout(int fd){
     return bad?fail("pilot uring publication"):0;
 }
 
+static int test_native_component_layout(int fd){
+    Model m={0};ESlot slot={0};UringBatch batch={0};
+    m.c.hidden=4;m.c.moe_inter=3;m.manifest.present=1;m.manifest.component_alignment=16;
+    m.S.n=12;m.S.cap=12;m.S.t=calloc(12,sizeof(st_tensor));
+    if(!m.S.t)return fail("native metadata allocation");
+    const char *proj[3]={"gate_proj","up_proj","down_proj"};
+    int O[3]={3,3,4},I[3]={4,4,3};int n=0;off_t cursor=4096;
+    for(int k=0;k<3;k++){
+        char base[300],name[340];snprintf(base,sizeof(base),
+            "model.layers.1.mlp.experts.7.%s.weight",proj[k]);
+        int64_t wb=(int64_t)O[k]*((I[k]+1)/2);
+        int64_t sb=(int64_t)coli_nvfp4_cutlass_scale_bytes(O[k],I[k]);
+        cursor=(cursor+15)&~15;unsigned char *w=malloc((size_t)wb);memset(w,0x11+k,(size_t)wb);
+        if(pwrite(fd,w,(size_t)wb,cursor)!=wb)return fail("native weight fixture");
+        m.S.t[n++]=(st_tensor){strdup(base),fd,cursor,wb,3,wb};free(w);cursor+=wb;
+        cursor=(cursor+15)&~15;unsigned char *s=malloc((size_t)sb);memset(s,0x38,(size_t)sb);
+        snprintf(name,sizeof(name),"%s.nvfp4_scale",base);
+        if(pwrite(fd,s,(size_t)sb,cursor)!=sb)return fail("native scale fixture");
+        m.S.t[n++]=(st_tensor){strdup(name),fd,cursor,sb,3,sb};free(s);cursor+=sb;
+        float ts=.5f,is=1.25f;
+        cursor=(cursor+15)&~15;snprintf(name,sizeof(name),"%s.nvfp4_tensor_scale",base);
+        if(pwrite(fd,&ts,4,cursor)!=4)return fail("native tensor scale fixture");
+        m.S.t[n++]=(st_tensor){strdup(name),fd,cursor,4,2,1};cursor+=4;
+        cursor=(cursor+15)&~15;snprintf(name,sizeof(name),"%s.nvfp4_input_scale",base);
+        if(pwrite(fd,&is,4,cursor)!=4)return fail("native input scale fixture");
+        m.S.t[n++]=(st_tensor){strdup(name),fd,cursor,4,2,1};cursor+=4;
+    }
+    if(ftruncate(fd,(cursor+4095)&~4095))return fail("native fixture truncate");
+    if(uring_batch_init(&batch))return fail("native ring init");
+    uring_batch_reset(&batch);int li=uring_load_add(&batch,&m,1,7,&slot,1);
+    if(li!=0||!batch.load[li].native_direct||batch.load[li].iobuf||
+       uring_submit_batch(&batch)||uring_finalize_load(&batch,li,1))
+        return fail("native direct record load");
+    int bad=slot.eid!=7||slot.g.fmt!=COLI_TENSOR_MODELOPT_NVFP4||
+        ((uintptr_t)slot.g.q4&15)||((uintptr_t)slot.g.block_scales&15)||
+        ((uintptr_t)slot.u.q4&15)||((uintptr_t)slot.u.block_scales&15)||
+        ((uintptr_t)slot.d.q4&15)||((uintptr_t)slot.d.block_scales&15)||
+        slot.g.tensor_scale!=.5f||slot.g.input_scale!=1.25f;
+    coli_uring_close(&batch.ring);compat_aligned_free(slot.slab);free(slot.fslab);
+    UringBatch malformed={0};ESlot rejected={0};m.S.t[4].off+=4;
+    if(uring_batch_init(&malformed))return fail("malformed native ring init");
+    uring_batch_reset(&malformed);li=uring_load_add(&malformed,&m,1,7,&rejected,0);
+    bad|=li!=0||malformed.load[li].error!=EINVAL||rejected.slab!=NULL;
+    coli_uring_close(&malformed.ring);
+    for(int i=0;i<m.S.n;i++)free(m.S.t[i].name);free(m.S.t);
+    return bad?fail("native direct tensor views"):0;
+}
+
 int main(void){
     char path[]="/tmp/coli-uring-XXXXXX";
     int fd=mkstemp(path); if(fd<0) return fail("mkstemp");
@@ -111,7 +159,8 @@ int main(void){
         coli_uring_close(&ring); close(fd); return fail("read data mismatch");
     }
     coli_uring_close(&ring);
-    if(ftruncate(fd,0) || test_expert_layout(fd)){ close(fd); return 1; }
+    if(ftruncate(fd,0) || test_expert_layout(fd) ||
+       ftruncate(fd,0) || test_native_component_layout(fd)){ close(fd); return 1; }
     close(fd);
     puts("test_uring: ok"); return 0;
 }

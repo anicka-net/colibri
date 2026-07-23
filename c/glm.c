@@ -2262,7 +2262,7 @@ typedef struct {
     int64_t pos[3],scale_pos[3],tensor_pos[3],input_pos[3];
     int64_t src_pos[3],src_scale_pos[3];
     void *iobuf; size_t iobuf_cap;
-    int native,native_coalesced;
+    int native,native_coalesced,native_direct;
     int pending,done,finalized,error;
 } UringLoad;
 typedef struct {
@@ -2331,11 +2331,25 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         st_tensor *part[12];int np=0;
         for(int k=0;k<3;k++){part[np++]=l->tw[k];part[np++]=l->tq[k];part[np++]=l->tt[k];part[np++]=l->ti[k];}
         for(int a=0;a<np;a++)for(int z=a+1;z<np;z++)if(part[z]->off<part[a]->off){st_tensor *t=part[a];part[a]=part[z];part[z]=t;}
-        int contiguous=1;for(int a=1;a<np;a++)if(part[a]->fd!=part[0]->fd||
-            part[a-1]->off+part[a-1]->nbytes!=part[a]->off)contiguous=0;
+        int contiguous=1,ordered=1;for(int a=1;a<np;a++){
+            if(part[a]->fd!=part[0]->fd||part[a-1]->off+part[a-1]->nbytes!=part[a]->off)
+                contiguous=0;
+            if(part[a]->fd!=part[0]->fd||part[a-1]->off+part[a-1]->nbytes>part[a]->off)
+                ordered=0;
+        }
         int64_t record_off=part[0]->off;
         int64_t record_span=part[np-1]->off+part[np-1]->nbytes-record_off;
-        if(contiguous){slab_need=record_span;l->native_coalesced=1;}
+        int component_aligned=m->manifest.component_alignment==16&&ordered&&
+                              (record_off&4095)==0;
+        if(component_aligned)for(int k=0;k<3;k++)
+            if((l->tw[k]->off&15)||(l->tq[k]->off&15)||
+               (l->tt[k]->off&15)||(l->ti[k]->off&15))component_aligned=0;
+        if(m->manifest.component_alignment==16&&!component_aligned)
+            return uring_load_error(l,EINVAL,
+                "native NVFP4 record violates declared component alignment"),li;
+        if(contiguous||component_aligned){
+            slab_need=record_span;l->native_coalesced=1;l->native_direct=component_aligned;
+        }
         if(!s->slab||slab_need>s->slab_cap){
             compat_aligned_free(s->slab);s->slab=NULL;s->slab_cap=0;
             size_t alloc=((size_t)slab_need+4095)&~(size_t)4095;
@@ -2348,23 +2362,30 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
             if(!s->fslab) return uring_load_error(l,ENOMEM,"io_uring native scalar slab"),li;
             numa_slab_bind(s->fslab,6*sizeof(float));
         }
-        if(contiguous){
+        if(contiguous||component_aligned){
             size_t packed=0;
             for(int k=0;k<3;k++){
                 l->src_pos[k]=l->tw[k]->off-record_off;
                 l->src_scale_pos[k]=l->tq[k]->off-record_off;
-                packed=(packed+15)&~(size_t)15;l->pos[k]=(int64_t)packed;packed+=(size_t)l->tw[k]->nbytes;
-                packed=(packed+15)&~(size_t)15;l->scale_pos[k]=(int64_t)packed;packed+=(size_t)l->tq[k]->nbytes;
+                if(component_aligned){
+                    l->pos[k]=l->src_pos[k];l->scale_pos[k]=l->src_scale_pos[k];
+                }else{
+                    packed=(packed+15)&~(size_t)15;l->pos[k]=(int64_t)packed;packed+=(size_t)l->tw[k]->nbytes;
+                    packed=(packed+15)&~(size_t)15;l->scale_pos[k]=(int64_t)packed;packed+=(size_t)l->tq[k]->nbytes;
+                }
                 l->tensor_pos[k]=l->tt[k]->off-record_off;l->input_pos[k]=l->ti[k]->off-record_off;
             }
-            if(packed>s->slab_cap)
+            if(!component_aligned&&packed>(size_t)s->slab_cap)
                 return uring_load_error(l,EOVERFLOW,"io_uring native packed expert slab"),li;
             int dfd=g_direct?st_direct_fd(&m->S,part[0]->fd):-1;
             size_t len=dfd>=0?(((size_t)record_span+4095)&~(size_t)4095):(size_t)record_span;
-            if(posix_memalign(&l->iobuf,4096,(len+4095)&~(size_t)4095))
-                return uring_load_error(l,ENOMEM,"io_uring native record staging"),li;
-            l->iobuf_cap=(len+4095)&~(size_t)4095;
-            if(uring_add_read(b,li,dfd>=0?dfd:part[0]->fd,l->iobuf,len,record_off,(size_t)record_span))
+            void *read_buf=s->slab;
+            if(!component_aligned){
+                if(posix_memalign(&l->iobuf,4096,(len+4095)&~(size_t)4095))
+                    return uring_load_error(l,ENOMEM,"io_uring native record staging"),li;
+                l->iobuf_cap=(len+4095)&~(size_t)4095;read_buf=l->iobuf;
+            }
+            if(uring_add_read(b,li,dfd>=0?dfd:part[0]->fd,read_buf,len,record_off,(size_t)record_span))
                 return uring_load_error(l,errno,"io_uring native coalesced record read"),li;
             return li;
         }
@@ -2494,10 +2515,13 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         int64_t total=0;
         for(int k=0;k<3;k++){
             if(l->native_coalesced){
-                memcpy(s->slab+l->pos[k],(uint8_t*)l->iobuf+l->src_pos[k],(size_t)l->tw[k]->nbytes);
-                memcpy(s->slab+l->scale_pos[k],(uint8_t*)l->iobuf+l->src_scale_pos[k],(size_t)l->tq[k]->nbytes);
-                memcpy(&s->fslab[k*2],(uint8_t*)l->iobuf+l->tensor_pos[k],4);
-                memcpy(&s->fslab[k*2+1],(uint8_t*)l->iobuf+l->input_pos[k],4);
+                uint8_t *record=l->native_direct?s->slab:(uint8_t*)l->iobuf;
+                if(!l->native_direct){
+                    memcpy(s->slab+l->pos[k],record+l->src_pos[k],(size_t)l->tw[k]->nbytes);
+                    memcpy(s->slab+l->scale_pos[k],record+l->src_scale_pos[k],(size_t)l->tq[k]->nbytes);
+                }
+                memcpy(&s->fslab[k*2],record+l->tensor_pos[k],4);
+                memcpy(&s->fslab[k*2+1],record+l->input_pos[k],4);
             }
             uint8_t *bs=s->slab+l->scale_pos[k]; int64_t sb=l->tq[k]->nbytes;
             float ts=s->fslab[k*2],is=s->fslab[k*2+1];
@@ -2629,7 +2653,9 @@ static void pipe_init(Model *m){
     if(g_uring){
         if(uring_batch_init(&g_ub_pipe)){ perror("URING=1 io_uring_setup"); exit(1); }
         if(m->manifest.present)
-            fprintf(stderr,"[NVFP4] complete-record io_uring loader active\n");
+            fprintf(stderr,m->manifest.component_alignment==16
+                ?"[NVFP4] component-aligned io_uring direct-to-slab loader active\n"
+                :"[NVFP4] compatibility-staged complete-record io_uring loader active\n");
         g_pp.m=m; g_pp.started=1; return;
     }
 #endif

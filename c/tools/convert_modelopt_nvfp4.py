@@ -243,7 +243,7 @@ def main() -> None:
         expert_records = merge_expert_records(pending, fragments)
         if expert_records:
             payload=shared/f"experts-{index+args.index_offset:05d}.safetensors"
-            offsets=nf.write_aligned_safetensors(payload,expert_records)
+            offsets=nf.write_aligned_safetensors(payload,expert_records,component_alignment=16)
             if any(offset%4096 for offset in offsets.values()): raise AssertionError("unaligned expert record")
             link_exact(payload,faithful/payload.name); link_exact(payload,compact/payload.name)
         if faithful_tensors:

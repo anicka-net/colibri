@@ -961,6 +961,18 @@ the repack copy and its UVM/page-placement pressure. Measure staging-copy CPU,
 UVM worker CPU, achieved NVMe bandwidth, and end-to-end miss latency before
 deciding whether to regenerate the 427-GB shared payload.
 
+Implemented on the NVFP4 branch as `component-aligned-v2`: every one of the 12
+components in an expert record starts at a 16-byte boundary, records remain
+4-KiB aligned, and the manifest advertises both properties. Legacy v1 payloads
+retain the staged compatibility path; v2 records are read by one io_uring
+operation directly into the persistent host-backed slab. The byte-preserving
+rewrite tool only regenerates Safetensors headers and inserts padding—there is
+no dequantization or scale conversion—and hard-links the rewritten payload into
+faithful/compact trees. CPU gates: all C tests and 134 Python/API tests pass; a
+real 3,024-tensor shard passed dtype/shape/length checks, 16-byte address checks,
+and leading/trailing-byte comparison. GB10 end-to-end performance remains to be
+remeasured after the rewritten payload reaches Pondermatic.
+
 The first staged cap-16 measurement also held `UVM GPU1 BH` at 0% while the
 main process used roughly 1.25 CPU cores and the SSD delivered about 1.0--1.1
 GB/s. Besides the repack memcpy, native load finalization currently rescans
