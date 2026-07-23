@@ -70,6 +70,24 @@ threshold tuning must use a frozen, warmed `.coli_usage` state.  Keep FP8 KV
 opt-in outside the validated Spark profile until the quality and 32k gates are
 complete.
 
+The faithful BF16 resident path must run on CUDA on GB10.  Before it did, the
+scalar CPU fallback put 230.5 s in attention and 139.4 s in the output
+projection during a 367 s SCORE smoke.  Automatic CUDA placement reduced the
+same nine-request smoke from 1,017 s to 104 s (**9.8x**), with a planner peak of
+105.7 GB and approximately 63 GB RSS plus 33.3 GiB reported CUDA allocation.
+Registering the pageable host expert slabs did not help the production NVFP4
+shapes (steady 0.069--0.073 ms either way), so pageable wrapping remains the
+measured choice.
+
+Long SCORE prompts exposed a separate dispatch boundary: host-backed experts
+were wrapped for CUDA only behind the grouped-prefill gate.  With
+`COLI_CUDA_PREFILL=0`, an `S=339` request therefore remained in the scalar
+W4A32 oracle at layer 1 for more than nine minutes with 0% GPU use.  Native
+NVFP4 host wrapping is now independent of that gate; under the same explicit
+`COLI_CUDA_PREFILL=0` control it completed the first request in about two
+minutes and advanced steadily through all 78 layers.  The broader frozen
+quality rungs remain the release gate.
+
 Rejected dispatch/build thresholds are intentionally visible.  Plain `sm_121`
 cannot launch the CUTLASS architecture-conditional MMA and is rejected in favor
 of `sm_121a`.  For prefill, native NVFP4 is engaged while resident BF16 selected
