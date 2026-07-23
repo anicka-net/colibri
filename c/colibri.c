@@ -4238,7 +4238,13 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
            l->kv_a.cuda_device==l->kv_b.cuda_device&&l->o.cuda_device==l->kv_b.cuda_device){
             int dev=l->kv_b.cuda_device, ok=1;
             float *dst=coli_cuda_pipe_scratch(dev,15,xb);
-            if(dst){
+            /* Ogni uscita dalla residenza deve riportare il residuo su host PRIMA di
+             * lasciare il layer al percorso CPU: x host e' STALE finche' x_dev_on>=0,
+             * quindi scaricare e' l'unico modo di non calcolare su uno stato vecchio. */
+            if(!dst){
+                /* niente scratch su questo device: si cade sul percorso CPU qui sotto */
+                if(x_dev_on>=0){ coli_cuda_pipe_download(x_dev_on,x_dev,x,xb); x_dev_on=-1; }
+            } else {
                 if(x_dev_on<0) ok=coli_cuda_pipe_upload(dev,dst,x,xb);
                 else if(x_dev_on!=dev){
                     double tp=g_prof?now_s():0;
@@ -4253,7 +4259,14 @@ static void layers_forward_rows(Model *m, float *x, int S, int pos_base,
                     coli_cuda_pipe_peer_copy(dev,x_dev,dev,coli_cuda_pipe_scratch(dev,14,xb),xb);
                     coli_cuda_pipe_download(dev,x_dev,x,xb);
                     x_dev_on=-1;
-                }else x_dev_on=-1;
+                }else{
+                    /* upload o peer-copy fallita (P2P disabilitato, rifiuto del driver,
+                     * NVLink giu'). Se la residenza era attiva il dato autorevole e'
+                     * ancora sul device PRECEDENTE, non in dst: va scaricato da li'.
+                     * Con x_dev_on<0 ha fallito l'upload e x host e' gia' autorevole. */
+                    if(x_dev_on>=0) coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
+                    x_dev_on=-1;
+                }
             }
         } else if(x_dev_on>=0){                 /* layer fuori pipe: il residuo torna a casa */
             coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
