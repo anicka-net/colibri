@@ -133,6 +133,51 @@ attention remains on the generic kernel; for decode, S=1 stays on the measured
 generic/chain path rather than forcing a CUTLASS grouped launch whose setup cost
 has not yet won at one row.
 
+### NVFP4 rollout priority and follow-on topology
+
+The first product gate remains **acceptable speed and accuracy on one GB10
+Spark**.  Do not hide a weak single-node result behind tensor parallelism or
+additional hardware.  Finish faithful and compact quality comparisons, frozen
+single-Spark prefill/decode measurements, native/fallback accounting, FP8-KV
+long-context validation, and the deterministic tool/agent suite before making
+multi-Spark work a release dependency.  Report cache hit rate, expert bytes
+fetched, felt I/O wait, native engagement, and KV footprint together; a kernel
+throughput number without the storage path is not a single-Spark result.
+
+After that gate, investigate routing-aware hybrid precision.  The independent
+`jarrelscy/GLM-5.2-NVFP4-AQLM-hybrid` checkpoint uses roughly the hottest 30%
+of experts in NVFP4 (about 4.5 bpw), the cold tail in PV-tuned AQLM (about
+2 bpw), and BF16 for attention, DSA, dense/shared tensors, and embeddings.  Its
+approximately 272 GB footprint still does not fit one Spark, but the policy is
+directly relevant: pin native-NVFP4 hot experts in LPDDR, keep smaller AQLM
+cold records behind the normal cache, and reduce both miss bytes and cache
+pressure.  Audit its hot-set selection, exact record layout, GB10 kernels,
+scratch expansion, routing fidelity, and published quality methodology before
+adopting anything.  Treat this as a third experimental profile, not part of the
+current NVFP4 merge gate, and compare it against uniform faithful NVFP4,
+compact NVFP4/INT8, and uniform INT4 under the same frozen state.
+
+Available future infrastructure expands the experiment ladder without changing
+that priority:
+
+- Two RoCE-connected Sparks (`pondermatic` and `deepthought`) provide about
+  242 GB aggregate LPDDR.  This is still too small for the 272 GB hybrid plus
+  runtime/KV headroom, but is useful for expert/layer ownership and the existing
+  remote-complete-layer interface.
+- A possible third Spark raises aggregate LPDDR to about 363 GB and makes a
+  fully resident hybrid deployment plausible.  Compare expert ownership with
+  TP3 rather than assuming dense tensor parallelism is required.
+- A 400 GbE switch and possible 400 GbE NVMe-oF SAN can provide a shared cold
+  tier.  Preserve immutable, aligned, independently addressable expert records
+  so the existing local provider can be replaced without changing tensor
+  semantics.  Benchmark registered-memory lifetime, queue depth, drive
+  striping, coalescing, prediction horizon, and end-to-end felt wait; do not
+  infer inference bandwidth from the nominal 50 GB/s link rate.
+- Keep dense/KV execution on the request Spark where practical.  Route expert
+  work to its owning peer, or fetch a complete record from the SAN, based on
+  the measured input/output-transfer versus record-transfer crossover.  This
+  sparse ownership design may avoid collectives on every dense operation.
+
 ## Open items, largest first
 
 ### Decode selected-attention tensor-core gather (landed, 2026-07-20)
