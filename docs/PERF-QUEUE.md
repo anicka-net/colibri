@@ -1011,3 +1011,15 @@ production-shape native/grouped oracle, and FP8-KV device-shadow readers
 including 32k all passed in the pinned CUDA 13.1.1 container. The native
 service profile remains unpromoted pending the broader frozen quality suite
 and a satisfactory disk-streaming performance result.
+
+Storage control and rejected short-context dispatch: `fio` against an aligned
+expert shard sustained 10.6 GiB/s (11.4 GB/s) with direct io_uring, 20 MiB
+reads, and depth 32, proving the remaining end-to-end limit is above the
+device/filesystem. A frozen one-question run using the nominal Spark
+`PILOT_REAL=1`, `PILOT_K=8`, `COUPLE_K=8`, `COUPLE_D=1` profile and cap 42
+took 413 s for three requests, reached about 100.4 GiB RSS, and did not improve
+per-request progress over cap 16 without pilot. Reject that combination for
+the faithful aligned snapshot: it spends memory and speculative reads without
+recovering queue depth. The next I/O probe should instrument submitted and
+completed native-record depth plus time in completion/finalization and
+host-backed first-touch; do not retune the NVMe itself.
