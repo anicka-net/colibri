@@ -86,7 +86,24 @@ W4A32 oracle at layer 1 for more than nine minutes with 0% GPU use.  Native
 NVFP4 host wrapping is now independent of that gate; under the same explicit
 `COLI_CUDA_PREFILL=0` control it completed the first request in about two
 minutes and advanced steadily through all 78 layers.  The broader frozen
-quality rungs remain the release gate.
+quality rungs were subsequently completed as described below.
+
+The reconciled faithful and compact frozen quality rungs both completed all
+481 requests at `TEMP=0`, using the identical `.coli_usage` hash
+`a8ae6d508409bbec3278f590a2869b2828c8436df1a3ff2b6b6acf993acacad0`.
+Faithful finished in 6,342 seconds with 81.7% mean normalized accuracy and
+-1.68915 aggregate gold log-likelihood in nat/token over 1,421 continuation
+tokens.  Compact finished in 5,966 seconds with 84.2% mean normalized accuracy
+and -1.70360 nat/token over the same continuations.  Compact is therefore
+0.01445 nat/token behind faithful, inside the specified 0.02 acceptance margin,
+with no new structural failure.  It scored MMLU 82.5%, HellaSwag 90.0%
+normalized, and ARC-Challenge 80.0% normalized.  The compact run reported zero
+routed CPU rows, no CUDA/native fallback or invalid-value diagnostics, and exit
+status zero.  Restore the snapshot's pre-run `.coli_usage` after each frozen
+gate; the compact state was restored to hash
+`af4b15a6875cfa77b05553979ad2731efa69ff9a56f3612036d2872155a9896f`.
+Treat the wall-time difference as indicative only: these were quality gates,
+not the matched warmed prefill/decode performance benchmark.
 
 Post-quality resident-format work should start by tuning the two implemented
 profiles rather than adding another conversion variable: faithful
