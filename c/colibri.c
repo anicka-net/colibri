@@ -4066,7 +4066,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
             if(!nr) continue;
 #ifdef COLI_CUDA
-            if(group_enabled&&g_cuda_enabled&&g_cuda_host_experts&&!e->g.cuda_eligible&&
+            /* Native NVFP4 has a direct per-expert CUDA path for every row
+             * count.  Do not make host wrapping depend on the grouped-prefill
+             * staging gate: for S>64 with COLI_CUDA_PREFILL=0 that silently
+             * sent the complete expert MLP through the scalar W4A32 oracle. */
+            if((group_enabled||e->g.fmt==COLI_TENSOR_MODELOPT_NVFP4)&&
+               g_cuda_enabled&&g_cuda_host_experts&&!e->g.cuda_eligible&&
                !e->g.cuda&&!omp_in_parallel()){
                 int dev=g_cuda_devices[0];
                 if(!qt_cuda_wrap_host(&e->g,dev)||!qt_cuda_wrap_host(&e->u,dev)||!qt_cuda_wrap_host(&e->d,dev)){
