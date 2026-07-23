@@ -101,6 +101,18 @@ scaling.  Compare BF16, row-INT8, and block-scaled E4M3 with the identical
 NVFP4 routed-expert payload and frozen `.coli_usage`; do not make FP8-resident
 support part of the current merge gate.
 
+For GB10 and coherent-memory Grace systems, the target steady-state execution
+model is GPU-only for tensor computation.  Unified/coherent addressing means
+routed experts need not fall back to CPU matmul merely because their weights
+are outside a separate VRAM tier: CUDA should consume the host/LPDDR/Grace
+memory directly, as the faithful NVFP4 run already does (`routed CPU 0`).
+CPU work remains appropriate for routing/control, io_uring submission and
+completion, metadata validation, and other orchestration.  Any CPU attention,
+projection, expert matmul, KV transform, or logits path on these machines
+should be counted and treated as a missing/failed device path.  Apply the same
+design to GH200 using formats Hopper supports; GH200's lack of native NVFP4
+does not justify CPU tensor execution.
+
 Rejected dispatch/build thresholds are intentionally visible.  Plain `sm_121`
 cannot launch the CUTLASS architecture-conditional MMA and is rejected in favor
 of `sm_121a`.  For prefill, native NVFP4 is engaged while resident BF16 selected
