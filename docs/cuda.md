@@ -101,8 +101,12 @@ COLI_REMOTE_LAYERS=4,5,6,7,8,9 \
 SNAP=/nvme/glm52_i4 ./glm 17 4 4
 ```
 
-Remote execution is decode-only (`S<=4`) and requires every expert in each
-configured layer to be present in the worker pack. Requests use registered
+Each wire request carries at most four token rows. Larger prefill batches are
+split into sequential four-token chunks while preserving the existing
+per-token expert accumulation order. The client commits remote output only
+after every chunk succeeds, so a mid-prefill worker failure can still fall
+back to the complete local layer without double-counting. Every expert in each
+configured layer must be present in the worker pack. Requests use registered
 host buffers; the default timeout is 5 seconds
 (`COLI_REMOTE_TIMEOUT_MS`). Connection, protocol, or completion failures log
 the reason, disable the remote path, and continue through the existing local

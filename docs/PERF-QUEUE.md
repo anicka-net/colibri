@@ -217,6 +217,53 @@ Production therefore remains on the local known-good build. The remote tier
 is a validated decode optimization, but deployment requires either remote
 prefill support or a workload gate that is explicitly decode-heavy.
 
+### Remote prefill extension (measured 2026-07-23) - NEAR MISS, HAND OFF
+
+The client now accepts arbitrary positive `S` and splits prefill into bounded
+wire chunks. Each chunk filters the full expert union while preserving union
+order. Large prefills accumulate into a zeroed scratch output and commit only
+after every chunk succeeds. A failure after completed chunks can therefore
+discard the partial remote result and execute the full layer locally without
+double-counting.
+
+The conservative four-token protocol required no worker or pack-format
+change. On the same 2,701-token prompt and 128-token forced replay:
+
+| Order | Local wall | Remote wall | Gain |
+|---|---:|---:|---:|
+| off1 -> on1 | 384.10 s | 362.21 s | **5.70%** |
+| on2 -> off2 | 378.35 s | 365.06 s | **3.51%** |
+| mean | **381.23 s** | **363.64 s** | **4.61%** |
+
+Every arm matched 128/128 replay tokens. Remote arms reported zero fallback.
+Each remote arm served 4,818 calls, 120,793 expert groups, and 135,744 routed
+rows. This recovers most of the missing long-prefill benefit, but remains
+below the 5% production gate.
+
+One bounded eight-token experiment separated the wire protocol version from
+the unchanged pack version and doubled the request limits. It reduced each
+remote arm to 2,790 calls, but did not improve the gate:
+
+| Order | Local wall | Remote wall | Gain |
+|---|---:|---:|---:|
+| off1 -> on1 | 384.23 s | 364.67 s | **5.09%** |
+| on2 -> off2 | 377.38 s | 363.82 s | **3.59%** |
+| mean | **380.81 s** | **364.25 s** | **4.35%** |
+
+Again, every arm matched 128/128 replay tokens with zero fallback. Mean client
+time rose from about 2.47 ms per four-token call to 4.24 ms per eight-token
+call; worker compute rose from about 2.27 ms to 3.89 ms. Halving request count
+therefore left aggregate remote time nearly unchanged. The retained code uses
+four-token chunks and keeps wire and pack version constants separate for any
+future protocol work.
+
+Stop here under the bounded 5% rule. Production remains on local PIPE2.
+The planned unforced greedy control was not run because the mean gate failed.
+Further progress requires engine scheduling work, such as overlapping remote
+layers with independent local work or changing layer ownership. That work is
+handed to Vojtech rather than expanding this prototype into a distributed
+scheduler.
+
 Control: doubling pondermatic's local expert tier from 30 to 60 GB improved
 p50 876.7→770.4 ms and cut read wait 113.7→95.5 s, but orchestration rose
 6.2→54.2 s and total decode regressed 360.2→374.0 s. The win depends on

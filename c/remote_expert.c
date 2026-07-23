@@ -317,26 +317,21 @@ static void configure(void) {
 
 int coli_remote_expert_enabled(int layer, int S) {
     pthread_once(&g_once, configure);
-    return g_configured && S > 0 && S <= COLI_REMOTE_MAX_S &&
+    return g_configured && S > 0 &&
            layer >= 0 && layer < (int)sizeof(g_layers) && g_layers[layer];
 }
 
-int coli_remote_expert_run(int layer, const float *x, int S, const int *uniq,
-                           int nu, const int *idxs, const float *weights,
-                           const int *keff, int K, int D, float *out) {
-    if (!coli_remote_expert_enabled(layer, S) || D != COLI_REMOTE_HIDDEN ||
+static int run_chunk(Remote *r, int layer, const float *x, int S,
+                     const int *uniq, int nu, const int *idxs,
+                     const float *weights, const int *keff, int K, int D,
+                     float *out) {
+    if (S < 1 || S > COLI_REMOTE_MAX_S ||
         nu < 1 || nu > COLI_REMOTE_MAX_EXPERTS)
         return 0;
-    pthread_mutex_lock(&g_lock);
-    Remote *r = &g_remote;
-    if (!r->connected && !remote_connect()) {
-        pthread_mutex_unlock(&g_lock);
-        return 0;
-    }
     ColiRemoteRequest *request = r->request;
     memset(request, 0, sizeof(*request));
     request->magic = COLI_REMOTE_MAGIC;
-    request->version = COLI_REMOTE_VERSION;
+    request->version = COLI_REMOTE_PROTOCOL_VERSION;
     request->seq = ++g_seq;
     request->layer = (uint32_t)layer;
     request->S = (uint32_t)S;
@@ -349,7 +344,6 @@ int coli_remote_expert_run(int layer, const float *x, int S, const int *uniq,
                 if (idxs[(size_t)s * K + k] == uniq[j]) {
                     if (total >= COLI_REMOTE_MAX_ROWS) {
                         disable_remote("route count exceeds protocol");
-                        pthread_mutex_unlock(&g_lock);
                         return 0;
                     }
                     request->tokrow[total++] = s;
@@ -365,17 +359,15 @@ int coli_remote_expert_run(int layer, const float *x, int S, const int *uniq,
     if (!post_receive(r, 2) || !write_request(r, request_bytes, 1) ||
         !wait_for(r, 2)) {
         disable_remote("request failed");
-        pthread_mutex_unlock(&g_lock);
         return 0;
     }
     ColiRemoteResponse *response = r->response;
     if (response->magic != COLI_REMOTE_MAGIC ||
-        response->version != COLI_REMOTE_VERSION ||
+        response->version != COLI_REMOTE_PROTOCOL_VERSION ||
         response->seq != request->seq || response->status ||
         response->count != request->count ||
         response->total_rows != request->total_rows) {
         disable_remote("invalid worker response");
-        pthread_mutex_unlock(&g_lock);
         return 0;
     }
     const float *remote_y = (const float *)(response + 1);
@@ -395,7 +387,67 @@ int coli_remote_expert_run(int layer, const float *x, int S, const int *uniq,
     g_rows += (uint64_t)total;
     g_bytes += request_bytes + sizeof(*response) + (size_t)total * D * sizeof(float);
     g_us += now_us() - started;
+    return 1;
+}
+
+int coli_remote_expert_run(int layer, const float *x, int S, const int *uniq,
+                           int nu, const int *idxs, const float *weights,
+                           const int *keff, int K, int D, float *out) {
+    if (!coli_remote_expert_enabled(layer, S) || D != COLI_REMOTE_HIDDEN ||
+        nu < 1 || K < 1 || K > COLI_REMOTE_MAX_ROWS)
+        return 0;
+    int chunk_cap = COLI_REMOTE_MAX_ROWS / K;
+    if (chunk_cap > COLI_REMOTE_MAX_S) chunk_cap = COLI_REMOTE_MAX_S;
+    if (chunk_cap < 1) return 0;
+
+    float *remote_out = S > chunk_cap ?
+        calloc((size_t)S * D, sizeof(*remote_out)) : out;
+    if (!remote_out) return 0;
+
+    pthread_mutex_lock(&g_lock);
+    Remote *r = &g_remote;
+    if (!r->connected && !remote_connect()) {
+        pthread_mutex_unlock(&g_lock);
+        if (remote_out != out) free(remote_out);
+        return 0;
+    }
+    for (int base = 0; base < S; base += chunk_cap) {
+        int chunk_s = S - base < chunk_cap ? S - base : chunk_cap;
+        int chunk_uniq[COLI_REMOTE_MAX_EXPERTS], chunk_nu = 0;
+        for (int j = 0; j < nu; j++) {
+            int present = 0;
+            for (int s = 0; s < chunk_s && !present; s++)
+                for (int k = 0; k < keff[base + s]; k++)
+                    if (idxs[(size_t)(base + s) * K + k] == uniq[j]) {
+                        present = 1;
+                        break;
+                    }
+            if (present) {
+                if (chunk_nu >= COLI_REMOTE_MAX_EXPERTS) {
+                    disable_remote("chunk expert count exceeds protocol");
+                    pthread_mutex_unlock(&g_lock);
+                    if (remote_out != out) free(remote_out);
+                    return 0;
+                }
+                chunk_uniq[chunk_nu++] = uniq[j];
+            }
+        }
+        if (!run_chunk(r, layer, x + (size_t)base * D, chunk_s,
+                       chunk_uniq, chunk_nu, idxs + (size_t)base * K,
+                       weights + (size_t)base * K, keff + base, K, D,
+                       remote_out + (size_t)base * D)) {
+            pthread_mutex_unlock(&g_lock);
+            if (remote_out != out) free(remote_out);
+            return 0;
+        }
+    }
     pthread_mutex_unlock(&g_lock);
+
+    if (remote_out != out) {
+        for (size_t i = 0, n = (size_t)S * D; i < n; i++)
+            out[i] += remote_out[i];
+        free(remote_out);
+    }
     return 1;
 }
 
@@ -416,7 +468,7 @@ void coli_remote_expert_shutdown(void) {
         ColiRemoteRequest *request = r->request;
         memset(request, 0, sizeof(*request));
         request->magic = COLI_REMOTE_MAGIC;
-        request->version = COLI_REMOTE_VERSION;
+        request->version = COLI_REMOTE_PROTOCOL_VERSION;
         request->seq = ++g_seq;
         write_request(r, sizeof(*request), 1);
         wait_for(r, 1);

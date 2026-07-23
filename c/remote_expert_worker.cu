@@ -212,7 +212,7 @@ static std::vector<Expert> load_pack(const char *path, int *max_layer) {
         throw std::runtime_error("short pack");
     const auto *header = (const ColiRemotePackHeader *)data;
     if (std::memcmp(header->magic, COLI_REMOTE_PACK_MAGIC, 8) ||
-        header->version != COLI_REMOTE_VERSION ||
+        header->version != COLI_REMOTE_PACK_VERSION ||
         header->hidden != COLI_REMOTE_HIDDEN ||
         header->inter != COLI_REMOTE_INTER ||
         header->records_offset + (uint64_t)header->count *
@@ -269,14 +269,14 @@ int main(int argc, char **argv) {
         rdma.wait(1);
         const auto *request = (const ColiRemoteRequest *)rdma.request;
         if (request->magic != COLI_REMOTE_MAGIC ||
-            request->version != COLI_REMOTE_VERSION) {
+            request->version != COLI_REMOTE_PROTOCOL_VERSION) {
             std::fprintf(stderr, "[REMOTE] invalid request header\n");
             return 1;
         }
         if (!request->count) break;
         auto *response = (ColiRemoteResponse *)rdma.response;
         response->magic = COLI_REMOTE_MAGIC;
-        response->version = COLI_REMOTE_VERSION;
+        response->version = COLI_REMOTE_PROTOCOL_VERSION;
         response->seq = request->seq;
         response->status = 0;
         response->count = request->count;
