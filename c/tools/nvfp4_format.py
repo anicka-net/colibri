@@ -29,7 +29,12 @@ FORMAT_MODELOPT_NVFP4 = "modelopt-nvfp4-e2m1"
 NVFP4_GROUP_SIZE = 16
 MODELOPT_SCALE_LAYOUT = "modelopt-row-major-o-by-ceil-i16"
 CUTLASS_SCALE_LAYOUT = "cutlass-sm1xx-sf-atom-128x4-v1"
-CUTLASS_REVISION = "2e602843e75100d0e03934efb386b3e1e35d7907"  # v4.5.1
+CUTLASS_VERSION = "4.6.1"
+CUTLASS_REVISION = "e05f953a5b3d38adc240df2ff928e0421c2abba3"
+SUPPORTED_CUTLASS_REVISIONS = {
+    "4.5.1": "2e602843e75100d0e03934efb386b3e1e35d7907",
+    CUTLASS_VERSION: CUTLASS_REVISION,
+}
 
 E2M1 = np.asarray(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -203,7 +208,7 @@ def dequantize_modelopt(
 def cutlass_scale_storage_shape(output_size: int, input_size: int) -> tuple[int, int, int]:
     """Return (M tiles, K tiles, bytes) for CUTLASS's SM1xx SF atom.
 
-    CUTLASS 4.5.1 defines the K-major atom as logical [128,64] with
+    CUTLASS 4.5.1 through 4.6.1 define the K-major atom as logical [128,64] with
     strides ((16,4),(0,1)).  Sixteen K coordinates therefore duplicate one
     scale and four distinct FP8 scale factors occupy each row of the atom.
     """
@@ -274,8 +279,10 @@ def validate_manifest(doc: Mapping[str, Any]) -> dict[str, Any]:
         if expert.get(key) != value:
             raise ManifestError(f"unsupported routed_experts.{key}: {expert.get(key)!r}")
     cutlass = doc.get("cutlass")
-    if not isinstance(cutlass, dict) or cutlass.get("version") != "4.5.1" or cutlass.get("revision") != CUTLASS_REVISION:
-        raise ManifestError("snapshot requires pinned CUTLASS 4.5.1 revision")
+    version = cutlass.get("version") if isinstance(cutlass, dict) else None
+    revision = cutlass.get("revision") if isinstance(cutlass, dict) else None
+    if SUPPORTED_CUTLASS_REVISIONS.get(version) != revision:
+        raise ManifestError("snapshot requires a pinned supported CUTLASS revision")
     record = doc.get("expert_record", {})
     if record.get("alignment") not in (4096, 16384):
         raise ManifestError("expert record alignment must be 4096 or 16384")
@@ -326,5 +333,5 @@ def make_manifest(repository: str, revision: str, resident_precision: str) -> di
             "immutable": True,
             "independently_addressable": True,
         },
-        "cutlass": {"version": "4.5.1", "revision": CUTLASS_REVISION},
+        "cutlass": {"version": CUTLASS_VERSION, "revision": CUTLASS_REVISION},
     })

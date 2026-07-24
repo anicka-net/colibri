@@ -7,7 +7,8 @@
 
 #include "../snapshot_manifest.h"
 
-static int write_manifest(const char *dir, const char *group, int aligned) {
+static int write_manifest(const char *dir, const char *group, int aligned,
+                          const char *cutlass_version, const char *cutlass_revision) {
     char path[512]; snprintf(path,sizeof(path),"%s/%s",dir,COLI_MANIFEST_FILE);
     FILE *f=fopen(path,"wb"); if(!f)return 0;
     fprintf(f,"{\"schema\":\"colibri.snapshot\",\"version\":1,"
@@ -20,8 +21,9 @@ static int write_manifest(const char *dir, const char *group, int aligned) {
         "\"scale_dtype\":\"fp8-e4m3fn\",\"tensor_scale_dtype\":\"f32\","
         "\"input_scale_dtype\":\"f32\"},\"expert_record\":{\"alignment\":4096,%s"
         "\"immutable\":true,\"independently_addressable\":true},"
-        "\"cutlass\":{\"version\":\"4.5.1\",\"revision\":\"%s\"}}",
-        group,aligned?"\"component_alignment\":16,\"layout\":\"component-aligned-v2\",":"",COLI_CUTLASS_451_REV);
+        "\"cutlass\":{\"version\":\"%s\",\"revision\":\"%s\"}}",
+        group,aligned?"\"component_alignment\":16,\"layout\":\"component-aligned-v2\",":"",
+        cutlass_version,cutlass_revision);
     return fclose(f)==0;
 }
 
@@ -30,14 +32,16 @@ int main(void) {
     if(!mkdtemp(dir))return 1;
     ColiSnapshotManifest m;
     if(coli_manifest_load(dir,&m,error,sizeof(error))!=0)return 2;
-    if(!write_manifest(dir,"16",0))return 3;
+    if(!write_manifest(dir,"16",0,"4.5.1",COLI_CUTLASS_451_REV))return 3;
     if(coli_manifest_load(dir,&m,error,sizeof(error))!=1 || !m.present ||
        m.expert_format!=COLI_TENSOR_MODELOPT_NVFP4 || m.resident_format!=COLI_TENSOR_BF16 ||
        m.component_alignment!=1 || strcmp(m.repository,"org/model") || strcmp(m.revision,"abc123"))return 4;
-    if(!write_manifest(dir,"16",1))return 5;
+    if(!write_manifest(dir,"16",1,"4.6.1",COLI_CUTLASS_461_REV))return 5;
     if(coli_manifest_load(dir,&m,error,sizeof(error))!=1 || m.component_alignment!=16)return 6;
-    if(!write_manifest(dir,"32",1))return 7;
+    if(!write_manifest(dir,"32",1,"4.6.1",COLI_CUTLASS_461_REV))return 7;
     if(coli_manifest_load(dir,&m,error,sizeof(error))!=-1 || !strstr(error,"NVFP4"))return 8;
+    if(!write_manifest(dir,"16",1,"4.6.1",COLI_CUTLASS_451_REV))return 9;
+    if(coli_manifest_load(dir,&m,error,sizeof(error))!=-1 || !strstr(error,"CUTLASS"))return 10;
     char path[512];snprintf(path,sizeof(path),"%s/%s",dir,COLI_MANIFEST_FILE);unlink(path);rmdir(dir);
     puts("snapshot manifest: ok"); return 0;
 }

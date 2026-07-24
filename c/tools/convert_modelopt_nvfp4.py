@@ -2,7 +2,7 @@
 """Build faithful and compact Colibri snapshots from a ModelOpt NVFP4 tree.
 
 Routed experts remain packed E2M1. Their E4M3 group-16 scales are numerically
-decoded for validation and rearranged into the CUTLASS 4.5.1 SM1xx SF atom
+decoded for validation and rearranged into the CUTLASS 4.6.1 SM1xx SF atom
 offline. Expert shards are written once and hard-linked into both variants.
 """
 
