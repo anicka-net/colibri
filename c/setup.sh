@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # colibrì — installazione su una macchina nuova (Linux x86-64, macOS, Windows/MinGW).
 # Compila il motore e fa un self-test. Il MODELLO (~372 GB int4) va copiato a parte
-# o rigenerato con tools/convert_fp8_to_int4.py (development-time Python tool).
+# o rigenerato con: coli convert --model <dir-su-ext4/NVMe>
 set -e
 cd "$(dirname "$0")"
 echo "🐦 colibrì — setup"
@@ -32,11 +32,11 @@ esac
 
 # 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
 echo "  building (ARCH=${ARCH:-native})…"
-make -s all ARCH="${ARCH:-native}"
+make -s colibri ARCH="${ARCH:-native}"
 
 # 3) self-test sull'oracolo tiny, se presente
 if [ -d glm_tiny ] && [ -f ref_glm.json ]; then
-    r=$(SNAP=./glm_tiny TF=1 ./glm 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
+    r=$(SNAP=./glm_tiny TF=1 ./colibri 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
     echo "  engine self-test: ${r:-?}  (expected 32/32)"
 fi
 
@@ -56,8 +56,9 @@ esac
 echo "  RAM: ${ram} GB   (more RAM = more cached experts = faster inference)"
 echo
 echo "ready. Next steps:"
-echo "  ./coli-native info --model /path/on/NVMe/glm52_i4"
-echo "  ./coli-native chat --model /path/on/NVMe/glm52_i4 --ram <GB>"
-echo "  conversion remains a development-time tool: python3 tools/convert_fp8_to_int4.py --help"
+echo "  ./coli build           # already done"
+echo "  ./coli convert --model /path/on/NVMe/glm52_i4     # generate the int4 model (hours)"
+echo "  ./coli info  --model /path/on/NVMe/glm52_i4"
+echo "  ./coli chat  --model /path/on/NVMe/glm52_i4 --ram <GB>"
 echo
 echo "IMPORTANT: keep the model on fast storage (NVMe/ext4), never on /mnt/c or a network mount."

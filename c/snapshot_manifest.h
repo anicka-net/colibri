@@ -14,7 +14,7 @@
 
 typedef struct {
     int present, version, resident_format, expert_format, group_size;
-    int scale_layout, record_alignment;
+    int scale_layout, record_alignment, component_alignment;
     char repository[256], revision[128];
 } ColiSnapshotManifest;
 
@@ -83,12 +83,26 @@ static inline int coli_manifest_load(const char *snapshot, ColiSnapshotManifest 
     jval *record=json_get(root,"expert_record"), *alignment=record&&record->t==J_OBJ?json_get(record,"alignment"):NULL;
     jval *immutable=record&&record->t==J_OBJ?json_get(record,"immutable"):NULL;
     jval *addressable=record&&record->t==J_OBJ?json_get(record,"independently_addressable"):NULL;
+    jval *component=record&&record->t==J_OBJ?json_get(record,"component_alignment"):NULL;
+    const char *record_layout=coli_manifest_string(record,"layout");
     if (!alignment || alignment->t!=J_NUM || (alignment->num!=4096 && alignment->num!=16384)) {
         json_free(root); free(arena); return coli_manifest_error(error,error_cap,"unsupported expert record alignment");
     }
     if(!immutable||immutable->t!=J_BOOL||!immutable->boolean||
        !addressable||addressable->t!=J_BOOL||!addressable->boolean){
         json_free(root);free(arena);return coli_manifest_error(error,error_cap,"expert records must be immutable and independently addressable");
+    }
+    out->component_alignment=1; /* v1 payloads require compatibility staging */
+    if(component){
+        if(component->t!=J_NUM||component->num!=16||!record_layout||
+           strcmp(record_layout,"component-aligned-v2")){
+            json_free(root);free(arena);return coli_manifest_error(error,error_cap,
+                "unsupported expert component alignment/layout");
+        }
+        out->component_alignment=16;
+    }else if(record_layout){
+        json_free(root);free(arena);return coli_manifest_error(error,error_cap,
+            "expert record layout requires component alignment");
     }
     out->present=1; out->version=1; out->expert_format=COLI_TENSOR_MODELOPT_NVFP4;
     out->group_size=16; out->scale_layout=COLI_SCALE_CUTLASS_SM1XX_128X4;

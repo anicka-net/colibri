@@ -5,7 +5,7 @@
  * the CPU path of kv_alloc only reads c->n_layers/kv_lora/qk_rope. */
 #include <assert.h>
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 typedef struct {

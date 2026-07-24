@@ -1,7 +1,7 @@
 #include <assert.h>
 
 #define main coli_glm_main_unused
-#include "../glm.c"
+#include "../colibri.c"
 #undef main
 
 static void fill_kv(Model *m, int len, float base){

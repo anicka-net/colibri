@@ -68,14 +68,19 @@ def write_aligned_safetensors(
     path: os.PathLike[str] | str,
     records: list[list[tuple[str, TensorBytes]]],
     alignment: int = 4096,
+    component_alignment: int = 16,
 ) -> dict[str, int]:
-    """Write standard Safetensors with an aligned start for every record.
+    """Write standard Safetensors with aligned records and tensor components.
 
     Padding is represented by reserved U8 tensors, keeping all data offsets
     valid for ordinary Safetensors readers. Returns absolute record offsets.
     """
     if alignment not in (4096, 16384):
         raise ValueError("record alignment must be 4096 or 16384")
+    if component_alignment < 1 or component_alignment & (component_alignment - 1):
+        raise ValueError("component alignment must be a positive power of two")
+    if alignment % component_alignment:
+        raise ValueError("record alignment must be a multiple of component alignment")
     header: dict[str, Any] = {}
     chunks: list[bytes] = []
     record_relative: dict[str, int] = {}
@@ -91,8 +96,14 @@ def write_aligned_safetensors(
                             "data_offsets": [cursor, cursor + padding]}
             chunks.append(bytes(padding)); cursor += padding
         record_relative[record[0][0]] = cursor
-        for name, tensor in record:
-            if name in seen or name.startswith("__coli_padding_"):
+        for component_number, (name, tensor) in enumerate(record):
+            padding = (-cursor) % component_alignment
+            if padding:
+                pad_name = f"__coli_component_padding_{record_number:08d}_{component_number:02d}"
+                header[pad_name] = {"dtype": "U8", "shape": [padding],
+                                    "data_offsets": [cursor, cursor + padding]}
+                chunks.append(bytes(padding)); cursor += padding
+            if name in seen or name.startswith("__coli_"):
                 raise ValueError(f"duplicate or reserved tensor name {name!r}")
             seen.add(name)
             expected = math.prod(tensor.shape) * _DTYPE_BYTES.get(tensor.dtype, 0)
@@ -102,7 +113,16 @@ def write_aligned_safetensors(
             header[name] = {"dtype": tensor.dtype, "shape": list(tensor.shape),
                             "data_offsets": [cursor, end]}
             chunks.append(tensor.data); cursor = end
-    header["__metadata__"] = {"format": "colibri-aligned-expert-records-v1", "pad": ""}
+    header["__metadata__"] = (
+        {
+            "format": "colibri-component-aligned-expert-records-v2",
+            "record_alignment": str(alignment),
+            "component_alignment": str(component_alignment),
+            "pad": "",
+        }
+        if component_alignment > 1
+        else {"format": "colibri-aligned-expert-records-v1", "pad": ""}
+    )
     encoded = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
     pad = (-(8 + len(encoded))) % alignment
     header["__metadata__"]["pad"] = " " * pad
@@ -256,8 +276,17 @@ def validate_manifest(doc: Mapping[str, Any]) -> dict[str, Any]:
     cutlass = doc.get("cutlass")
     if not isinstance(cutlass, dict) or cutlass.get("version") != "4.5.1" or cutlass.get("revision") != CUTLASS_REVISION:
         raise ManifestError("snapshot requires pinned CUTLASS 4.5.1 revision")
-    if doc.get("expert_record", {}).get("alignment") not in (4096, 16384):
+    record = doc.get("expert_record", {})
+    if record.get("alignment") not in (4096, 16384):
         raise ManifestError("expert record alignment must be 4096 or 16384")
+    component_alignment = record.get("component_alignment", 1)
+    layout = record.get("layout")
+    if component_alignment not in (1, 16):
+        raise ManifestError("expert record component_alignment must be 1 or 16")
+    if component_alignment == 16 and layout != "component-aligned-v2":
+        raise ManifestError("16-byte expert components require component-aligned-v2")
+    if layout == "component-aligned-v2" and component_alignment != 16:
+        raise ManifestError("component-aligned-v2 requires 16-byte components")
     return dict(doc)
 
 
@@ -290,6 +319,12 @@ def make_manifest(repository: str, revision: str, resident_precision: str) -> di
             "tensor_scale_dtype": FORMAT_F32,
             "input_scale_dtype": FORMAT_F32,
         },
-        "expert_record": {"alignment": 4096, "immutable": True, "independently_addressable": True},
+        "expert_record": {
+            "alignment": 4096,
+            "component_alignment": 16,
+            "layout": "component-aligned-v2",
+            "immutable": True,
+            "independently_addressable": True,
+        },
         "cutlass": {"version": "4.5.1", "revision": CUTLASS_REVISION},
     })

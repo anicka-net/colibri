@@ -5,6 +5,22 @@ correctness-validated on pondermatic's GB10 with CUDA 13.0.88, targeting
 `sm_121a`. Deployment remains pinned to the CUDA 13.1 development container;
 repeat every build below there before using a converted snapshot.
 
+## Reconciled merge candidate
+
+Candidate `83fc0db` includes `origin/main` and JustVugg `dev` through
+`5724dae`. On Twilight it passes the full C suite and Python/API suite (221
+passed, 13 skipped), the native-server suite (26 passed), and a CUDA 13.3 `sm_121a`
+release build. The CUTLASS layout parity test passes. The ordinary CUDA
+harness and dedicated NVFP4 oracle both compile; execution exits 77 because
+Twilight has no NVIDIA device. The reconciled Inkling CUDA target also
+compiles for `sm_121a`.
+
+The remaining merge gates require a GB10: rerun both CUDA harnesses in the
+pinned CUDA 13.1 container, run native and forced-generic full-model smokes,
+repeat the matched native-prefill performance comparison, and run the
+deterministic faithful/compact quality and tool suites on this exact commit.
+FP8 KV remains opt-in until its 4k/32k device-shadow gate completes.
+
 ## Build and numerical gates
 
 From `c/`:

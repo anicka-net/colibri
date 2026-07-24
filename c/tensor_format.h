@@ -9,7 +9,9 @@ typedef enum {
     COLI_TENSOR_INT2_ROW = 3,
     COLI_TENSOR_INT4_GROUP = 4,
     COLI_TENSOR_BF16 = 5,
-    COLI_TENSOR_MODELOPT_NVFP4 = 6
+    COLI_TENSOR_MODELOPT_NVFP4 = 6,
+    COLI_TENSOR_INT3_GROUP = 7,
+    COLI_TENSOR_E8 = 8
 } ColiTensorFormat;
 
 typedef enum {

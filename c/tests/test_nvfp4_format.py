@@ -14,6 +14,7 @@ from convert_modelopt_nvfp4 import (
     is_runtime_indexer,
     merge_expert_records,
 )
+from realign_nvfp4_experts import rewrite_shard, verify_shard_samples
 
 
 class Nvfp4FormatTest(unittest.TestCase):
@@ -52,6 +53,7 @@ class Nvfp4FormatTest(unittest.TestCase):
 
     def test_manifest_round_trip_and_corruption(self):
         doc = nf.make_manifest("org/model", "a" * 40, nf.FORMAT_BF16)
+        self.assertEqual(doc["expert_record"]["component_alignment"], 16)
         with tempfile.TemporaryDirectory() as td:
             path = pathlib.Path(td) / nf.MANIFEST_NAME
             path.write_text(json.dumps(doc), encoding="utf-8")
@@ -60,6 +62,11 @@ class Nvfp4FormatTest(unittest.TestCase):
             bad["routed_experts"] = dict(doc["routed_experts"], group_size=32)
             path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaisesRegex(nf.ManifestError, "group_size"):
+                nf.load_manifest(td)
+            bad = dict(doc)
+            bad["expert_record"] = dict(doc["expert_record"], component_alignment=8)
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaisesRegex(nf.ManifestError, "component_alignment"):
                 nf.load_manifest(td)
 
     def test_aligned_safetensors_records(self):
@@ -75,8 +82,46 @@ class Nvfp4FormatTest(unittest.TestCase):
             data_start, header = nf.read_safetensors_header(path)
             self.assertEqual(data_start % 4096, 0)
             self.assertTrue(all(offset % 4096 == 0 for offset in offsets.values()))
+            for name, metadata in header.items():
+                if name == "__metadata__" or name.startswith("__coli_"):
+                    continue
+                self.assertEqual((data_start + metadata["data_offsets"][0]) % 16, 0, name)
+            self.assertEqual(header["__metadata__"]["format"],
+                             "colibri-component-aligned-expert-records-v2")
             self.assertEqual(header["expert.1.weight"]["data_offsets"][1] -
                              header["expert.1.weight"]["data_offsets"][0], 33)
+
+    def test_realign_is_byte_preserving_and_component_aligned(self):
+        records = []
+        expected = {}
+        for expert in range(2):
+            record = []
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                base = f"model.layers.1.mlp.experts.{expert}.{projection}.weight"
+                arrays = (
+                    (base, np.arange(17 + expert, dtype=np.uint8)),
+                    (base + ".nvfp4_scale", np.full(33, 0x38, dtype=np.uint8)),
+                    (base + ".nvfp4_tensor_scale", np.asarray([0.5], dtype=np.float32)),
+                    (base + ".nvfp4_input_scale", np.asarray([1.25], dtype=np.float32)),
+                )
+                for name, value in arrays:
+                    tensor = nf.tensor_bytes(value)
+                    record.append((name, tensor)); expected[name] = tensor.data
+            records.append(record)
+        with tempfile.TemporaryDirectory() as td:
+            source = pathlib.Path(td) / "old.safetensors"
+            target = pathlib.Path(td) / "new.safetensors"
+            nf.write_aligned_safetensors(source, records, component_alignment=1)
+            count, _, _ = rewrite_shard(source, target)
+            self.assertEqual(count, 2)
+            self.assertEqual(verify_shard_samples(source, target), len(expected))
+            data_start, header = nf.read_safetensors_header(target)
+            with target.open("rb") as stream:
+                for name, wanted in expected.items():
+                    begin, end = header[name]["data_offsets"]
+                    self.assertEqual((data_start + begin) % 16, 0, name)
+                    stream.seek(data_start + begin)
+                    self.assertEqual(stream.read(end - begin), wanted)
 
     def test_rejects_nonpositive_scales_and_wrong_shapes(self):
         packed = np.zeros((1, 8), dtype=np.uint8)

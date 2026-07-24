@@ -70,12 +70,156 @@ threshold tuning must use a frozen, warmed `.coli_usage` state.  Keep FP8 KV
 opt-in outside the validated Spark profile until the quality and 32k gates are
 complete.
 
+The faithful BF16 resident path must run on CUDA on GB10.  Before it did, the
+scalar CPU fallback put 230.5 s in attention and 139.4 s in the output
+projection during a 367 s SCORE smoke.  Automatic CUDA placement reduced the
+same nine-request smoke from 1,017 s to 104 s (**9.8x**), with a planner peak of
+105.7 GB and approximately 63 GB RSS plus 33.3 GiB reported CUDA allocation.
+Registering the pageable host expert slabs did not help the production NVFP4
+shapes (steady 0.069--0.073 ms either way), so pageable wrapping remains the
+measured choice.
+
+Long SCORE prompts exposed a separate dispatch boundary: host-backed experts
+were wrapped for CUDA only behind the grouped-prefill gate.  With
+`COLI_CUDA_PREFILL=0`, an `S=339` request therefore remained in the scalar
+W4A32 oracle at layer 1 for more than nine minutes with 0% GPU use.  Native
+NVFP4 host wrapping is now independent of that gate; under the same explicit
+`COLI_CUDA_PREFILL=0` control it completed the first request in about two
+minutes and advanced steadily through all 78 layers.  The broader frozen
+quality rungs were subsequently completed as described below.
+
+The reconciled faithful and compact frozen quality rungs both completed all
+481 requests at `TEMP=0`, using the identical `.coli_usage` hash
+`a8ae6d508409bbec3278f590a2869b2828c8436df1a3ff2b6b6acf993acacad0`.
+Faithful finished in 6,342 seconds with 81.7% mean normalized accuracy and
+-1.68915 aggregate gold log-likelihood in nat/token over 1,421 continuation
+tokens.  Compact finished in 5,966 seconds with 84.2% mean normalized accuracy
+and -1.70360 nat/token over the same continuations.  Compact is therefore
+0.01445 nat/token behind faithful, inside the specified 0.02 acceptance margin,
+with no new structural failure.  It scored MMLU 82.5%, HellaSwag 90.0%
+normalized, and ARC-Challenge 80.0% normalized.  The compact run reported zero
+routed CPU rows, no CUDA/native fallback or invalid-value diagnostics, and exit
+status zero.  Restore the snapshot's pre-run `.coli_usage` after each frozen
+gate; the compact state was restored to hash
+`af4b15a6875cfa77b05553979ad2731efa69ff9a56f3612036d2872155a9896f`.
+Treat the wall-time difference as indicative only: these were quality gates,
+not the matched warmed prefill/decode performance benchmark.
+
+The final reconciled GB10 gate used candidate `3dd11eb` and completed the
+native/default/generic CUDA harnesses, CUTLASS layout and grouped-oracle tests,
+all faithful/compact/base-model smokes, and all four frozen quality rungs.
+The NVIDIA ModelOpt base snapshot scored 85.0% mean normalized accuracy and
+-1.65169 nat/token; the abliterated faithful and compact results are above.
+The current Colibri INT4 baseline scored 53.3% and -10.08675 nat/token.  All
+four quality runs completed 481/481 requests with exit status zero.  The first
+live-tool harness invocation was invalid because it mixed `coli serve` flags
+with the underlying `openai_server.py` flags; no model was loaded in that
+attempt.
+
+The corrected faithful-NVFP4 two-turn tool gate exposed a server-profile
+boundary already represented by `COLI_SERVE_ALL_STOPS`.  With the default
+single-EOS serve policy, the accurate NVFP4 model emitted a valid Rome tool
+call but continued to the 256-token ceiling, fabricated later user/tool turns,
+and polluted the follow-up context.  Re-arming the full GLM stop set with
+`COLI_SERVE_ALL_STOPS=1` stopped turn one after 24 tokens with exactly one
+strict, clean call (`get_weather({"city":"Rome"})`); turn two consumed the
+synthetic result and reported 31 C and sunny in 83 tokens.  The complete gate
+passed in 181 seconds, used the component-aligned io_uring loader, and reported
+zero routed CPU rows.  Set `COLI_SERVE_ALL_STOPS=1` in the validated NVFP4
+Spark service profile, but do not change the global serve default: noisy INT4
+tool calls still need the #401 single-EOS behavior.  The frozen placement state
+was restored afterward to SHA-256
+`a8ae6d508409bbec3278f590a2869b2828c8436df1a3ff2b6b6acf993acacad0`.
+
+Post-quality resident-format work should start by tuning the two implemented
+profiles rather than adding another conversion variable: faithful
+NVFP4/BF16 and compact NVFP4/row-INT8 still have substantial attention,
+resident-projection, dispatch, UVM, and expert-I/O headroom.  Once their
+accuracy baselines are frozen, evaluate a third compact resident profile using
+properly scaled E4M3 weights (prefer block scaling over an unscaled BF16-to-FP8
+cast).  FP8 has the same one-byte weight storage and may unlock faster native
+GB10 tensor-core projections, while row-INT8 is the current conservative
+quality/compatibility choice and can have finer effective precision after row
+scaling.  Compare BF16, row-INT8, and block-scaled E4M3 with the identical
+NVFP4 routed-expert payload and frozen `.coli_usage`; do not make FP8-resident
+support part of the current merge gate.
+
+For GB10 and coherent-memory Grace systems, the target steady-state execution
+model is GPU-only for tensor computation.  Unified/coherent addressing means
+routed experts need not fall back to CPU matmul merely because their weights
+are outside a GPU-local tier.  CPU work remains appropriate for
+routing/control, io_uring submission and completion, metadata validation, and
+other orchestration.  Any CPU attention, projection, expert matmul, KV
+transform, or logits path on these machines should be counted and treated as a
+missing/failed device path.
+
+Do not, however, collapse GB10 and GH200 into the same memory-tier policy.
+GB10 has LPDDR unified memory and no separate high-bandwidth GPU-local VRAM, so
+CUDA consumption from LPDDR is the terminal execution tier, as the faithful
+NVFP4 run already demonstrates (`routed CPU 0`).  GH200 has both
+Grace-accessible coherent LPDDR and 96 GB of substantially faster HBM.  Its
+cold path should launch the expert on the GPU directly from coherent LPDDR
+while asynchronously promoting that same expert into HBM; later hits execute
+from HBM.  This resembles Tekton's RAM-to-VRAM promotion in placement and
+reuse, but not in cold execution: Tekton may profitably calculate a small cold
+expert on its EPYC CPU while H2D is in flight, whereas GH200 should calculate
+it on the GPU from LPDDR while the LPDDR-to-HBM promotion is in flight.  Keep
+the source allocation alive until both execution and copy complete, coalesce
+duplicate promotions, and expose direct-LPDDR, HBM-hit, promotion, and
+promotion-fallback counters.  Apply this design using formats Hopper supports;
+GH200's lack of native NVFP4 does not justify CPU tensor execution.
+
 Rejected dispatch/build thresholds are intentionally visible.  Plain `sm_121`
 cannot launch the CUTLASS architecture-conditional MMA and is rejected in favor
 of `sm_121a`.  For prefill, native NVFP4 is engaged while resident BF16 selected
 attention remains on the generic kernel; for decode, S=1 stays on the measured
 generic/chain path rather than forcing a CUTLASS grouped launch whose setup cost
 has not yet won at one row.
+
+### NVFP4 rollout priority and follow-on topology
+
+The first product gate remains **acceptable speed and accuracy on one GB10
+Spark**.  Do not hide a weak single-node result behind tensor parallelism or
+additional hardware.  Finish faithful and compact quality comparisons, frozen
+single-Spark prefill/decode measurements, native/fallback accounting, FP8-KV
+long-context validation, and the deterministic tool/agent suite before making
+multi-Spark work a release dependency.  Report cache hit rate, expert bytes
+fetched, felt I/O wait, native engagement, and KV footprint together; a kernel
+throughput number without the storage path is not a single-Spark result.
+
+After that gate, investigate routing-aware hybrid precision.  The independent
+`jarrelscy/GLM-5.2-NVFP4-AQLM-hybrid` checkpoint uses roughly the hottest 30%
+of experts in NVFP4 (about 4.5 bpw), the cold tail in PV-tuned AQLM (about
+2 bpw), and BF16 for attention, DSA, dense/shared tensors, and embeddings.  Its
+approximately 272 GB footprint still does not fit one Spark, but the policy is
+directly relevant: pin native-NVFP4 hot experts in LPDDR, keep smaller AQLM
+cold records behind the normal cache, and reduce both miss bytes and cache
+pressure.  Audit its hot-set selection, exact record layout, GB10 kernels,
+scratch expansion, routing fidelity, and published quality methodology before
+adopting anything.  Treat this as a third experimental profile, not part of the
+current NVFP4 merge gate, and compare it against uniform faithful NVFP4,
+compact NVFP4/INT8, and uniform INT4 under the same frozen state.
+
+Available future infrastructure expands the experiment ladder without changing
+that priority:
+
+- Two RoCE-connected Sparks (`pondermatic` and `deepthought`) provide about
+  242 GB aggregate LPDDR.  This is still too small for the 272 GB hybrid plus
+  runtime/KV headroom, but is useful for expert/layer ownership and the existing
+  remote-complete-layer interface.
+- A possible third Spark raises aggregate LPDDR to about 363 GB and makes a
+  fully resident hybrid deployment plausible.  Compare expert ownership with
+  TP3 rather than assuming dense tensor parallelism is required.
+- A 400 GbE switch and possible 400 GbE NVMe-oF SAN can provide a shared cold
+  tier.  Preserve immutable, aligned, independently addressable expert records
+  so the existing local provider can be replaced without changing tensor
+  semantics.  Benchmark registered-memory lifetime, queue depth, drive
+  striping, coalescing, prediction horizon, and end-to-end felt wait; do not
+  infer inference bandwidth from the nominal 50 GB/s link rate.
+- Keep dense/KV execution on the request Spark where practical.  Route expert
+  work to its owning peer, or fetch a complete record from the SAN, based on
+  the measured input/output-transfer versus record-transfer crossover.  This
+  sparse ownership design may avoid collectives on every dense operation.
 
 ## Open items, largest first
 
@@ -1057,6 +1201,18 @@ the repack copy and its UVM/page-placement pressure. Measure staging-copy CPU,
 UVM worker CPU, achieved NVMe bandwidth, and end-to-end miss latency before
 deciding whether to regenerate the 427-GB shared payload.
 
+Implemented on the NVFP4 branch as `component-aligned-v2`: every one of the 12
+components in an expert record starts at a 16-byte boundary, records remain
+4-KiB aligned, and the manifest advertises both properties. Legacy v1 payloads
+retain the staged compatibility path; v2 records are read by one io_uring
+operation directly into the persistent host-backed slab. The byte-preserving
+rewrite tool only regenerates Safetensors headers and inserts padding—there is
+no dequantization or scale conversion—and hard-links the rewritten payload into
+faithful/compact trees. CPU gates: all C tests and 134 Python/API tests pass; a
+real 3,024-tensor shard passed dtype/shape/length checks, 16-byte address checks,
+and leading/trailing-byte comparison. GB10 end-to-end performance remains to be
+remeasured after the rewritten payload reaches Pondermatic.
+
 The first staged cap-16 measurement also held `UVM GPU1 BH` at 0% while the
 main process used roughly 1.25 CPU cores and the SSD delivered about 1.0--1.1
 GB/s. Besides the repack memcpy, native load finalization currently rescans
@@ -1073,3 +1229,37 @@ Observed NVMe throughput rose from roughly 1.0 to 1.8 GB/s as queue depth grew
 from about 25 to 47. This is correctness evidence, not a performance win: the
 earlier pthread smoke took 181 s. Do not claim native-record io_uring faster
 until aligned direct placement and validation caching recover that regression.
+
+Aligned-v2 GB10 follow-up (2026-07-23, CUDA 13.1.1, `sm_121a`): the rewritten
+payload passed a faithful FP32-KV smoke at cap 16 with `DIRECT=1`, `URING=1`,
+host-backed CUDA experts, native NVFP4 at S>=1, and no CUDA expert tier:
+9/9 requests, 100% smoke accuracy, and `-0.28373 nat/token`. Peak RSS remained
+about 63.3 GiB. The initial aligned run spent one CPU core converting and
+rescanning every FP8 scale on every reload and took 1602 s. Caching successful
+validation per immutable `(layer,expert)` record, recognizing E4M3FN validity
+from its exact byte encoding, and validating full production scale tiles in
+one linear pass reduced the same smoke to 1017 s (-36.5%). Metadata and scalar
+scales are still checked on every load; odd/padded shapes retain full physical
+and logical scale validation on first publication. This recovers substantial
+CPU headroom but is still slower than the 452 s compatibility-path run and the
+historical 181 s pthread run, so aligned io_uring throughput remains an open
+performance gate rather than a claimed win.
+
+Final GB10 correctness gates at commit `07d4fdc`: full CUDA backend harness,
+generic fallback (`COLI_NVFP4_NATIVE=0`), CUTLASS SFA/SFB layout parity,
+production-shape native/grouped oracle, and FP8-KV device-shadow readers
+including 32k all passed in the pinned CUDA 13.1.1 container. The native
+service profile remains unpromoted pending the broader frozen quality suite
+and a satisfactory disk-streaming performance result.
+
+Storage control and rejected short-context dispatch: `fio` against an aligned
+expert shard sustained 10.6 GiB/s (11.4 GB/s) with direct io_uring, 20 MiB
+reads, and depth 32, proving the remaining end-to-end limit is above the
+device/filesystem. A frozen one-question run using the nominal Spark
+`PILOT_REAL=1`, `PILOT_K=8`, `COUPLE_K=8`, `COUPLE_D=1` profile and cap 42
+took 413 s for three requests, reached about 100.4 GiB RSS, and did not improve
+per-request progress over cap 16 without pilot. Reject that combination for
+the faithful aligned snapshot: it spends memory and speculative reads without
+recovering queue depth. The next I/O probe should instrument submitted and
+completed native-record depth plus time in completion/finalization and
+host-backed first-touch; do not retune the NVMe itself.

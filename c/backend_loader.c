@@ -45,11 +45,19 @@ typedef int            (*fn_expert_group)(ColiCudaTensor *const *gates, ColiCuda
                                           const int *tokrow, int S_tok, int accum_ok,
                                           int x_device,float *out_device);
 typedef int            (*fn_expert_group_collect)(int device, int home_device, float *x_dev, int D);
+typedef int            (*fn_expert_group_issue)(ColiCudaTensor *const *gates,
+                                                ColiCudaTensor *const *ups,
+                                                ColiCudaTensor *const *downs,
+                                                const int *rows, int count, const float *x);
+typedef const float *  (*fn_expert_group_take)(int device);
 typedef int            (*fn_attention_absorb)(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                               const float *latent, const float *rope, int H, int Q,
                                               int R, int V, int K, int T, float attention_scale);
 typedef int            (*fn_tensor_upload)(ColiCudaTensor **tensor, const void *weights,
                                            const float *scales, int fmt, int I, int O, int device);
+typedef int            (*fn_tensor_upload_g)(ColiCudaTensor **tensor, const void *weights,
+                                             const float *scales, int fmt, int I, int O,
+                                             int device, int gs);
 typedef int            (*fn_tensor_wrap_host)(ColiCudaTensor **tensor, const void *weights,
                                               const float *scales, int fmt, int I, int O, int device);
 typedef int            (*fn_tensor_upload_nvfp4)(ColiCudaTensor **tensor, const uint8_t *weights,
@@ -58,7 +66,7 @@ typedef int            (*fn_tensor_upload_nvfp4)(ColiCudaTensor **tensor, const 
                                                  int I, int O, int device);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
                                     const void *weights, const float *scales,
-                                    int fmt, int S, int I, int O, int device);
+                                    int fmt, int S, int I, int O, int device, int gs);
 typedef int            (*fn_matmul_nvfp4)(ColiCudaTensor **tensor, float *y, const float *x,
                                           const uint8_t *weights, const uint8_t *block_scales,
                                           float tensor_scale, float input_scale, int scale_layout,
@@ -152,8 +160,11 @@ static struct {
     fn_expert_mlp      expert_mlp;
     fn_expert_group    expert_group;
     fn_expert_group_collect expert_group_collect;
+    fn_expert_group_issue expert_group_issue;
+    fn_expert_group_take expert_group_take;
     fn_attention_absorb attention_absorb;
     fn_tensor_upload   tensor_upload;
+    fn_tensor_upload_g tensor_upload_g;
     fn_tensor_wrap_host tensor_wrap_host;
     fn_tensor_upload_nvfp4 tensor_upload_nvfp4;
     fn_tensor_upload_nvfp4 tensor_wrap_host_nvfp4;
@@ -271,8 +282,11 @@ static int coli_cuda_load(void){
     RESOLVE(expert_mlp,     fn_expert_mlp)
     RESOLVE(expert_group,   fn_expert_group)
     RESOLVE(expert_group_collect, fn_expert_group_collect)
+    RESOLVE(expert_group_issue, fn_expert_group_issue)
+    RESOLVE(expert_group_take, fn_expert_group_take)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
+    RESOLVE(tensor_upload_g, fn_tensor_upload_g)
     RESOLVE(tensor_wrap_host, fn_tensor_wrap_host)
     RESOLVE(tensor_upload_nvfp4, fn_tensor_upload_nvfp4)
     RESOLVE(tensor_wrap_host_nvfp4, fn_tensor_upload_nvfp4)
@@ -402,6 +416,18 @@ int coli_cuda_expert_group_collect(int device,int home_device,float *x_dev,int D
     return g_cuda.expert_group_collect(device,home_device,x_dev,D);
 }
 
+int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
+        ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
+        const int *rows, int count, const float *x){
+    if(!g_cuda.available || !g_cuda.expert_group_issue) return 0;
+    return g_cuda.expert_group_issue(gates,ups,downs,rows,count,x);
+}
+
+const float *coli_cuda_expert_group_take(int device){
+    if(!g_cuda.available || !g_cuda.expert_group_take) return NULL;
+    return g_cuda.expert_group_take(device);
+}
+
 int coli_cuda_attention_absorb(ColiCudaTensor *kv_b, float *ctx, const float *q,
                                const float *latent, const float *rope, int H, int Q,
                                int R, int V, int K, int T, float attention_scale){
@@ -413,6 +439,12 @@ int coli_cuda_tensor_upload(ColiCudaTensor **tensor, const void *weights,
                             const float *scales, int fmt, int I, int O, int device){
     if(!g_cuda.available) return 0;
     return g_cuda.tensor_upload(tensor, weights, scales, fmt, I, O, device);
+}
+
+int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor, const void *weights,
+        const float *scales, int fmt, int I, int O, int device, int gs){
+    if(!g_cuda.available || !g_cuda.tensor_upload_g) return 0;
+    return g_cuda.tensor_upload_g(tensor,weights,scales,fmt,I,O,device,gs);
 }
 
 int coli_cuda_tensor_wrap_host(ColiCudaTensor **tensor, const void *weights,
@@ -441,9 +473,9 @@ int coli_cuda_tensor_wrap_host_nvfp4(ColiCudaTensor **tensor, const uint8_t *wei
 
 int coli_cuda_matmul(ColiCudaTensor **tensor, float *y, const float *x,
                      const void *weights, const float *scales,
-                     int fmt, int S, int I, int O, int device){
+                     int fmt, int S, int I, int O, int device, int gs){
     if(!g_cuda.available) return 0;
-    return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device);
+    return g_cuda.matmul(tensor, y, x, weights, scales, fmt, S, I, O, device, gs);
 }
 
 int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor, float *y, const float *x,
