@@ -44,7 +44,18 @@ if sys.platform == "win32":
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from version import __version__ as _version
+# version.py sits next to this script in a source checkout, but an installed
+# layout puts the launcher in $(PREFIX)/bin while the support modules live in
+# $(PREFIX)/libexec/colibri — and a packager may strip it entirely (#575,
+# FreeBSD port). The launcher must never crash over a version string.
+try:
+    from version import __version__ as _version
+except ModuleNotFoundError:
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "libexec", "colibri"))
+    try:
+        from version import __version__ as _version
+    except ModuleNotFoundError:
+        _version = "unknown"
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, openai_server.py) and
@@ -949,7 +960,8 @@ def cmd_convert(a):
     venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
     py = venv_py if os.path.exists(venv_py) else sys.executable
     base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
-          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
+          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
+          "--group-size", str(a.group_size)]
     if a.xbits: base+=["--xbits",str(a.xbits)]
     # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
     print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
@@ -1023,6 +1035,8 @@ def main():
     pb.add_argument("--data",default=_bench_cache)
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
     pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
+    pc.add_argument("--group-size",type=int,default=64,
+        help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"doctor":cmd_doctor,

@@ -485,4 +485,48 @@ PS C:\quack\llm\colibri\docker> docker run --rm -it --name colibri-c -v "C:\quac
 
 ```
 
+---
+
+## Slim image (developers / production)
+
+The guide above uses `Dockerfile`, which clones the repo inside the image — one
+file to download, nothing else on your machine. For CI, servers, or anyone who
+already has the repo checked out, `Dockerfile.slim` is a multi-stage build that
+produces a **~115 MB** image (vs. the full toolchain the clone-in-image keeps
+around), runs as a **non-root** user, and compiles the engine with a
+**portable** ISA (`x86-64-v3`) so the image runs on any modern x86-64 host
+instead of only the machine that built it.
+
+Build it from the repo root (it needs the `c/` sources as context):
+
+```bash
+git clone https://github.com/JustVugg/colibri.git && cd colibri
+docker build -t colibri -f docker/Dockerfile.slim .
+```
+
+Run — the model is bind-mounted at `/model`, never baked in:
+
+```bash
+docker run --rm -v /nvme/glm52_i4:/model colibri info
+docker run --rm -it -v /nvme/glm52_i4:/model colibri chat --ram 24
+docker run --rm -p 5000:5000 -v /nvme/glm52_i4:/model colibri \
+    serve --host 0.0.0.0 --model-id glm-5.2 --ram 24
+```
+
+The entrypoint is `coli`, so the first argument is the subcommand (`info`,
+`chat`, `serve`, `run`, `plan`, `doctor`) — no `./coli` prefix. The container
+runs as UID 1000, so the model directory must be readable by that user
+(a directory you own already is; a root-owned one needs `chmod -R a+rX` or a
+matching `--user`).
+
+### One-command server (docker compose)
+
+```bash
+MODEL_DIR=/nvme/glm52_i4 COLI_RAM=24 docker compose -f docker/docker-compose.yml up
+```
+
+Serves the OpenAI-compatible API on `localhost:5000`. The converter (which
+needs PyTorch) is intentionally not in this image — convert from a source
+checkout, then point `MODEL_DIR` at the result.
+
 [source: 1]

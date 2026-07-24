@@ -25,7 +25,18 @@ Implemented endpoints are `GET /v1/models`, `GET /v1/models/{model}`,
 `POST /v1/chat/completions`, `POST /v1/responses`, Anthropic-compatible
 `POST /v1/messages`, and legacy `POST /v1/completions`. They support JSON
 responses, SSE streaming, usage counts,
-`max_tokens`/`max_completion_tokens`, `temperature`, and `top_p`. The extension
+`max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, and up to four
+custom `stop` sequences. Stop sequences are removed from the response and end
+generation early in both JSON and streaming modes. The extension
+`x_colibri_ignore_leading_stop: true` discards leading stop sequences until
+the first non-whitespace response content, which is useful for local templates
+that occasionally emit a role marker before the answer; strict OpenAI stop
+behavior remains the default for client-provided sequences. GLM chat requests
+with no client `stop` automatically use the template's `<|user|>` and
+`<|observation|>` role markers, patiently ignoring only leading markers; this
+prevents a model-completed turn from silently generating a new user or tool
+turn. Inkling chat and legacy completion requests receive no implicit GLM stop
+sequences. The extension
 `enable_thinking: true` enables GLM-5.2's reasoning block; the standard
 `reasoning_effort` field also enables it unless set to `none`. DeepSeek clients
 may use `think: false` or `thinking: {"type": "disabled"}`. Reasoning is
@@ -100,7 +111,9 @@ service example in `ops/` advertises `deepseek-v4-flash` and
 The server is deliberately text-only. The
 744B model stays in one persistent process, so concurrent HTTP requests queue
 or use separately allocated KV slots instead of loading duplicate model copies.
-Image/audio input, custom stop sequences, log probabilities, and token penalties return an explicit error
+or use separately allocated KV slots instead of loading duplicate model copies.
+Image/audio input, log probabilities,
+and token penalties return an explicit error
 rather than being silently ignored. The default bind address is localhost; set
 `COLI_API_KEY` before exposing the server beyond the machine.
 

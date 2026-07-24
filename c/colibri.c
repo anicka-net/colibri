@@ -5816,7 +5816,7 @@ static void intr_install(void){
 static void intr_install(void){}
 #endif
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
-                       void (*emit)(int,void*), void *ud, int *kv_out){
+                       void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
@@ -5893,7 +5893,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         repin_pass(m);                                  /* safe point: all device work is synchronized */
     }
     g_spec_live = 0;                     /* prefill/decode successivi: gate normali / next prefill: normal gates */
-    if(logit) free(logit);
+    /* logit_out (mux chunking): hand the continuation logits to the caller.
+     * NULL here means the loop exited right after emitting a token that was
+     * never forwarded — it sits at all[kv], and the caller must forward it
+     * before the next chunk. */
+    if(logit_out) *logit_out=logit;
+    else if(logit) free(logit);
     if(kv_out) *kv_out=kv;
     return emitted;
 }
@@ -6048,7 +6053,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     for(int i=0;i<np;i++) out[i]=prompt[i];
     float *logit=step(m,prompt,np,0);
     EmitStore es={out+np,0};
-    spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
+    spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL,NULL);
 }
 
 static void profile_print(Model *m, double elapsed){
@@ -6318,7 +6323,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double t=now_s();
     EmitStream es={&T,m,t,0,0};
     grammar_reset(&g_grd);
-    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
+    int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL,NULL);
     double dt=now_s()-t;
     double tot=m->hits+m->miss;
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
@@ -7158,6 +7163,10 @@ static int kv_cache_restore_best(Model *m, ServeCtx *s,
 
 typedef struct {
     int active, pending, emitted, maximum, prompt_tokens, prof_tokens, length_limited;
+    int spec;                            /* single-slot speculation (#492): decode runs through
+                                            spec_decode chunks instead of the shared batch */
+    float *spec_logit;                   /* continuation logits between chunks; NULL = the last
+                                            emitted token sits at hist[len], not yet forwarded */
     unsigned long long id;
     float temp, top_p;
     double started;
@@ -7171,6 +7180,10 @@ static void mux_data(Tok *T, unsigned long long id, int token){
     printf("DATA %llu %d\n",id,n); if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
     fflush(stdout);
 }
+
+/* emit callback for the single-slot speculative path: stream straight to the mux protocol */
+typedef struct { Tok *T; unsigned long long id; } MuxEmit;
+static void mux_spec_emit(int t, void *ud){ MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t); }
 
 static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     adaptive_cap_note_used(sc->len);
@@ -7205,6 +7218,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
     if(g_prof) prof_report(m,&r->pb,dt,r->prof_tokens+r->emitted,stderr);
+    if(r->spec_logit){ free(r->spec_logit); r->spec_logit=NULL; }
+    r->spec=0;
     r->active=0;
 }
 
@@ -7216,6 +7231,16 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     char *line=NULL; size_t cap=0; ssize_t nr=getline(&line,&cap,stdin);
     if(nr<0){ free(line); return -1; }
     if(nr && line[nr-1]=='\n') line[--nr]=0;
+    if(!strncmp(line,"STOP ",5)){
+        unsigned long long id=0; char tail;
+        if(sscanf(line+5,"%llu %c",&id,&tail)!=1 || id==0){
+            printf("ERROR 0 BAD_REQUEST\n"); fflush(stdout); free(line); return 0;
+        }
+        for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==id){
+            mux_done(m,&ctx[i],&req[i]); free(line); return 0;
+        }
+        printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
+    }
     if(!strncmp(line,"CANCEL ",7)){
         unsigned long long id=0; char tail;
         if(sscanf(line+7,"%llu %c",&id,&tail)!=1 || id==0){
@@ -7225,6 +7250,8 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
             req[i].active=0; kv_bind(m,&ctx[i].kv);
             if(g_kv_cache.enabled) kv_cache_checkpoint(m,&ctx[i]);
             else kv_disk_append(m,ctx[i].hist,ctx[i].len);
+            if(req[i].spec_logit){ free(req[i].spec_logit); req[i].spec_logit=NULL; }
+            req[i].spec=0;
             printf("ERROR %llu CANCELLED\n",id); fflush(stdout); free(line); return 0;
         }
         printf("ERROR %llu NOT_FOUND\n",id); fflush(stdout); free(line); return 0;
@@ -7352,9 +7379,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         repin_decay(m);
     }
 #endif
+    /* Clamp to the KV room without flagging. length_limited describes what
+     * actually ended generation, and is set only at the cap-hit sites below. */
     int room=maxctx-sc->len-1;
     r->maximum=coli_effective_generation_limit(r->maximum,room);
     g_temp=r->temp; g_nuc=r->top_p;
+    /* Single-slot speculation (#492/#358): with one KV slot there is no ragged
+     * batch — the decode is a single contiguous sequence, exactly the regime
+     * spec_decode already serves in chat/run/run_serve. Hand the request to the
+     * scheduler's chunked spec path instead of the pending-token cycle; grammar
+     * requests keep the forced-draft path (its acceptance is ~1 where it fires,
+     * and the two draft sources would fight over the same forward). */
+    if(g_draft>0 && nctx==1 && !grd[sub.slot].on){
+        if(r->maximum<=0){
+            r->length_limited=1; free(logit); mux_done(m,sc,r); return 1;
+        }
+        r->spec=1; r->spec_logit=logit; r->active=1;
+        return 1;
+    }
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
     if(coli_generation_limit_reached(0,r->maximum)){
         r->length_limited=1; mux_done(m,sc,r); return 1;
@@ -7372,13 +7414,18 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
-    g_draft=0; /* one scheduler owns every forward; MTP/n-gram speculation is not ragged-safe.
-                * Grammar-forced drafts ARE mux-safe (below): a drafting slot leaves the shared
-                * batch for one forward and runs the proven single-sequence verify path
-                * (kv_bind + step_all), exactly like prefill already does per submission. */
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
+    /* MTP/n-gram speculation is not ragged-safe across KV slots, so multi-slot
+     * serve keeps one scheduler owning every forward (g_draft=0). At KV_SLOTS=1
+     * there IS no ragged batch — decode is one contiguous sequence, the exact
+     * regime spec_decode already serves in chat/run/run_serve — so the engine's
+     * resolved draft setting stays live (#492/#358). Grammar-forced drafts stay
+     * mux-safe on every slot count, as before. */
+    if(nctx>1) g_draft=0;
+    else if(g_draft>0)
+        fprintf(stderr,"[MTP] single-slot serve: speculation active (draft=%d)\n",g_draft);
     g_kvsave=getenv("KVSAVE")?atoi(getenv("KVSAVE")):1;
     if(g_inj_v && g_kvsave){
         g_kvsave=0;
@@ -7447,6 +7494,26 @@ static void run_serve_mux(Model *m, const char *snap){
         DecodeRow rows[512]; int slots[512], S=0;
         for(int i=0;i<nctx;i++) if(req[i].active){
             ServeCtx *sc=&ctx[i]; ServeReq *r=&req[i]; GrDraft *gd=&grd[i];
+            if(r->spec){
+                /* Single-slot speculative decode (#492): KV_SLOTS=1 has no ragged
+                 * batch, so the whole turn runs through spec_decode in one call —
+                 * the exact contract run_serve (non-mux) already uses. No chunk
+                 * splicing (that would re-enter spec_decode mid-turn and double
+                 * the boundary token); Ctrl-C interrupts through g_intr inside
+                 * spec_decode, same as every other serve path. r->spec_logit
+                 * holds the prefill continuation from mux_submit. */
+                kv_bind(m,&sc->kv);
+                g_temp=r->temp; g_nuc=r->top_p;
+                float *lg=r->spec_logit; r->spec_logit=NULL;   /* spec_decode takes ownership */
+                MuxEmit ud={&T,r->id};
+                int prod=spec_decode(m,sc->hist,sc->len,r->maximum-r->emitted,eos,lg,
+                                     mux_spec_emit,&ud,&sc->len,NULL);
+                r->emitted+=prod;
+                if(coli_generation_limit_reached(r->emitted,r->maximum))
+                    r->length_limited=1;
+                mux_done(m,sc,r);
+                continue;                    /* whole turn handled outside the shared batch */
+            }
             /* grammar-forced drafts (greedy requests only: verification under sampling
              * needs rejection resampling, out of scope here). The slot leaves the shared
              * batch for one forward and runs the single-sequence verify path. */
@@ -7469,7 +7536,7 @@ static void run_serve_mux(Model *m, const char *snap){
                     r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
                     if(gd->on) gr_feed(gd,next);
                     mux_data(&T,r->id,next);
-                    if(r->emitted>=r->maximum){ mux_done(m,sc,r); done=1; break; }
+                    if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); done=1; break; }
                     if(j<k){
                         if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
                         gd->acc++;
@@ -7577,7 +7644,7 @@ static void run_serve(Model *m, const char *snap){
             float *logit=step(m,hist+len-1,1,len-1);
             EmitStream es={&T,m,now_s(),0,1};
             int prod=0;
-            if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
+            if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len,NULL);
             else free(logit);
             double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
             double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
@@ -7664,7 +7731,7 @@ static void run_serve(Model *m, const char *snap){
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
         grammar_reset(&g_grd);                         /* nuova risposta = nuovo documento (MORE invece continua) */
-        if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len);
+        if(cur>0) prod=spec_decode(m,hist,len,cur,eos,logit,emit_stream,&es,&len,NULL);
         else free(logit);
         double tdt=now_s()-tt0; if(tdt<1e-6) tdt=1e-6;
         double dh=(double)(m->hits-h0), dm=(double)(m->miss-ms0);
@@ -9013,15 +9080,19 @@ int main(int argc, char **argv){
      * altrimenti "MTP active (draft=8)" mentirebbe: il messaggio e' stampato
      * prima della scelta del path (run_serve_mux, sotto), e con DRAFT=8 diceva
      * "active" per poi disabilitarlo in silenzio (#358, LordMZTE). */
-    int mux_will_disable_mtp = getenv("SERVE") && getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"));
+    /* Multi-slot mux only: at KV_SLOTS=1 there is no ragged batch and the mux
+     * keeps the resolved draft setting live (#492 single-slot speculation). */
+    int mux_slots = getenv("KV_SLOTS") ? atoi(getenv("KV_SLOTS")) : 1;
+    int mux_will_disable_mtp = getenv("SERVE") && getenv("SERVE_BATCH") &&
+                               atoi(getenv("SERVE_BATCH")) && mux_slots>1;
     int eff_draft = mux_will_disable_mtp ? 0 : g_draft;
     printf("loaded in %.2fs | resident dense: %.2f MB | layers=%d experts=%d | MTP %s (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts,
            m.has_mtp?(mux_will_disable_mtp?"DISABLED (multiplexed serve)":"ACTIVE"):"absent", eff_draft);
     /* anche su stderr: e' il canale che le UI (coli) mostrano all'utente */
     if(mux_will_disable_mtp && m.has_mtp)
-        fprintf(stderr,"[MTP] disabled in multiplexed serve (SERVE_BATCH=1): speculation is not "
-                       "ragged-safe across KV slots. Single-client interactive use (`coli chat`) keeps MTP.\n");
+        fprintf(stderr,"[MTP] disabled in multiplexed serve (SERVE_BATCH=1, KV_SLOTS>1): speculation is "
+                       "not ragged-safe across KV slots. Single-slot serve (KV_SLOTS=1) keeps MTP.\n");
     else
         fprintf(stderr,"[MTP] %s (draft=%d)\n", m.has_mtp?"active: native speculative decoding":"absent", eff_draft);
 #ifdef __linux__
