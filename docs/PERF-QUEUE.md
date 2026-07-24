@@ -105,6 +105,32 @@ gate; the compact state was restored to hash
 Treat the wall-time difference as indicative only: these were quality gates,
 not the matched warmed prefill/decode performance benchmark.
 
+The final reconciled GB10 gate used candidate `3dd11eb` and completed the
+native/default/generic CUDA harnesses, CUTLASS layout and grouped-oracle tests,
+all faithful/compact/base-model smokes, and all four frozen quality rungs.
+The NVIDIA ModelOpt base snapshot scored 85.0% mean normalized accuracy and
+-1.65169 nat/token; the abliterated faithful and compact results are above.
+The current Colibri INT4 baseline scored 53.3% and -10.08675 nat/token.  All
+four quality runs completed 481/481 requests with exit status zero.  The first
+live-tool harness invocation was invalid because it mixed `coli serve` flags
+with the underlying `openai_server.py` flags; no model was loaded in that
+attempt.
+
+The corrected faithful-NVFP4 two-turn tool gate exposed a server-profile
+boundary already represented by `COLI_SERVE_ALL_STOPS`.  With the default
+single-EOS serve policy, the accurate NVFP4 model emitted a valid Rome tool
+call but continued to the 256-token ceiling, fabricated later user/tool turns,
+and polluted the follow-up context.  Re-arming the full GLM stop set with
+`COLI_SERVE_ALL_STOPS=1` stopped turn one after 24 tokens with exactly one
+strict, clean call (`get_weather({"city":"Rome"})`); turn two consumed the
+synthetic result and reported 31 C and sunny in 83 tokens.  The complete gate
+passed in 181 seconds, used the component-aligned io_uring loader, and reported
+zero routed CPU rows.  Set `COLI_SERVE_ALL_STOPS=1` in the validated NVFP4
+Spark service profile, but do not change the global serve default: noisy INT4
+tool calls still need the #401 single-EOS behavior.  The frozen placement state
+was restored afterward to SHA-256
+`a8ae6d508409bbec3278f590a2869b2828c8436df1a3ff2b6b6acf993acacad0`.
+
 Post-quality resident-format work should start by tuning the two implemented
 profiles rather than adding another conversion variable: faithful
 NVFP4/BF16 and compact NVFP4/row-INT8 still have substantial attention,
