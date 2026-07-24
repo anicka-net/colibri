@@ -54,6 +54,8 @@ class Nvfp4FormatTest(unittest.TestCase):
     def test_manifest_round_trip_and_corruption(self):
         doc = nf.make_manifest("org/model", "a" * 40, nf.FORMAT_BF16)
         self.assertEqual(doc["expert_record"]["component_alignment"], 16)
+        self.assertEqual(doc["cutlass"],
+                         {"version": nf.CUTLASS_VERSION, "revision": nf.CUTLASS_REVISION})
         with tempfile.TemporaryDirectory() as td:
             path = pathlib.Path(td) / nf.MANIFEST_NAME
             path.write_text(json.dumps(doc), encoding="utf-8")
@@ -67,6 +69,19 @@ class Nvfp4FormatTest(unittest.TestCase):
             bad["expert_record"] = dict(doc["expert_record"], component_alignment=8)
             path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaisesRegex(nf.ManifestError, "component_alignment"):
+                nf.load_manifest(td)
+            legacy = dict(doc)
+            legacy["cutlass"] = {
+                "version": "4.5.1",
+                "revision": nf.SUPPORTED_CUTLASS_REVISIONS["4.5.1"],
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            self.assertEqual(nf.load_manifest(td)["cutlass"]["version"], "4.5.1")
+            bad = dict(doc)
+            bad["cutlass"] = {"version": "4.6.1",
+                              "revision": nf.SUPPORTED_CUTLASS_REVISIONS["4.5.1"]}
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaisesRegex(nf.ManifestError, "CUTLASS"):
                 nf.load_manifest(td)
 
     def test_aligned_safetensors_records(self):

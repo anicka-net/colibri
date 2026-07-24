@@ -394,7 +394,8 @@ def ollama_options(body, server_max_tokens):
         normalized["temperature"] = options["temperature"]
     if "top_p" in options:
         normalized["top_p"] = options["top_p"]
-    maximum, temperature, top_p, _grammar = generation_options(normalized, server_max_tokens)
+    maximum, temperature, top_p, _grammar, _stop_sequences = generation_options(
+        normalized, server_max_tokens)
     return normalized, maximum, temperature, top_p
 
 
@@ -1115,6 +1116,109 @@ GENERIC_JSON_GBNF = (
     'jws ::= ( " " | "\\t" | "\\n" | "\\r" )*\n'
 )
 
+DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+
+
+def parse_stop_sequences(body):
+    value = body.get("stop")
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        sequences = [value]
+    elif isinstance(value, list):
+        sequences = value
+    else:
+        raise APIError(400, "`stop` must be a string or an array of strings.",
+                       "stop", "invalid_value")
+    if not 1 <= len(sequences) <= 4:
+        raise APIError(400, "`stop` must contain between 1 and 4 sequences.",
+                       "stop", "invalid_value")
+    for index, sequence in enumerate(sequences):
+        if not isinstance(sequence, str) or not sequence:
+            raise APIError(400, "Each `stop` sequence must be a non-empty string.",
+                           f"stop.{index}", "invalid_value")
+    return tuple(sequences)
+
+
+def stop_policy(body, chat):
+    sequences = parse_stop_sequences(body)
+    ignore_leading = body.get("x_colibri_ignore_leading_stop", False)
+    if not isinstance(ignore_leading, bool):
+        raise APIError(400, "`x_colibri_ignore_leading_stop` must be a boolean.",
+                       "x_colibri_ignore_leading_stop", "invalid_value")
+    if chat and ARCH == "glm" and not sequences:
+        # The GLM chat template owns these role boundaries, so generic OpenAI
+        # clients should not need model-specific stop knowledge. Inkling has a
+        # different marker family and receives no implicit GLM stops. Treat an
+        # occasional leading GLM marker patiently; client-provided stops remain
+        # strict unless the extension is explicitly requested.
+        return DEFAULT_CHAT_STOP_SEQUENCES, True
+    return sequences, ignore_leading
+
+
+class StopFilter:
+    """Stream text without exposing a full or partial stop sequence."""
+    def __init__(self, sequences, emit, ignore_leading=False):
+        self.sequences = tuple(sequences)
+        self.emit = emit
+        self.ignore_leading = ignore_leading
+        self.pending = ""
+        self.matched = None
+        self.useful_content_seen = False
+        self.leading_matches_ignored = 0
+
+    def _emit(self, text):
+        if text:
+            self.emit(text)
+            if text.strip():
+                self.useful_content_seen = True
+
+    def feed(self, chunk):
+        if self.matched is not None:
+            return
+        text = self.pending + chunk
+        self.pending = ""
+        while True:
+            match = None
+            for order, sequence in enumerate(self.sequences):
+                offset = text.find(sequence)
+                candidate = (offset, order, sequence)
+                if offset >= 0 and (match is None or candidate[:2] < match[:2]):
+                    match = candidate
+            if match is None:
+                break
+            offset, _order, sequence = match
+            prefix = text[:offset]
+            if (self.ignore_leading and not self.useful_content_seen
+                    and not prefix.strip()):
+                self.leading_matches_ignored += 1
+                text = text[offset + len(sequence):]
+                if not text:
+                    return
+                continue
+            self.matched = sequence
+            self._emit(prefix)
+            return
+
+        hold = 0
+        maximum = min(len(text), max((len(s) - 1 for s in self.sequences), default=0))
+        for size in range(1, maximum + 1):
+            suffix = text[-size:]
+            if any(sequence.startswith(suffix) for sequence in self.sequences):
+                hold = size
+        flush = len(text) - hold
+        if flush:
+            self._emit(text[:flush])
+        self.pending = text[flush:]
+
+    def finish(self):
+        if self.matched is None and self.pending:
+            self._emit(self.pending)
+        self.pending = ""
+
+    def stopped(self):
+        return self.matched is not None
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -1161,8 +1265,7 @@ def generation_options(body, limit):
                            "tool_choice", "invalid_value")
         if choice != "none" and not (body.get("tools") or body.get("functions")):
             raise APIError(400, "`tool_choice` requires `tools`.", "tool_choice", "invalid_value")
-    if body.get("stop") is not None:
-        raise APIError(400, "Custom stop sequences are not supported yet.", "stop", "unsupported_parameter")
+    stop_sequences = parse_stop_sequences(body)
     if body.get("logprobs"):
         raise APIError(400, "Log probabilities are not supported yet.", "logprobs", "unsupported_parameter")
     if body.get("frequency_penalty", 0) or body.get("presence_penalty", 0):
@@ -1227,7 +1330,7 @@ def generation_options(body, limit):
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
             not math.isfinite(top_p) or not 0 < top_p <= 1):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
-    return maximum, float(temperature), float(top_p), grammar
+    return maximum, float(temperature), float(top_p), grammar, stop_sequences
 
 
 def read_engine_turn(stream, sentinel, on_bytes):
@@ -1394,7 +1497,7 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None):
+                 cancelled=None, grammar=None, stopped=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -1436,6 +1539,7 @@ class Engine:
             raise
 
         cancel_sent = False
+        stop_sent = False
         while True:
             try:
                 kind, value = events.get(timeout=0.25)
@@ -1447,9 +1551,14 @@ class Engine:
                         self.process.stdin.flush()
                 continue
             if kind == "data":
-                if not cancel_sent:
+                if not cancel_sent and not stop_sent:
                     decode(value)
-                    if cancelled and cancelled():
+                    if stopped and stopped():
+                        stop_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"STOP {request_id}\n".encode())
+                            self.process.stdin.flush()
+                    elif cancelled and cancelled():
                         cancel_sent = True
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
@@ -1595,11 +1704,16 @@ class APIServer(ThreadingHTTPServer):
                 self.response_history_bytes -= removed
 
 
-def engine_generate(engine, *args, grammar=None):
+def engine_generate(engine, *args, grammar=None, stopped=None):
     """Keep test/embedding engines compatible while only extending the wire ABI when used."""
-    if grammar is None:
+    if grammar is None and stopped is None:
         return engine.generate(*args)
-    return engine.generate(*args, grammar=grammar)
+    kwargs = {}
+    if grammar is not None:
+        kwargs["grammar"] = grammar
+    if stopped is not None:
+        kwargs["stopped"] = stopped
+    return engine.generate(*args, **kwargs)
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -1690,7 +1804,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_prompt(self, prompt, body):
         if not self.server.context_length:
             return
-        maximum, _temperature, _top_p, _grammar = generation_options(
+        maximum, _temperature, _top_p, _grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         input_limit = max(1, self.server.context_length - maximum)
         if len(prompt.encode()) > input_limit * PROMPT_BYTES_PER_TOKEN_LIMIT:
@@ -1886,7 +2000,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 pass
 
     def collect_generation(self, body, prompt, thinking):
-        maximum, temperature, top_p, grammar = generation_options(
+        maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -1906,7 +2020,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return reasoning, text, stats, {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
 
     def protocol_stream(self, body, prompt, request_id, consumer_factory, finish, fail):
-        maximum, temperature, top_p, grammar = generation_options(
+        maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
             body, self.server.max_tokens)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
@@ -2438,12 +2552,14 @@ class APIHandler(BaseHTTPRequestHandler):
         if dbg >= 2:
             sys.stderr.write(f"\n===== PROMPT [{request_id}] =====\n{prompt}\n===== OUTPUT [{request_id}] =====\n")
             sys.stderr.flush()
-        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
+            body, self.server.max_tokens)
         if grammar is not None and ARCH == "inkling":
             # inkling.c's serve loop speaks the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, "`response_format` grammars are not supported by the Inkling "
                                 "engine yet.", "response_format", "unsupported_parameter")
+        stop_sequences, ignore_leading_stop = stop_policy(body, chat)
         # tools and tool_choice come from chat_completion() already processed/filtered
         if chat and tool_choice == "none":
             tools = None          # client forbade tools: never surface tool_calls
@@ -2473,9 +2589,12 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
+                stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
                 stats = engine_generate(self.server.engine,
-                    prompt, maximum, temperature, top_p, output.append, cache_slot,
-                    self.client_disconnected, grammar=grammar)
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    self.client_disconnected, grammar=grammar,
+                    stopped=stop_filter.stopped)
+                stop_filter.finish()
                 text = "".join(output)
                 if ARCH == "inkling":
                     text, reasoning = split_inkling(text)
@@ -2596,13 +2715,16 @@ class APIHandler(BaseHTTPRequestHandler):
                         emit_content(sp["buf"][:flush])
                         sp["buf"] = sp["buf"][flush:]
                 splitter = ReasoningStream(thinking, emit_reasoning, emit_tools)
+                stop_filter = StopFilter(stop_sequences, splitter.feed, ignore_leading_stop)
                 def emit_tools_raw(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
-                    splitter.feed(chunk)
+                    stop_filter.feed(chunk)
                 stats = engine_generate(self.server.engine,
                     prompt, maximum, temperature, top_p, emit_tools_raw, cache_slot,
-                    lambda: not connected, grammar=grammar)
+                    lambda: not connected, grammar=grammar,
+                    stopped=stop_filter.stopped)
+                stop_filter.finish()
                 splitter.close()
                 if not sp["tool"] and sp["buf"]:
                     emit_content(sp["buf"])             # no tool call happened: flush held tail
@@ -2614,16 +2736,19 @@ class APIHandler(BaseHTTPRequestHandler):
                             "logprobs": None, "finish_reason": None}])
                 finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
             else:
+                splitter = (InklingStreamSplit(emit_content, emit_reasoning if chat else None)
+                            if ARCH == "inkling" else
+                            ReasoningStream(thinking, emit_reasoning, emit_content))
                 def emit_plain(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     splitter.feed(chunk)
-                splitter = (InklingStreamSplit(emit_content, emit_reasoning if chat else None)
-                            if ARCH == "inkling" else
-                            ReasoningStream(thinking, emit_reasoning, emit_content))
+                stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 stats = engine_generate(self.server.engine,
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
-                    lambda: not connected, grammar=grammar)
+                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    lambda: not connected, grammar=grammar,
+                    stopped=stop_filter.stopped)
+                stop_filter.finish()
                 splitter.close()
                 finish = "length" if stats["length_limited"] else "stop"
             ka_stop.set()                          # generation done: stop the keepalive pump
@@ -2706,7 +2831,8 @@ class APIHandler(BaseHTTPRequestHandler):
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
-        maximum, temperature, top_p, grammar = generation_options(body, self.server.max_tokens)
+        maximum, temperature, top_p, grammar, _stop_sequences = generation_options(
+            body, self.server.max_tokens)
         cache_slot = body.get("cache_slot")
         if (cache_slot is not None and
                 (isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or

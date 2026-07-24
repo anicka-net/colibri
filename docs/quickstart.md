@@ -120,11 +120,18 @@ You have two paths.
 
 ### Easiest — download a ready-made int4 container
 
-A pre-converted **GLM-5.2 int4** model is on Hugging Face. **Use the version
-with the int8 MTP heads** (the plain int4 heads disable speculative decoding —
-see [#8](https://github.com/JustVugg/colibri/issues/8)):
+A pre-converted **GLM-5.2 int4** model is on Hugging Face. Use the
+**group-scaled (gs64)** container with the **int8 MTP head**:
 
-**https://huggingface.co/mateogrgic/GLM-5.2-colibri-int4-with-int8-mtp**
+**https://huggingface.co/mastouri/GLM-5.2-colibri-int4-g64-with-int8-mtp**
+
+Group scales matter: the older per-row int4 containers
+(`mateogrgic/…-int4-with-int8-mtp`, `jlnsrk/…`) measure ~9pp worse on quality
+benchmarks and are the root cause of the think-mode loops and never-terminating
+generations in [#455](https://github.com/JustVugg/colibri/issues/455) — the
+gs64 container cured every failing case in that report. (The int8 MTP head is
+also required: plain int4 heads disable speculative decoding, see
+[#8](https://github.com/JustVugg/colibri/issues/8).)
 
 Download it into a folder on a fast disk, e.g. `/nvme/glm52_i4` (Linux/macOS) or
 `D:\glm52_i4` (Windows). It is about **372 GB**, so make sure you have the space.
@@ -138,8 +145,9 @@ never needs the full ~756 GB on disk at once:
 ./coli convert --model /nvme/glm52_i4
 ```
 
-This step uses Python and runs only once. Safe to interrupt and re-run — it
-resumes where it left off.
+This produces a group-scaled (gs64) container — the same quality-validated
+format as the recommended download. This step uses Python and runs only once.
+Safe to interrupt and re-run — it resumes where it left off.
 
 ---
 

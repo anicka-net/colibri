@@ -1183,6 +1183,40 @@ case through the generic W4A32 decoder. Repeat the build gate in the pinned
 CUDA 13.1 deployment container; CUDA 13.0 is an additional compatibility
 result, not a replacement for that pin.
 
+#### CUTLASS 4.6.1 refresh (2026-07-24, pondermatic)
+
+Integration candidate `9b1419a` advances the pinned submodule to the exact
+CUTLASS 4.6.1 tag (`e05f953a5b3d38adc240df2ff928e0421c2abba3`).
+CUDA 13.3 on Twilight compiled the complete native backend and test harness
+for `sm_121a`; the SFA/SFB layout oracle passed. In the pinned CUDA 13.1.1
+container on Pondermatic, layout parity, production-shape single and grouped
+NVFP4 oracles, the full CUDA backend, and the forced-generic control all
+passed.
+
+Three benchmark samples showed normal launch-scale variance. The two repeated
+samples measured:
+
+- I=6144/O=2048: S=1 native 0.054 ms versus generic 0.121--0.122 ms
+  (2.24--2.27x); S=64 native 0.106--0.108 ms versus 6.575 ms
+  (61.15--61.74x).
+- I=2048/O=6144: S=1 native 0.052 ms versus generic 0.123 ms
+  (2.34--2.35x); S=64 native 0.084--0.085 ms versus 7.184--7.195 ms
+  (84.54--85.68x).
+
+The S=1 results match the 4.5.1 baseline within the documented 3--5%
+run-to-run variation, and the large-row speedups are unchanged in practice.
+Keep `COLI_NVFP4_NATIVE_MIN_ROWS=1`; there is no new rejected threshold.
+Pageable and registered host-expert steady-state timings also remained
+equivalent.
+
+Backward compatibility was checked end to end: the existing aligned-v2
+faithful snapshot, whose manifest pins CUTLASS 4.5.1 at `2e602843`, loaded
+read-only with the 4.6.1 runtime and completed a full-model smoke with 4,971
+native calls, zero generic/unavailable/failure calls, and the component-aligned
+direct io_uring loader engaged. New conversions pin 4.6.1; loaders accept only
+the exact 4.5.1 and 4.6.1 version/SHA pairs because both describe the same
+persisted `cutlass-sm1xx-sf-atom-128x4-v1` bytes.
+
 #### NVFP4 expert-record alignment follow-up (2026-07-22)
 
 The converted payload aligns each expert record to 4 KiB, but does not align

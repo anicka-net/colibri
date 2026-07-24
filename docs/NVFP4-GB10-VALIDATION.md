@@ -1,11 +1,43 @@
 # GB10 NVFP4 validation gate
 
 The native backend is compile-validated on Twilight with CUDA 13.3 and
-correctness-validated on pondermatic's GB10 with CUDA 13.0.88, targeting
-`sm_121a`. Deployment remains pinned to the CUDA 13.1 development container;
-repeat every build below there before using a converted snapshot.
+correctness-validated on pondermatic's GB10 in the pinned CUDA 13.1.1
+development container, targeting `sm_121a`. CUDA 13.0.88 is also a historical
+compatibility result. Repeat every build below before using a converted
+snapshot.
 
-## Reconciled merge candidate
+## 2026-07-24 upstream and CUTLASS refresh
+
+Candidate `9b1419a` includes JustVugg `dev` through `26629e7` and updates the
+submodule from CUTLASS 4.5.1 to the exact CUTLASS 4.6.1 tag
+(`e05f953a5b3d38adc240df2ff928e0421c2abba3`). New conversions record the new
+pin. Existing 4.5.1 manifests remain valid only with their exact old revision
+because both releases use the persisted
+`cutlass-sm1xx-sf-atom-128x4-v1` layout; mixed version/revision pairs fail
+before tensor loading.
+
+Twilight passed the full C and Python/API suites, the native-server suite,
+the ModelOpt converter/manifest tests, a CUDA 13.3 native backend link for
+`sm_121a`, and the CUTLASS-derived SFA/SFB layout oracle. Pondermatic then
+passed that layout oracle, the production-shape single and grouped NVFP4
+oracle, the complete native CUDA backend harness, and its forced-generic
+control under CUDA 13.1.1.
+
+The existing faithful aligned-v2 snapshot still carries the exact CUTLASS
+4.5.1 manifest. A read-only full-model smoke accepted it, loaded all BF16
+resident tensors, completed a three-token prefill plus one generated token,
+and reported 4,971 native NVFP4 engagements with zero generic,
+native-unavailable, or failure events.
+
+Repeated microbenchmarks retain the existing dispatch decision. At `S=1`,
+6144-to-2048 measured 0.054 ms native versus 0.121--0.122 ms generic, while
+2048-to-6144 measured 0.052 ms versus 0.123 ms. At `S=64`, the corresponding
+native speedups remained 61--62x and 84--86x. These are within the established
+run-to-run range of the 4.5.1 measurements, so
+`COLI_NVFP4_NATIVE_MIN_ROWS=1` remains selected and no threshold is rejected
+anew.
+
+## Historical reconciled merge candidate
 
 Candidate `83fc0db` includes `origin/main` and JustVugg `dev` through
 `5724dae`. On Twilight it passes the full C suite and Python/API suite (221

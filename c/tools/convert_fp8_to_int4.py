@@ -353,8 +353,16 @@ def main():
         help="bits for other attention projections (q_a, q_b, kv_a). Default=ebits")
     ap.add_argument("--dmlp-bits", type=int, default=None,
         help="bits for dense MLP (first 3 layers). Default=ebits")
-    ap.add_argument("--group-size", type=int, default=0,  # 0 = per-row (backward compat); 128 = group-scaled
-        help="group size for int4 scales: 0=per-row (default), 128=one scale per 128 elements (much better quality)")
+    ap.add_argument("--group-size", type=int, default=64,
+        # gs64 is the community-validated default (#225 root cause, #455 5/5-clean
+        # verification, ablation #453: per-row int4 costs -9.3pp mean acc_norm vs
+        # -2.2..-3.4pp for group-scaled). Per-row remains available as an explicit
+        # opt-out; the resume manifest (check_or_record_params) refuses to mix the
+        # two in one outdir, so a resumed pre-default conversion aborts loudly
+        # instead of interleaving formats (#355-class).
+        help="group size for int4 scales: 64=one scale per 64 elements (default, "
+             "much better quality), 0=per-row (legacy; costs ~9pp on quality "
+             "benchmarks and is the #455 non-termination trigger)")
     # Per-projection bit overrides for routed experts (orthogonal to the type-level flags above).
     ap.add_argument("--up-bits", type=_bits, default=None,
         help="bits for up_proj in routed experts (e.g. 3 = int3-g64). Default=xbits")
@@ -389,7 +397,7 @@ def main():
         # EN: this way is repairable in place with tools/repair_mtp_int8.py.
         print(f"WARNING: --mtp with --ebits {a.ebits} and per-row scales ZEROES eh_proj's "
               "embedding half -> MTP acceptance ~0% (issue #8). Use the default --ebits 8, "
-              "or add --group-size 128 for group-scaled int4.")
+              "or drop --group-size 0 to get the group-scaled default.")
     if a.xbits is None: a.xbits = a.ebits
     for proj, val in (("gate_proj", a.gate_bits), ("up_proj", a.up_bits), ("down_proj", a.down_bits)):
         if val is not None: PROJ_BITS[proj] = val

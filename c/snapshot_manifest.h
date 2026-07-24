@@ -11,6 +11,7 @@
 
 #define COLI_MANIFEST_FILE "colibri-manifest.json"
 #define COLI_CUTLASS_451_REV "2e602843e75100d0e03934efb386b3e1e35d7907"
+#define COLI_CUTLASS_461_REV "e05f953a5b3d38adc240df2ff928e0421c2abba3"
 
 typedef struct {
     int present, version, resident_format, expert_format, group_size;
@@ -77,8 +78,12 @@ static inline int coli_manifest_load(const char *snapshot, ColiSnapshotManifest 
     }
     jval *cutlass=json_get(root,"cutlass");
     const char *cv=coli_manifest_string(cutlass,"version"), *cr=coli_manifest_string(cutlass,"revision");
-    if (!cv || strcmp(cv,"4.5.1") || !cr || strcmp(cr,COLI_CUTLASS_451_REV)) {
-        json_free(root); free(arena); return coli_manifest_error(error,error_cap,"manifest does not pin supported CUTLASS 4.5.1 revision");
+    int supported_cutlass=cv&&cr&&
+        ((!strcmp(cv,"4.5.1")&&!strcmp(cr,COLI_CUTLASS_451_REV)) ||
+         (!strcmp(cv,"4.6.1")&&!strcmp(cr,COLI_CUTLASS_461_REV)));
+    if (!supported_cutlass) {
+        json_free(root); free(arena); return coli_manifest_error(error,error_cap,
+            "manifest does not pin a supported CUTLASS revision");
     }
     jval *record=json_get(root,"expert_record"), *alignment=record&&record->t==J_OBJ?json_get(record,"alignment"):NULL;
     jval *immutable=record&&record->t==J_OBJ?json_get(record,"immutable"):NULL;
