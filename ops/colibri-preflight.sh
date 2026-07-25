@@ -26,13 +26,29 @@ for f in config.json tokenizer.json; do
 done
 
 min_shards=${COLI_PREFLIGHT_MIN_SHARDS:-1}
-shards=$(find "$MODEL" -maxdepth 1 -name 'out-[0-9]*' -type f 2>/dev/null | wc -l)
-[ "$shards" -ge "$min_shards" ] || \
-    fail "found $shards weight shards, expected >= $min_shards — snapshot incomplete"
+if [ -r "$MODEL/colibri-manifest.json" ]; then
+    # Native NVFP4 snapshots split immutable routed-expert records from
+    # variant-owned resident tensors.  Both sets are required; the expert set
+    # may be hard-linked from the shared payload directory.
+    shards=$(find "$MODEL" -maxdepth 1 -name 'experts-*.safetensors' -type f 2>/dev/null | wc -l)
+    resident=$(find "$MODEL" -maxdepth 1 -name 'resident-*.safetensors' -type f 2>/dev/null | wc -l)
+    [ "$shards" -ge "$min_shards" ] || \
+        fail "found $shards NVFP4 expert shards, expected >= $min_shards — snapshot incomplete"
+    [ "$resident" -ge "$min_shards" ] || \
+        fail "found $resident resident shards, expected >= $min_shards — snapshot incomplete"
+else
+    shards=$(find "$MODEL" -maxdepth 1 -name 'out-[0-9]*' -type f 2>/dev/null | wc -l)
+    [ "$shards" -ge "$min_shards" ] || \
+        fail "found $shards weight shards, expected >= $min_shards — snapshot incomplete"
+fi
 
 if [ "${COLI_PREFLIGHT_NEED_IDX:-0}" = "1" ]; then
-    idx=$(find "$MODEL" -maxdepth 1 -name 'out-idx-*' -type f 2>/dev/null | wc -l)
-    [ "$idx" -ge 1 ] || fail "no out-idx-* files — DSA sparse attention would be disabled"
+    if [ -r "$MODEL/colibri-manifest.json" ]; then
+        idx=$(find "$MODEL" -maxdepth 1 -name 'indexer-*.safetensors' -type f 2>/dev/null | wc -l)
+    else
+        idx=$(find "$MODEL" -maxdepth 1 -name 'out-idx-*' -type f 2>/dev/null | wc -l)
+    fi
+    [ "$idx" -ge 1 ] || fail "no DSA indexer shards — sparse attention would be disabled"
 fi
 
 min_gb=${COLI_PREFLIGHT_MIN_GB:-0}
