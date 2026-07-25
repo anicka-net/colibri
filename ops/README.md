@@ -28,6 +28,9 @@ Spark-class hosts) and `service.env.multigpu.example` (discrete multi-GPU,
 settings that silently cost an order of magnitude, notably `AUTOPIN`, which must
 NOT be disabled where a VRAM expert tier is used.  The hardware-tuning skill
 documents the per-profile reasoning and the measured service gotchas.
+`service.env.pondermatic.example` is the validated native-NVFP4/FP8-KV
+production profile for the named GB10 host; it reserves a 256k single-slot
+context and lets the runtime RAM guard maximize the remaining expert cache.
 
 `ExecStartPre` runs `ops/colibri-preflight.sh`, which refuses to start when the
 snapshot is missing or short (tmpfs does not survive a reboot), when
