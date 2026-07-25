@@ -1323,3 +1323,21 @@ the faithful aligned snapshot: it spends memory and speculative reads without
 recovering queue depth. The next I/O probe should instrument submitted and
 completed native-record depth plus time in completion/finalization and
 host-backed first-touch; do not retune the NVMe itself.
+
+#### Pondermatic compact/FP8 production deployment (2026-07-25)
+
+The aligned-v2 compact snapshot is deployed through `coli-native` with native
+NVFP4 experts, INT8 resident matrices, FP8 E4M3 device KV shadows, canonical
+FP32 host KV, direct io_uring expert loads, and CUTLASS 4.6.1. The service
+advertises a 196,608-token (192k) context and a 16,384-token completion limit.
+The live format-aware RAM guard reduced the requested expert cap from 256 to 3,
+projecting a 107.8 GB peak under its 108.5 GB automatic safety budget.
+
+A 262,144-token context was rejected rather than overcommitted: even cap 1
+projected 125.0 GB (18.5 GB resident plus 104.9 GB reserve), above both the
+automatic budget and the 123.1 GB actually available at startup. A context
+between 192k and 256k would leave only one or two cache slots per sparse layer,
+so 192k is the practical maximum that retains a useful expert cache. Production
+health, model discovery, and a deterministic chat-completion smoke passed; the
+service returned the requested `NVFP4 production ready` response with no
+restart.
