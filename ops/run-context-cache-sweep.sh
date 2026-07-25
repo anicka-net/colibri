@@ -43,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-systemctl --user stop colibri-watchdog.timer
+systemctl --user stop colibri-watchdog.timer colibri-watchdog.service
 systemctl --user stop colibri-server.service
 
 set -a
