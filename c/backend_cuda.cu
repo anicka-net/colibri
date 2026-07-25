@@ -2363,7 +2363,8 @@ __global__ static void attention_absorb_sel_kernel(float *ctx,const float *q,
         const void *weights,const float *wscale,int fmt,
         int H,int Q,int R,int V,int K,float scale);
 static int dsa_decode_tcgather(int device,float *ctx,const float *q,
-        const float *latent,const float *rope,const int *sel,int S,int topk,
+        const float *latent,const float *rope,const float *latent_scale,
+        const float *rope_scale,const int *sel,int S,int topk,
         const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,int T,float scale);
 /* COLI_DBG_DSACHAIN=1: tempi cumulativi del punto di sync a metà catena
  * (drenaggio pipeline + download punteggi) e del top-k host.  Esposti con una
@@ -2612,10 +2613,11 @@ extern "C" int coli_cuda_pipe_attn_chain_v2(int device,
     int tc_uniform=selm;
     for(int s=0;tc_uniform&&s<S;s++)
         if(dsa->nsel[s]!=dsa->topk)tc_uniform=0;
-    if(tc_uniform&&decode_tcg&&!fp8){
+    if(tc_uniform&&decode_tcg){
         tc_ctx=coli_cuda_pipe_scratch(device,41,(size_t)S*H*vh*4);
-        if(tc_ctx)tc_ok=dsa_decode_tcgather(device,tc_ctx,qQ,d_Lc,d_Rc,dsel_d,S,
-            dsa->topk,kvb,H,qk_nope,qk_rope,vh,kv_lora,pos_base+S,attn_scale);
+        if(tc_ctx)tc_ok=dsa_decode_tcgather(device,tc_ctx,qQ,d_Lc,d_Rc,
+            d_Lc_scale,d_Rc_scale,dsel_d,S,dsa->topk,kvb,H,qk_nope,qk_rope,
+            vh,kv_lora,pos_base+S,attn_scale);
         if(tc_ok)coli_dsac_tcg_rows+=(uint64_t)S;
         else coli_dsac_tcg_fb+=(uint64_t)S;
     }
@@ -3327,13 +3329,14 @@ extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,con
  * Replaces attention_absorb_batch_kernel at prefill sizes, where the naive
  * per-element contraction is ~60x off the FLOP floor.  Same math on tensor
  * cores, one head at a time (scores[S,T] for all 64 heads would be GBs):
- *   1. qabs[S,K]   = q_nope[S,Q] @ (ws*Wk)[Q,K]           int4 weights, NN
+ *   1. qabs[S,K]   = q_nope[S,Q] @ Wk[Q,K]                resident tile decode, NN
  *   2. scores[S,T] = qabs @ Lc^T + q_rope @ Rc^T           fp16 TC, NT
  *   3. causal online-softmax rows (scale applied here; tail zeroed so the
  *      step-4 reduction can run over the full T)
  *   4. ctxL[S,K]   = P[S,T] @ Lc[T,K]                      fp16 TC, NN
- *   5. ctx[:,hV:]  = ctxL @ Wv^T ;  out = ctx @ Wo^T       int4 weights, NT
- * Weight nibbles are SIGNED (upload converts); decode matches w4a16_matmul. */
+ *   5. ctx[:,hV:]  = ctxL @ Wv^T ;  out = ctx @ Wo^T       resident tile decode, NT
+ * Row-INT4 keeps its signed-nibble specialization; row-INT8 and BF16 decode
+ * the same logical tiles and share the score/context tensor-core stages. */
 template<typename AT,typename BT>
 __device__ static void gemm_f16_tc_body(float *C,const AT *A,const BT *B,
         int M,int N,int K,int lda,int ldb,int ldc,int transB,int beta){
@@ -3503,6 +3506,102 @@ __global__ static void dsa_gather_sel(KT *LcSel,KT *RcSel,
     for(int k=threadIdx.x;k<K;k+=blockDim.x)ld[k]=ls[k];
     for(int r=threadIdx.x;r<R;r+=blockDim.x)rd[r]=rs[r];
 }
+/* FP8 shadows carry one fp32 scale per canonical KV row.  Gather directly to
+ * fp16: the following score/context GEMMs already consume fp16, and selected
+ * rows are the only values worth dequantizing during sparse decode. */
+__global__ static void dsa_gather_sel_fp8(__half *LcSel,__half *RcSel,
+        const uint8_t *latent,const uint8_t *rope,const float *latent_scale,
+        const float *rope_scale,const int *sel,int topk,int K,int R,int T){
+    size_t z=blockIdx.y,j=blockIdx.x;
+    int t=sel[z*topk+j];
+    if(t<0)t=0;if(t>=T)t=T-1;
+    const uint8_t *ls=latent+(size_t)t*K,*rs=rope+(size_t)t*R;
+    __half *ld=LcSel+(z*topk+j)*K,*rd=RcSel+(z*topk+j)*R;
+    float lscale=latent_scale[t],rscale=rope_scale[t];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x)
+        ld[k]=__float2half(e4m3fn_value(ls[k])*lscale);
+    for(int r=threadIdx.x;r<R;r+=blockDim.x)
+        rd[r]=__float2half(e4m3fn_value(rs[r])*rscale);
+}
+/* The resident BF16 and row-INT8 attention matrices use the same logical
+ * block-diagonal layout as row-INT4.  Decode a 16x16 weight tile to fp16 and
+ * retain the WMMA contraction; this avoids falling all the way back to the
+ * per-head scalar absorb kernel merely because the resident format changed. */
+__device__ static void quant_a16_nn_scaled_body(float *y,const float *x,
+        const void *w,const float *ws,int fmt,int M,int N,int K,int lda,
+        size_t wrb,int ldy){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*lda+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int k=z/16,n=z%16,gk=k0+k,gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K)v=weight_at(w,fmt,(size_t)gk*wrb,gn)*
+                row_scale_at(ws,fmt,gk);
+            bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::row_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*ldy+n0+n]=out[warp][z];}
+#endif
+}
+__global__ static void quant_a16_nn_scaled_bd(float *y,const float *x,
+        const void *w,const float *ws,int fmt,int M,int N,int K,int lda,
+        size_t wrb,int ldy,int xz,int wrowz,int wrow0,int yz){
+    size_t z=blockIdx.z,wr=z*wrowz+wrow0;
+    quant_a16_nn_scaled_body(y+z*yz,x+z*xz,
+        (const uint8_t*)w+wr*wrb,ws?ws+wr:nullptr,fmt,M,N,K,lda,wrb,ldy);
+}
+__global__ static void quant_a16_nn_scaled(float *y,const float *x,
+        const void *w,const float *ws,int fmt,int M,int N,int K,int lda,
+        size_t wrb,int ldy){
+    quant_a16_nn_scaled_body(y,x,w,ws,fmt,M,N,K,lda,wrb,ldy);
+}
+__device__ static void quant_a16_nt_ld_body(float *y,const float *x,
+        const void *w,const float *ws,int fmt,int M,int K,int N,int lda,int ldy,
+        size_t wrb){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*lda+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int n=z/16,gk=k0+(z%16),gn=n0+n;float v=0.f;
+            if(gn<N&&gk<K)v=weight_at(w,fmt,(size_t)gn*wrb,gk)*
+                row_scale_at(ws,fmt,gn);
+            bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,n=z%16;
+        if(m0+m<M&&n0+n<N)y[(size_t)(m0+m)*ldy+n0+n]=out[warp][z];}
+#endif
+}
+__global__ static void quant_a16_nt_bd(float *y,const float *x,const void *w,
+        const float *ws,int fmt,int M,int K,int N,int lda,int ldy,size_t wrb,
+        int xz,int wrowz,int wrow0,int yz){
+    size_t z=blockIdx.z,wr=z*wrowz+wrow0;
+    quant_a16_nt_ld_body(y+z*yz,x+z*xz,
+        (const uint8_t*)w+wr*wrb,ws?ws+wr:nullptr,fmt,M,K,N,lda,ldy,wrb);
+}
+__global__ static void quant_a16_nt_ld(float *y,const float *x,const void *w,
+        const float *ws,int fmt,int M,int K,int N,int lda,int ldy,size_t wrb){
+    quant_a16_nt_ld_body(y,x,w,ws,fmt,M,K,N,lda,ldy,wrb);
+}
 /* softmax in-place su righe piene (nessuna causalita': ogni riga di fase B
  * vede esattamente topk chiavi selezionate). */
 __global__ static void softmax_rows_flat(float *rows,int width,float scale){
@@ -3524,13 +3623,18 @@ __global__ static void softmax_rows_flat(float *rows,int width,float scale){
  * All launches use the legacy stream because the fused chain's projections,
  * KV writes, selection upload and consumers are ordered there. */
 static int dsa_decode_tcgather(int device,float *ctx,const float *q,
-        const float *latent,const float *rope,const int *sel,int S,int topk,
+        const float *latent,const float *rope,const float *latent_scale,
+        const float *rope_scale,const int *sel,int S,int topk,
         const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,int T,float scale){
     DeviceContext *dc=find_ctx(device);
     if(!dc||!ctx||!q||!latent||!rope||!sel||!kvb||!select_ctx(dc)||
-       dc->compute_major<7||S<1||S>4||topk<1||topk>T||kvb->fmt!=2||
+       dc->compute_major<7||S<1||S>4||topk<1||topk>T||
+       (kvb->fmt!=COLI_TENSOR_INT4_ROW&&kvb->fmt!=COLI_TENSOR_INT8_ROW&&
+        kvb->fmt!=COLI_TENSOR_BF16)||
        kvb->I!=K||kvb->O!=H*(Q+V)||(Q&15)||(R&15)||(V&15)||(K&15))return 0;
-    int f16=kv_f16_mode(); size_t esz=f16?sizeof(__half):sizeof(float);
+    int kvdtype=kv_dtype_mode(),f16=kvdtype==1,fp8=kvdtype==2;
+    if(fp8&&(!latent_scale||!rope_scale))return 0;
+    size_t esz=(f16||fp8)?sizeof(__half):sizeof(float);
     float *LcSel=coli_cuda_pipe_scratch(device,32,(size_t)S*topk*K*esz);
     float *RcSel=coli_cuda_pipe_scratch(device,33,(size_t)S*topk*R*esz);
     float *qabs =coli_cuda_pipe_scratch(device,34,(size_t)S*H*K*4);
@@ -3540,20 +3644,27 @@ static int dsa_decode_tcgather(int device,float *ctx,const float *q,
     const char *sd=getenv("COLI_DSA_TC_SYNC_DEBUG"); int syncdbg=sd&&atoi(sd);
 #define TC_SYNC(label) do{if(syncdbg&&!cuda_ok(cudaDeviceSynchronize(),label))return 0;}while(0)
     cudaStream_t st=0; const uint8_t *wb=(const uint8_t*)kvb->weights;
-    const float *wsc=kvb->scales; size_t rb=row_bytes(2,K);
+    const float *wsc=kvb->scales; size_t rb=row_bytes(kvb->fmt,K);
     if(f16)dsa_gather_sel<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
         (__half*)LcSel,(__half*)RcSel,(const __half*)latent,(const __half*)rope,
         sel,topk,K,R,T);
+    else if(fp8)dsa_gather_sel_fp8<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
+        (__half*)LcSel,(__half*)RcSel,(const uint8_t*)latent,(const uint8_t*)rope,
+        latent_scale,rope_scale,sel,topk,K,R,T);
     else dsa_gather_sel<<<dim3((unsigned)topk,(unsigned)S),128,0,st>>>(
         LcSel,RcSel,latent,rope,sel,topk,K,R,T);
     if(!cuda_ok(cudaGetLastError(),"decode tc gather"))return 0;
     TC_SYNC("decode tc gather sync");
-    w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
-        qabs,q,wb,wsc,S,K,Q,H*(Q+R),rb,H*K,Q+R,Q+V,0,K);
+    if(kvb->fmt==COLI_TENSOR_INT4_ROW)
+        w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
+            qabs,q,wb,wsc,S,K,Q,H*(Q+R),rb,H*K,Q+R,Q+V,0,K);
+    else
+        quant_a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
+            qabs,q,wb,wsc,kvb->fmt,S,K,Q,H*(Q+R),rb,H*K,Q+R,Q+V,0,K);
     if(!cuda_ok(cudaGetLastError(),"decode tc qabs"))return 0;
     TC_SYNC("decode tc qabs sync");
     dim3 gs((unsigned)((topk+63)/64),(unsigned)((H+15)/16),(unsigned)S);
-    if(f16){
+    if(f16||fp8){
         gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,qabs,(const __half*)LcSel,
             H,topk,K,K,K,topk,1,0,(size_t)H*K,(size_t)topk*K,(size_t)H*topk);
         gemm_f16_tc_zb<<<gs,128,0,st>>>(scb,q+Q,(const __half*)RcSel,
@@ -3570,19 +3681,36 @@ static int dsa_decode_tcgather(int device,float *ctx,const float *q,
     if(!cuda_ok(cudaGetLastError(),"decode tc softmax"))return 0;
     TC_SYNC("decode tc softmax sync");
     dim3 gc((unsigned)((K+63)/64),(unsigned)((H+15)/16),(unsigned)S);
-    if(f16)gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,(const __half*)LcSel,
+    if(f16||fp8)gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,(const __half*)LcSel,
         H,K,topk,topk,K,K,0,0,(size_t)H*topk,(size_t)topk*K,(size_t)H*K);
     else gemm_f16_tc_zb<<<gc,128,0,st>>>(ctxL,scb,LcSel,
         H,K,topk,topk,K,K,0,0,(size_t)H*topk,(size_t)topk*K,(size_t)H*K);
     if(!cuda_ok(cudaGetLastError(),"decode tc context"))return 0;
     TC_SYNC("decode tc context sync");
-    w4a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
-        ctx,ctxL,wb,wsc,S,K,V,H*K,H*V,K,Q+V,Q,V);
+    if(kvb->fmt==COLI_TENSOR_INT4_ROW)
+        w4a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
+            ctx,ctxL,wb,wsc,S,K,V,H*K,H*V,K,Q+V,Q,V);
+    else
+        quant_a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((S+15)/16),(unsigned)H),128,0,st>>>(
+            ctx,ctxL,wb,wsc,kvb->fmt,S,K,V,H*K,H*V,rb,K,Q+V,Q,V);
     if(!cuda_ok(cudaGetLastError(),"decode tc value"))return 0;
     TC_SYNC("decode tc value sync");
 #undef TC_SYNC
     return 1;
 }
+/* Narrow CUDA-test hook for the otherwise internal decode decomposition.
+ * Keeping device pointers in the contract lets the fixture exercise exactly
+ * the production kernels without adding a second allocation/conversion path. */
+#ifdef COLI_CUDA_TEST
+extern "C" int coli_cuda_test_dsa_decode_tcgather(int device,float *ctx,
+        const float *q,const float *latent,const float *rope,
+        const float *latent_scale,const float *rope_scale,const int *sel,
+        int S,int topk,const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,
+        int T,float scale){
+    return dsa_decode_tcgather(device,ctx,q,latent,rope,latent_scale,rope_scale,
+                              sel,S,topk,kvb,H,Q,R,V,K,T,scale);
+}
+#endif
 /* DSA prefill: k_idx per S righe nuove nell'ombra Ic device + punteggi della
  * selezione per le righe di fase B (pos+1 > topk), scaricati sull'host per il
  * top-k esatto.  xn_dev = righe in_ln-normate [S,D], qres_dev = residuo q
@@ -3721,11 +3849,14 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
             (size_t)S_b*sel_topk*sizeof(int),cudaMemcpyHostToDevice,st),
             "prefill sel upload")) return 0;
     }
-    /* Faithful snapshots keep resident attention matrices in BF16 and compact
-     * snapshots keep them in row-INT8.  The tensor-core decomposition below is
-     * specific to row-INT4; retain the same phase-A/phase-B DSA semantics for
-     * all other explicit formats through the scalar CUDA oracle kernels. */
-    if(w->fmt!=COLI_TENSOR_INT4_ROW||proj->fmt!=COLI_TENSOR_INT4_ROW){
+    /* Keep an explicit scalar CUDA oracle for unknown future formats.  INT4,
+     * INT8 and BF16 all use the tensor-core decomposition below; only the
+     * two resident-weight projection stages differ in their tile decoder. */
+    int wtc=w->fmt==COLI_TENSOR_INT4_ROW||w->fmt==COLI_TENSOR_INT8_ROW||
+            w->fmt==COLI_TENSOR_BF16;
+    int ptc=proj->fmt==COLI_TENSOR_INT4_ROW||proj->fmt==COLI_TENSOR_INT8_ROW||
+            proj->fmt==COLI_TENSOR_BF16;
+    if(!wtc||!ptc){
         int dtype=kv_dtype_mode();
         if(dtype==2&&(!latent_scale||!rope_scale)){
             g_kv_fp8_fallbacks++;return 0;
@@ -3770,7 +3901,7 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
         if(dtype==2)g_kv_fp8_reader_rows+=(uint64_t)T;
         return cuda_ok(cudaStreamSynchronize(st),"prefill generic DSA attention sync");
     }
-    size_t rb=row_bytes(2,K);
+    size_t rb=row_bytes(w->fmt,K),prb=row_bytes(proj->fmt,proj->I);
     const uint8_t *wb=(const uint8_t*)w->weights;
     const float *wsc=w->scales;
     int dtype=kv_dtype_mode(),f16=dtype==1;
@@ -3794,8 +3925,12 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
         for(int h=0;h<H;h++){
             size_t rbase=(size_t)h*(Q+V);
             const float *qh=q_dev+(size_t)h*(Q+R);
-            w4a16_nn_scaled<<<gq,128,0,st>>>(dc->pf_q,qh,wb+rbase*rb,
-                wsc+rbase,S_a,K,Q,H*(Q+R),rb,K);
+            if(w->fmt==COLI_TENSOR_INT4_ROW)
+                w4a16_nn_scaled<<<gq,128,0,st>>>(dc->pf_q,qh,wb+rbase*rb,
+                    wsc+rbase,S_a,K,Q,H*(Q+R),rb,K);
+            else
+                quant_a16_nn_scaled<<<gq,128,0,st>>>(dc->pf_q,qh,wb+rbase*rb,
+                    wsc?wsc+rbase:nullptr,w->fmt,S_a,K,Q,H*(Q+R),rb,K);
             if(f16){
                 gemm_f16_tc<<<gs,128,0,st>>>(dc->pf_s,dc->pf_q,hL,
                     S_a,T_a,K,K,K,T_a,1,0);
@@ -3812,8 +3947,13 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
                 S_a,K,T_a,T_a,K,K,0,0);
             else gemm_f16_tc<<<gq,128,0,st>>>(dc->pf_c,dc->pf_s,latent_dev,
                 S_a,K,T_a,T_a,K,K,0,0);
-            w4a16_nt_ld<<<gv,128,0,st>>>(dc->ac+(size_t)h*V,dc->pf_c,
-                wb+(rbase+Q)*rb,wsc+rbase+Q,S_a,K,V,H*V);
+            if(w->fmt==COLI_TENSOR_INT4_ROW)
+                w4a16_nt_ld<<<gv,128,0,st>>>(dc->ac+(size_t)h*V,dc->pf_c,
+                    wb+(rbase+Q)*rb,wsc+rbase+Q,S_a,K,V,H*V);
+            else
+                quant_a16_nt_ld<<<gv,128,0,st>>>(dc->ac+(size_t)h*V,dc->pf_c,
+                    wb+(rbase+Q)*rb,wsc?wsc+rbase+Q:nullptr,w->fmt,
+                    S_a,K,V,K,H*V,rb);
         }
     }
     if(S_b>0){
@@ -3841,9 +3981,14 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
             else dsa_gather_sel<<<dim3((unsigned)sel_topk,(unsigned)rn),128,0,st>>>(
                 LcSel,RcSel,latent_dev,rope_dev,dsel+(size_t)c0*sel_topk,sel_topk,K,R,T);
             /* qabs[r,h,:] = q_nope[r,h,:] @ (ws*Wk_h) */
-            w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
-                qabs,q_dev+(size_t)row0*H*(Q+R),wb,wsc,rn,K,Q,H*(Q+R),rb,H*K,
-                Q+R,Q+V,0,K);
+            if(w->fmt==COLI_TENSOR_INT4_ROW)
+                w4a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
+                    qabs,q_dev+(size_t)row0*H*(Q+R),wb,wsc,rn,K,Q,H*(Q+R),rb,H*K,
+                    Q+R,Q+V,0,K);
+            else
+                quant_a16_nn_scaled_bd<<<dim3((unsigned)((K+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
+                    qabs,q_dev+(size_t)row0*H*(Q+R),wb,wsc,w->fmt,rn,K,Q,
+                    H*(Q+R),rb,H*K,Q+R,Q+V,0,K);
             /* scores[r,h,:] = qabs[r,h,:] @ LcSel[r]^T + q_rope[r,h,:] @ RcSel[r]^T */
             if(f16){
                 gemm_f16_tc_zb<<<dim3((unsigned)((sel_topk+63)/64),(unsigned)((H+15)/16),(unsigned)rn),128,0,st>>>(
@@ -3869,9 +4014,14 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
                 ctxL,scb,LcSel,H,K,sel_topk,sel_topk,K,K,0,0,
                 (size_t)H*sel_topk,(size_t)sel_topk*K,(size_t)H*K);
             /* ctx[r,h*V..] = ctxL[r,h,:] @ (Wv_h)^T */
-            w4a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
-                dc->ac+(size_t)row0*H*V,ctxL,wb,wsc,rn,K,V,H*K,H*V,
-                K,Q+V,Q,V);
+            if(w->fmt==COLI_TENSOR_INT4_ROW)
+                w4a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
+                    dc->ac+(size_t)row0*H*V,ctxL,wb,wsc,rn,K,V,H*K,H*V,
+                    K,Q+V,Q,V);
+            else
+                quant_a16_nt_bd<<<dim3((unsigned)((V+63)/64),(unsigned)((rn+15)/16),(unsigned)H),128,0,st>>>(
+                    dc->ac+(size_t)row0*H*V,ctxL,wb,wsc,w->fmt,rn,K,V,H*K,H*V,
+                    rb,K,Q+V,Q,V);
         }
         if(!tcg){
             size_t smem_sel=(size_t)(2*K+sel_topk+256)*sizeof(float);
@@ -3885,8 +4035,12 @@ extern "C" int coli_cuda_prefill_attn_gemm(ColiCudaTensor *w,ColiCudaTensor *pro
     }
     if(!cuda_ok(cudaGetLastError(),"prefill gemm attention launch"))return 0;
     dim3 go((unsigned)((proj->O+63)/64),(unsigned)((S+15)/16));
-    w4a16_nt_ld<<<go,128,0,st>>>(out_dev,dc->ac,
-        (const uint8_t*)proj->weights,proj->scales,S,proj->I,proj->O,proj->O);
+    if(proj->fmt==COLI_TENSOR_INT4_ROW)
+        w4a16_nt_ld<<<go,128,0,st>>>(out_dev,dc->ac,
+            (const uint8_t*)proj->weights,proj->scales,S,proj->I,proj->O,proj->O);
+    else
+        quant_a16_nt_ld<<<go,128,0,st>>>(out_dev,dc->ac,proj->weights,
+            proj->scales,proj->fmt,S,proj->I,proj->O,proj->I,proj->O,prb);
     if(!cuda_ok(cudaGetLastError(),"prefill gemm o_proj launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(st),"prefill gemm attention sync");
 }

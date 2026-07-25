@@ -9172,7 +9172,15 @@ int main(int argc, char **argv){
     if(getenv("SERVE")){
         if(getenv("SERVE_BATCH") && atoi(getenv("SERVE_BATCH"))) run_serve_mux(&m,snap);
         else run_serve(&m,snap);
-        if(stats) stats_dump(&m,stats); return 0;
+        if(stats) stats_dump(&m,stats);
+#ifdef COLI_CUDA
+        /* Persistent serve used to return before the same aggregate backend
+         * report emitted by PROMPT/TF runs.  That hid native NVFP4 engagement
+         * and silent-fallback counters from service benchmarks even after a
+         * clean EOF shutdown. */
+        if(g_cuda_enabled) cuda_stats_print();
+#endif
+        return 0;
     }
 
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */

@@ -116,6 +116,32 @@ live-tool harness invocation was invalid because it mixed `coli serve` flags
 with the underlying `openai_server.py` flags; no model was loaded in that
 attempt.
 
+The post-merge resident-format/FP8 gate on 2026-07-25 used CUDA 13.1,
+CUTLASS 4.6.1, and `sm_121a`.  The device harness passed FP32, FP16, FP8,
+forced-generic, single-GEMM, grouped-NVFP4, resident BF16/row-INT8, and 32k
+FP8-shadow coverage.  The full-model matrix then completed
+faithful/compact x FP16/FP8 at both a 6,009-token programming prompt and a
+warmed short prompt:
+
+| Profile | Workload | FP16 prefill/decode | FP8 prefill/decode |
+|---|---|---:|---:|
+| faithful | 6,009-token | 12.76 / 1.09 tok/s | 12.79 / 1.11 tok/s |
+| compact | 6,009-token | 14.37 / 1.34 tok/s | 14.30 / 1.38 tok/s |
+| faithful | short | 4.27 / 1.15 tok/s | 4.26 / 1.14 tok/s |
+| compact | short | 4.51 / 1.41 tok/s | 4.58 / 1.39 tok/s |
+
+Long cases used one sample per cell and short cases two, so treat small
+FP16/FP8 differences as parity rather than a ranking.  All four long cases
+engaged the DSA TC gather for 4,914 decode rows with zero fallback, all 192
+resident dense-layer calls engaged, and native NVFP4 reported about 171k
+calls with zero generic/unavailable/failure calls.  Each FP8 long case
+quantized 937,404 KV rows and read 473,616 rows with zero fallback.  Extending
+the TC decomposition from row-INT4 to resident BF16/row-INT8 and gathering
+scaled E4M3 KV directly to FP16 raised long-prompt prefill from the earlier
+5.43 to 12.76 tok/s for faithful and 6.21 to 14.37 tok/s for compact.  Unlike
+the older INT4-only Spark result below, NVFP4 production must therefore keep
+`COLI_DSA_DECODE_TCGATHER=1` and `COLI_DSA_TCGATHER=1`.
+
 The corrected faithful-NVFP4 two-turn tool gate exposed a server-profile
 boundary already represented by `COLI_SERVE_ALL_STOPS`.  With the default
 single-EOS serve policy, the accurate NVFP4 model emitted a valid Rome tool

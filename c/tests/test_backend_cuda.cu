@@ -35,6 +35,11 @@ static int relative_rms(const float *got,const float *want,int n,float limit){
 extern "C" int coli_cuda_test_gemv_q4_cached(int device,const float *x,
         const uint8_t *w,const float *scales,int I,int O,float *shared_out,
         float *cached_out);
+extern "C" int coli_cuda_test_dsa_decode_tcgather(int device,float *ctx,
+        const float *q,const float *latent,const float *rope,
+        const float *latent_scale,const float *rope_scale,const int *sel,
+        int S,int topk,const ColiCudaTensor *kvb,int H,int Q,int R,int V,int K,
+        int T,float scale);
 
 int main(int argc, char **argv) {
     int devices[COLI_CUDA_MAX_DEVICES], ndev = argc > 1 ? argc - 1 : 1;
@@ -319,15 +324,109 @@ int main(int argc, char **argv) {
     }
     coli_cuda_tensor_free(atbf);
 
-    /* Faithful snapshots use BF16 resident attention tensors.  Exercise the
-       generic DSA prefill split (two causal rows + one selected row) against a
-       zero oracle in every configured KV-shadow dtype. */
+    /* Decode selected-attention TC gather must engage for both resident
+       formats used by NVFP4 snapshots and for every KV shadow dtype. */
+    {
+        constexpr int S=1,H=2,Q=16,R=16,V=16,K=16,T=4,TOPK=3,O=H*(Q+V);
+        float wf[O*K],q[S*H*(Q+R)],lh[T*K],rh[T*R],ref[S*H*V],got[S*H*V];
+        int8_t wi[O*K];float ws[O];uint16_t wb[O*K];int sel[TOPK]={0,2,3};
+        for(int row=0;row<O;row++){
+            ws[row]=1.f/32.f;
+            for(int k=0;k<K;k++){
+                int v=(row*7+k*3)%9-4;wf[row*K+k]=(float)v/32.f;
+                wi[row*K+k]=(int8_t)v;
+                uint32_t bits;std::memcpy(&bits,&wf[row*K+k],sizeof(bits));
+                wb[row*K+k]=(uint16_t)(bits>>16);
+            }
+        }
+        for(int i=0;i<(int)(sizeof(q)/sizeof(q[0]));i++)q[i]=(float)((i*5)%11-5)/8.f;
+        for(int i=0;i<T*K;i++)lh[i]=(float)((i*3)%13-6)/8.f;
+        for(int i=0;i<T*R;i++)rh[i]=(float)((i*7)%15-7)/8.f;
+        for(int h=0;h<H;h++){
+            float qa[K],score[TOPK],cl[K];int base=h*(Q+V);
+            for(int k=0;k<K;k++){qa[k]=0;for(int d=0;d<Q;d++)
+                qa[k]+=q[h*(Q+R)+d]*wf[(base+d)*K+k];}
+            float mx=-1e30f,z=0;
+            for(int j=0;j<TOPK;j++){score[j]=0;int t=sel[j];
+                for(int k=0;k<K;k++)score[j]+=qa[k]*lh[t*K+k];
+                for(int r=0;r<R;r++)score[j]+=q[h*(Q+R)+Q+r]*rh[t*R+r];
+                score[j]*=.25f;mx=score[j]>mx?score[j]:mx;}
+            for(int j=0;j<TOPK;j++){score[j]=std::exp(score[j]-mx);z+=score[j];}
+            for(int k=0;k<K;k++){cl[k]=0;for(int j=0;j<TOPK;j++)
+                cl[k]+=score[j]/z*lh[sel[j]*K+k];}
+            for(int v=0;v<V;v++){ref[h*V+v]=0;for(int k=0;k<K;k++)
+                ref[h*V+v]+=cl[k]*wf[(base+Q+v)*K+k];}
+        }
+        ColiCudaTensor *ti=nullptr,*tb=nullptr;
+        int kd=coli_cuda_kv_dtype(),esz=kd==COLI_KV_FP8_E4M3?1:kd==COLI_KV_FP16?2:4;
+        float *qd=(float*)coli_cuda_pipe_alloc(d0,sizeof(q));
+        void *ld=coli_cuda_pipe_alloc(d0,(size_t)T*K*esz);
+        void *rd=coli_cuda_pipe_alloc(d0,(size_t)T*R*esz);
+        float *ls=kd==COLI_KV_FP8_E4M3?(float*)coli_cuda_pipe_alloc(d0,T*sizeof(float)):nullptr;
+        float *rs=kd==COLI_KV_FP8_E4M3?(float*)coli_cuda_pipe_alloc(d0,T*sizeof(float)):nullptr;
+        int *sd=(int*)coli_cuda_pipe_alloc(d0,sizeof(sel));
+        float *cd=(float*)coli_cuda_pipe_alloc(d0,sizeof(got));
+        if(!coli_cuda_tensor_upload(&ti,wi,ws,COLI_TENSOR_INT8_ROW,K,O,d0)||
+           !coli_cuda_tensor_upload(&tb,wb,nullptr,COLI_TENSOR_BF16,K,O,d0)||
+           !qd||!ld||!rd||!sd||!cd||(kd==COLI_KV_FP8_E4M3&&(!ls||!rs))||
+           !coli_cuda_pipe_upload(d0,qd,q,sizeof(q))||
+           !coli_cuda_pipe_upload_kv_rows(d0,ld,ls,lh,T,K,0)||
+           !coli_cuda_pipe_upload_kv_rows(d0,rd,rs,rh,T,R,0)||
+           !coli_cuda_pipe_upload(d0,(float*)sd,sel,sizeof(sel)))return 1;
+        ColiCudaTensor *formats[2]={ti,tb};
+        const char *names[2]={"INT8","BF16"};
+        for(int f=0;f<2;f++){
+            if(!coli_cuda_test_dsa_decode_tcgather(d0,cd,qd,(const float*)ld,
+                    (const float*)rd,ls,rs,sd,S,TOPK,formats[f],H,Q,R,V,K,T,.25f)||
+               !coli_cuda_pipe_download(d0,cd,got,sizeof(got))||
+               !relative_rms(got,ref,H*V,kd==COLI_KV_FP8_E4M3?.04f:.015f)){
+                std::fprintf(stderr,"%s/kv%d decode TC gather failed\n",names[f],kd);
+                return 1;
+            }
+        }
+        if(kd==COLI_KV_FP8_E4M3&&
+           coli_cuda_test_dsa_decode_tcgather(d0,cd,qd,(const float*)ld,
+                (const float*)rd,nullptr,rs,sd,S,TOPK,tb,H,Q,R,V,K,T,.25f))return 1;
+        coli_cuda_tensor_free(ti);coli_cuda_tensor_free(tb);
+        coli_cuda_pipe_free(d0,qd);coli_cuda_pipe_free(d0,ld);coli_cuda_pipe_free(d0,rd);
+        coli_cuda_pipe_free(d0,sd);coli_cuda_pipe_free(d0,cd);
+        if(ls)coli_cuda_pipe_free(d0,ls);if(rs)coli_cuda_pipe_free(d0,rs);
+        std::fprintf(stderr,"NVFP4 resident decode TC gather formats/KV%d: ok\n",kd);
+    }
+
+    /* Tensor-core prefill for NVFP4 resident formats: two causal rows plus one
+       selected DSA row, checked against the scalar equation in every KV dtype. */
     {
         constexpr int S=3,H=1,Q=16,R=16,V=16,K=16,T=3,TOPK=2;
-        uint16_t wk[H*(Q+V)*K]={},wo[V*H*V]={};
-        ColiCudaTensor *kw=nullptr,*ow=nullptr;
-        float q[S*H*(Q+R)]={},lh[T*K]={},rh[T*R]={},got[S*V]={};
-        int sel[S*TOPK]={0,0,0,0,0,1};
+        constexpr int WO=H*(Q+V);
+        float wf[WO*K],q[S*H*(Q+R)],lh[T*K],rh[T*R],ref[S*V],got[S*V];
+        int8_t wi[WO*K],oi[V*H*V]={};float ws[WO],os[V];
+        uint16_t wb[WO*K],ob[V*H*V]={};
+        int sel[S*TOPK]={0,0,0,0,0,2};
+        for(int row=0;row<WO;row++){ws[row]=1.f/32.f;for(int k=0;k<K;k++){
+            int v=(row*5+k*3)%9-4;wf[row*K+k]=(float)v/32.f;wi[row*K+k]=(int8_t)v;
+            uint32_t bits;std::memcpy(&bits,&wf[row*K+k],sizeof(bits));wb[row*K+k]=(uint16_t)(bits>>16);
+        }}
+        for(int v=0;v<V;v++){oi[v*V+v]=32;os[v]=1.f/32.f;
+            float one=1.f;uint32_t bits;std::memcpy(&bits,&one,sizeof(bits));ob[v*V+v]=(uint16_t)(bits>>16);}
+        for(int i=0;i<(int)(sizeof(q)/sizeof(q[0]));i++)q[i]=(float)((i*7)%13-6)/8.f;
+        for(int i=0;i<T*K;i++)lh[i]=(float)((i*3)%11-5)/8.f;
+        for(int i=0;i<T*R;i++)rh[i]=(float)((i*5)%15-7)/8.f;
+        for(int s=0;s<S;s++){
+            int keys[TOPK],nk;if(s<2){nk=s+1;for(int j=0;j<nk;j++)keys[j]=j;}
+            else{nk=TOPK;keys[0]=0;keys[1]=2;}
+            float qa[K],score[TOPK],cl[K];for(int k=0;k<K;k++){qa[k]=0;
+                for(int d=0;d<Q;d++)qa[k]+=q[s*(Q+R)+d]*wf[d*K+k];}
+            float mx=-1e30f,z=0;for(int j=0;j<nk;j++){score[j]=0;int t=keys[j];
+                for(int k=0;k<K;k++)score[j]+=qa[k]*lh[t*K+k];
+                for(int r=0;r<R;r++)score[j]+=q[s*(Q+R)+Q+r]*rh[t*R+r];
+                score[j]*=.25f;mx=score[j]>mx?score[j]:mx;}
+            for(int j=0;j<nk;j++){score[j]=std::exp(score[j]-mx);z+=score[j];}
+            for(int k=0;k<K;k++){cl[k]=0;for(int j=0;j<nk;j++)
+                cl[k]+=score[j]/z*lh[keys[j]*K+k];}
+            for(int v=0;v<V;v++){ref[s*V+v]=0;for(int k=0;k<K;k++)
+                ref[s*V+v]+=cl[k]*wf[(Q+v)*K+k];}
+        }
         int kd=coli_cuda_kv_dtype(),esz=kd==COLI_KV_FP8_E4M3?1:kd==COLI_KV_FP16?2:4;
         void *qd=coli_cuda_pipe_alloc(d0,sizeof(q));
         void *ld=coli_cuda_pipe_alloc(d0,(size_t)T*K*esz);
@@ -335,20 +434,27 @@ int main(int argc, char **argv) {
         float *ls=kd==COLI_KV_FP8_E4M3?(float*)coli_cuda_pipe_alloc(d0,T*sizeof(float)):nullptr;
         float *rs=kd==COLI_KV_FP8_E4M3?(float*)coli_cuda_pipe_alloc(d0,T*sizeof(float)):nullptr;
         void *od=coli_cuda_pipe_alloc(d0,sizeof(got));
-        if(!coli_cuda_tensor_upload(&kw,wk,nullptr,COLI_TENSOR_BF16,K,H*(Q+V),d0)||
-           !coli_cuda_tensor_upload(&ow,wo,nullptr,COLI_TENSOR_BF16,H*V,V,d0)||
-           !qd||!ld||!rd||!od||(kd==COLI_KV_FP8_E4M3&&(!ls||!rs))||
-           !coli_cuda_pipe_upload(d0,(float*)qd,q,sizeof(q)/sizeof(float))||
+        if(!qd||!ld||!rd||!od||(kd==COLI_KV_FP8_E4M3&&(!ls||!rs))||
+           !coli_cuda_pipe_upload(d0,(float*)qd,q,sizeof(q))||
            !coli_cuda_pipe_upload_kv_rows(d0,ld,ls,lh,T,K,0)||
-           !coli_cuda_pipe_upload_kv_rows(d0,rd,rs,rh,T,R,0)||
-           !coli_cuda_prefill_attn_gemm(kw,ow,(float*)od,(const float*)qd,
-                (const float*)ld,(const float*)rd,ls,rs,S,H,Q,R,V,K,T,1.f,sel,2,TOPK)||
-           !coli_cuda_pipe_download(d0,(const float*)od,got,sizeof(got)))return 1;
-        for(float value:got)if(value!=0.f||!std::isfinite(value))return 1;
-        coli_cuda_tensor_free(kw);coli_cuda_tensor_free(ow);
+           !coli_cuda_pipe_upload_kv_rows(d0,rd,rs,rh,T,R,0))return 1;
+        for(int f=0;f<2;f++){
+            ColiCudaTensor *kw=nullptr,*ow=nullptr;
+            int ok=f==0
+                ?coli_cuda_tensor_upload(&kw,wi,ws,COLI_TENSOR_INT8_ROW,K,WO,d0)&&
+                 coli_cuda_tensor_upload(&ow,oi,os,COLI_TENSOR_INT8_ROW,H*V,V,d0)
+                :coli_cuda_tensor_upload(&kw,wb,nullptr,COLI_TENSOR_BF16,K,WO,d0)&&
+                 coli_cuda_tensor_upload(&ow,ob,nullptr,COLI_TENSOR_BF16,H*V,V,d0);
+            if(!ok||!coli_cuda_prefill_attn_gemm(kw,ow,(float*)od,(const float*)qd,
+                    (const float*)ld,(const float*)rd,ls,rs,S,H,Q,R,V,K,T,.25f,
+                    sel,2,TOPK)||
+               !coli_cuda_pipe_download(d0,(const float*)od,got,sizeof(got))||
+               !relative_rms(got,ref,S*V,kd==COLI_KV_FP8_E4M3?.04f:.015f))return 1;
+            coli_cuda_tensor_free(kw);coli_cuda_tensor_free(ow);
+        }
         coli_cuda_pipe_free(d0,qd);coli_cuda_pipe_free(d0,ld);coli_cuda_pipe_free(d0,rd);
         coli_cuda_pipe_free(d0,od);if(ls)coli_cuda_pipe_free(d0,ls);if(rs)coli_cuda_pipe_free(d0,rs);
-        std::fprintf(stderr,"BF16 generic DSA prefill split: ok\n");
+        std::fprintf(stderr,"NVFP4 resident TC DSA prefill formats/KV%d: ok\n",kd);
     }
 
     /* Native s4 WMMA path: compare the quantized-activation result against the
