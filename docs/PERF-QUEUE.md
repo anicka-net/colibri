@@ -1328,10 +1328,11 @@ host-backed first-touch; do not retune the NVMe itself.
 
 The aligned-v2 compact snapshot is deployed through `coli-native` with native
 NVFP4 experts, INT8 resident matrices, FP8 E4M3 device KV shadows, canonical
-FP32 host KV, direct io_uring expert loads, and CUTLASS 4.6.1. The service
-advertises a 196,608-token (192k) context and a 16,384-token completion limit.
-The live format-aware RAM guard reduced the requested expert cap from 256 to 3,
-projecting a 107.8 GB peak under its 108.5 GB automatic safety budget.
+FP32 host KV, direct io_uring expert loads, and CUTLASS 4.6.1. The initial
+service advertised a 196,608-token (192k) context and a 16,384-token completion
+limit. The live format-aware RAM guard reduced the requested expert cap from
+256 to 3, projecting a 107.8 GB peak under its 108.5 GB automatic safety
+budget.
 
 A 262,144-token context was rejected rather than overcommitted: even cap 1
 projected 125.0 GB (18.5 GB resident plus 104.9 GB reserve), above both the
@@ -1341,3 +1342,16 @@ so 192k is the practical maximum that retains a useful expert cache. Production
 health, model discovery, and a deterministic chat-completion smoke passed; the
 service returned the requested `NVFP4 production ready` response with no
 restart.
+
+A frozen persisted-KV sweep then reused the exact same 32,000-token programming
+prompt for two 256-token decodes at each context size. Measured expert hit rate,
+decode rate, and resident expert LRU were: 128k/cap-16 38.0%, 1.09 tok/s,
+25.48 GB; 96k/cap-22 43.0%, 1.16 tok/s, 35.04 GB; 64k/cap-28 47.3%,
+1.21 tok/s, 44.59 GB; and 32k/cap-35 51.5%, 1.27 tok/s, 55.74 GB. Every
+post-seed run restored the 32,255-token canonical FP32 checkpoint in about
+three seconds with no prefill, produced an identical continuation, engaged
+native NVFP4 and FP8 KV with zero fallback, and remained I/O-bound.
+
+Production was therefore changed to a 32,768-token context. This devotes the
+largest safe share of unified RAM to the expert cache: 2,625 resident records,
+35 experts per each of 75 sparse layers, under the automatic RAM safety budget.
